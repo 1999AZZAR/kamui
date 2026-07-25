@@ -5,6 +5,7 @@ use crate::mcp::ConnectionStatus;
 use crate::prompt;
 use crate::provider::{ChatRequest, Message, Provider, StreamEvent, Usage};
 use crate::storage::{Database, Session};
+use crate::tools;
 use crate::tools::ToolRegistry;
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
@@ -339,7 +340,16 @@ where
                     call.name,
                     truncate(call.arguments.trim(), 120)
                 );
-                let output = if tools.requires_confirmation(&call.name) {
+                let output = if call.name == tools::ASK_USER_TOOL {
+                    tokio::select! {
+                        output = ask_user(&mut input_rx, &call.arguments) => output?,
+                        signal = tokio::signal::ctrl_c() => {
+                            signal.context("failed to listen for Ctrl+C")?;
+                            println!("\n(interrupted — back to prompt)\n");
+                            continue 'chat;
+                        }
+                    }
+                } else if tools.requires_confirmation(&call.name) {
                     if let Some(preview) = tools.preview(call) {
                         println!("{preview}");
                     }
@@ -531,7 +541,12 @@ where
                 call.name,
                 truncate(call.arguments.trim(), 120)
             );
-            let output = if tools.requires_confirmation(&call.name) && !auto_approve {
+            let output = if call.name == tools::ASK_USER_TOOL {
+                println!("    skipped: ask_user is not available in non-interactive mode");
+                "There is no user to ask in non-interactive mode. Proceed using your best \
+                 judgment, or state your assumption in the final answer."
+                    .to_string()
+            } else if tools.requires_confirmation(&call.name) && !auto_approve {
                 println!("    denied: non-interactive mode (pass --auto-approve to allow)");
                 "The user declined to run this command (non-interactive mode).".to_string()
             } else {
@@ -1017,6 +1032,50 @@ fn display_path(path: &std::path::Path) -> String {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct AskUserArguments {
+    question: String,
+    #[serde(default)]
+    options: Vec<String>,
+}
+
+/// Print an `ask_user` question (with numbered options, if any) and read one line of stdin as the
+/// answer. If the user types a number that matches an offered option, the option's text is
+/// returned instead of the raw digit, so the model gets a proper answer either way; any other
+/// text (a number out of range, or free-form text when no options were offered) is returned as
+/// typed. Returns an `Error: ...` string, not an `Err`, for bad JSON — same convention as
+/// `ToolRegistry::dispatch` — so the model can recover on the next round.
+async fn ask_user(
+    input_rx: &mut mpsc::UnboundedReceiver<String>,
+    arguments: &str,
+) -> Result<String> {
+    let arguments: AskUserArguments = match serde_json::from_str(arguments) {
+        Ok(arguments) => arguments,
+        Err(error) => return Ok(format!("Error: invalid ask_user arguments: {error}")),
+    };
+    if arguments.question.trim().is_empty() {
+        return Ok("Error: ask_user requires a non-empty 'question' argument".to_string());
+    }
+
+    println!("  ? {}", arguments.question);
+    for (index, option) in arguments.options.iter().enumerate() {
+        println!("    {}. {option}", index + 1);
+    }
+    print!("    > ");
+    io::stdout().flush()?;
+
+    let answer = input_rx.recv().await.unwrap_or_default();
+    let answer = answer.trim();
+    let resolved = answer
+        .parse::<usize>()
+        .ok()
+        .and_then(|number| number.checked_sub(1))
+        .and_then(|index| arguments.options.get(index))
+        .map(String::as_str)
+        .unwrap_or(answer);
+    Ok(resolved.to_string())
+}
+
 fn truncate(text: &str, max: usize) -> String {
     let mut result: String = text.chars().take(max).collect();
     if text.chars().count() > max {
@@ -1308,5 +1367,68 @@ mod tests {
         let snippet = make_snippet(&content, "needle");
         assert!(snippet.starts_with('…'));
         assert!(snippet.contains("NEEDLE"));
+    }
+
+    fn respond_with(text: &str) -> mpsc::UnboundedReceiver<String> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        sender.send(text.to_string()).unwrap();
+        receiver
+    }
+
+    #[tokio::test]
+    async fn ask_user_rejects_invalid_json_arguments() {
+        let mut rx = respond_with("anything");
+        let output = ask_user(&mut rx, "not json").await.unwrap();
+        assert!(output.starts_with("Error:"));
+    }
+
+    #[tokio::test]
+    async fn ask_user_rejects_a_blank_question() {
+        let mut rx = respond_with("anything");
+        let output = ask_user(&mut rx, r#"{"question":"   "}"#).await.unwrap();
+        assert!(output.starts_with("Error:"));
+    }
+
+    #[tokio::test]
+    async fn ask_user_returns_free_text_when_no_options_are_offered() {
+        let mut rx = respond_with("Tuesday works better");
+        let output = ask_user(&mut rx, r#"{"question":"When?"}"#).await.unwrap();
+        assert_eq!(output, "Tuesday works better");
+    }
+
+    #[tokio::test]
+    async fn ask_user_resolves_a_numbered_choice_to_its_option_text() {
+        let mut rx = respond_with("2");
+        let output = ask_user(
+            &mut rx,
+            r#"{"question":"Pick one","options":["red","green","blue"]}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, "green");
+    }
+
+    #[tokio::test]
+    async fn ask_user_falls_back_to_raw_text_for_an_out_of_range_number() {
+        let mut rx = respond_with("99");
+        let output = ask_user(
+            &mut rx,
+            r#"{"question":"Pick one","options":["red","green"]}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, "99");
+    }
+
+    #[tokio::test]
+    async fn ask_user_accepts_free_text_even_when_options_are_offered() {
+        let mut rx = respond_with("actually neither");
+        let output = ask_user(
+            &mut rx,
+            r#"{"question":"Pick one","options":["red","green"]}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, "actually neither");
     }
 }

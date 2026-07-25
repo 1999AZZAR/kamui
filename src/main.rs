@@ -27,6 +27,9 @@ async fn main() -> Result<()> {
             println!("kamui {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
+        Command::Doctor => {
+            return run_doctor().await;
+        }
         command => command,
     };
 
@@ -83,7 +86,7 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        Command::Help | Command::Version => unreachable!("handled above"),
+        Command::Help | Command::Version | Command::Doctor => unreachable!("handled above"),
     }
 
     Ok(())
@@ -92,6 +95,7 @@ async fn main() -> Result<()> {
 enum Command {
     Chat(Option<String>),
     Once { prompt: String, auto_approve: bool },
+    Doctor,
     Help,
     Version,
 }
@@ -127,10 +131,106 @@ fn parse_command_from(arguments: impl Iterator<Item = String>) -> Result<Command
                 auto_approve,
             })
         }
+        Some("doctor") => Ok(Command::Doctor),
         Some("-h" | "--help") => Ok(Command::Help),
         Some("-V" | "--version") => Ok(Command::Version),
         Some(_) => anyhow::bail!("usage: kamui [-r <session-id>] [-p <prompt> [--auto-approve]]"),
     }
+}
+
+/// `kamui doctor`: check configuration, provider connectivity, and MCP servers one at a time,
+/// printing a pass/fail line for each with actionable guidance on failure, rather than crashing on
+/// the first problem the way starting a normal chat would. Exits with an error if anything failed,
+/// so it is usable as a pre-flight check in a script.
+async fn run_doctor() -> Result<()> {
+    println!("Kamui doctor");
+    println!();
+    let mut failures = 0usize;
+
+    let config = match Config::load() {
+        Ok(config::Loaded::Ready(config)) => {
+            check_ok("Config file parses and is complete");
+            Some(config)
+        }
+        Ok(config::Loaded::NeedsSetup(path)) => {
+            check_fail(&format!(
+                "Config at {} is incomplete — run `kamui` once to finish onboarding",
+                path.display()
+            ));
+            failures += 1;
+            None
+        }
+        Err(error) => {
+            check_fail(&format!("Config file is invalid: {error:#}"));
+            failures += 1;
+            None
+        }
+    };
+
+    if let Some(config) = &config {
+        let profile = config.default();
+        check_ok(&format!(
+            "Default profile '{}' uses model '{}'",
+            profile.name, profile.model
+        ));
+        let provider = OpenAIProvider::new(profile.api_key.clone(), profile.base_url.clone());
+        match provider
+            .chat(provider::ChatRequest {
+                model: profile.model.clone(),
+                messages: vec![provider::Message::user("ping")],
+                tools: Vec::new(),
+            })
+            .await
+        {
+            Ok(_) => check_ok("Provider responds to a test request"),
+            Err(error) => {
+                check_fail(&format!("Provider request failed: {error:#}"));
+                failures += 1;
+            }
+        }
+
+        if config.mcp_servers.is_empty() {
+            check_ok("No MCP servers configured (nothing to check)");
+        } else {
+            let mcp = mcp::connect_all(&config.mcp_servers).await;
+            for status in &mcp.statuses {
+                match &status.error {
+                    Some(error) => {
+                        check_fail(&format!("MCP server '{}' failed: {error}", status.name));
+                        failures += 1;
+                    }
+                    None => check_ok(&format!(
+                        "MCP server '{}' connected ({} tool(s))",
+                        status.name, status.tool_count
+                    )),
+                }
+            }
+        }
+    }
+
+    match Database::open() {
+        Ok(_) => check_ok("Database opens successfully"),
+        Err(error) => {
+            check_fail(&format!("Database could not be opened: {error:#}"));
+            failures += 1;
+        }
+    }
+
+    println!();
+    if failures == 0 {
+        println!("All checks passed.");
+        Ok(())
+    } else {
+        anyhow::bail!("{failures} check(s) failed");
+    }
+}
+
+fn check_ok(message: &str) {
+    println!("  \u{2713} {message}");
+}
+
+fn check_fail(message: &str) {
+    println!("  \u{2717} {message}");
 }
 
 fn print_help() {
@@ -140,6 +240,7 @@ fn print_help() {
     println!("  -r, --resume <ID>   Resume a saved session");
     println!("  -p, --print <TEXT>  Run one prompt non-interactively and exit");
     println!("      --auto-approve  With -p, approve tool calls without prompting");
+    println!("  doctor              Check configuration, provider, and MCP servers");
     println!("  -h, --help          Print help");
     println!("  -V, --version       Print version");
 }
@@ -238,5 +339,13 @@ mod tests {
     #[test]
     fn unknown_flag_is_rejected() {
         assert!(parse_command_from(args(&["--bogus"])).is_err());
+    }
+
+    #[test]
+    fn doctor_flag_is_recognized() {
+        assert!(matches!(
+            parse_command_from(args(&["doctor"])).unwrap(),
+            Command::Doctor
+        ));
     }
 }

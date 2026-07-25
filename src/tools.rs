@@ -61,7 +61,10 @@ impl ToolRegistry {
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.iter().map(|tool| tool.definition()).collect()
+        let mut definitions: Vec<ToolDefinition> =
+            self.tools.iter().map(|tool| tool.definition()).collect();
+        definitions.push(ask_user_definition());
+        definitions
     }
 
     pub fn len(&self) -> usize {
@@ -88,6 +91,44 @@ impl ToolRegistry {
             },
             None => format!("Error: unknown tool '{}'", call.name),
         }
+    }
+}
+
+/// Name of the pseudo-tool the chat loop intercepts before it reaches `ToolRegistry::dispatch`.
+/// It has no `Tool` implementation of its own: it needs access to the interactive stdin channel
+/// (`start_chat`'s `input_rx`), which `Tool::run` has no way to receive, so the chat loop handles
+/// it directly instead. Its definition still comes from `ToolRegistry::definitions()` so it is
+/// offered to the model like any other tool and stays in one place with the rest of the roster.
+pub const ASK_USER_TOOL: &str = "ask_user";
+
+fn ask_user_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: ASK_USER_TOOL.to_string(),
+        description: "Pause and ask the user a clarifying question before proceeding, when a \
+                      task is ambiguous or has multiple reasonable interpretations. Call this \
+                      tool itself — do not just write the question as your response text, since \
+                      that does not pause the turn or wait for an actual answer, only continue \
+                      the conversation on the next message. This is not for approval of a risky \
+                      action (run_command and patch_file already ask for that automatically) — \
+                      use it when you genuinely need more information to continue, e.g. which of \
+                      several matching files was meant, or a preference between reasonable \
+                      options."
+            .to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "The question to ask, e.g. \"Which file did you mean?\""
+                },
+                "options": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "2-4 short suggested answers shown as numbered choices, e.g. [\"src/main.rs\", \"src/lib.rs\"]. Optional — omit for an open-ended question with no natural fixed choices."
+                }
+            },
+            "required": ["question"]
+        }),
     }
 }
 
