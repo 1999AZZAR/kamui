@@ -45,8 +45,8 @@ effort or operational risk is disproportionate to their immediate value.
   prompt shuts down gracefully. Windows stdin uses a reader thread and Tokio channel so the async
   runtime does not block on terminal input.
 - Supported chat commands are `/help`, `/new`, `/sessions`, `/resume <id>`, `/model [name]`,
-  `/rename <id> <title>`, `/search <text>`, `/compact`, `/delete <id>`, `/stats`, and `/exit`. Plain
-  `exit` also quits.
+  `/rename <id> <title>`, `/search <text>`, `/compact`, `/delete <id>`, `/stats`, `/memory`,
+  `/forget <text>` (or `/forget all`), and `/exit`. Plain `exit` also quits.
 - Long sessions are compacted automatically: when the un-summarized recent history exceeds a byte
   threshold (about half the profile's `context_window`, or a default), older messages are folded
   into a rolling summary and the request sends the summary plus recent messages. `/compact` forces
@@ -84,6 +84,26 @@ effort or operational risk is disproportionate to their immediate value.
   characters.
 - Resume displays the six most recent messages and reports how many earlier messages were omitted.
 - Context percentage is displayed only when `KAMUI_CONTEXT_WINDOW` is configured.
+- `ask_user` lets the model pause a turn to ask a clarifying question (with up to 4 optional
+  numbered choices) instead of guessing. In interactive chat it reads one line from the same
+  stdin channel used for command input and approval answers; a numbered reply resolves to that
+  option's text, anything else is returned as typed. In `-p` non-interactive mode there is no user
+  to ask, so it is declined with a message telling the model to proceed on its own judgment. It is
+  intercepted by the chat loop before `ToolRegistry::dispatch`, since it needs the interactive
+  stdin channel that `Tool::run` has no way to receive.
+- `remember`, `update_memory`, and `forget` manage a global memory table (`user_version = 6`),
+  intercepted the same way `ask_user` is (they need `Database` directly). Unlike project
+  instructions (`KAMUI.md`, a file the user edits) or session history (scoped to one conversation),
+  a remembered fact is global and permanent: it is read fresh from storage on every turn (not
+  frozen at startup, since Kamui is a single interactive process rather than a server shared
+  across many chats) and is visible in every project Kamui is run in afterward. `update_memory` and
+  `forget` resolve their target via an unambiguous case-insensitive substring match, failing with
+  guidance on zero or multiple matches rather than guessing. Total stored memory is capped at 4
+  KiB; `/memory` lists what is remembered and `/forget <text>` (or `/forget all`) removes it
+  directly, without going through the model.
+- `kamui doctor` checks configuration, provider connectivity (a real test request), and MCP
+  server connections one at a time with pass/fail output, exiting non-zero if anything failed —
+  usable as a pre-flight check without starting a full chat session.
 
 ## Repository Context
 

@@ -4,6 +4,7 @@ use crate::context::ProjectContext;
 use crate::mcp::ConnectionStatus;
 use crate::prompt;
 use crate::provider::{ChatRequest, Message, Provider, StreamEvent, Usage};
+use crate::storage;
 use crate::storage::{Database, Session};
 use crate::tools;
 use crate::tools::ToolRegistry;
@@ -212,8 +213,16 @@ where
 
         // Working conversation for this turn: the agentic system prompt (plus project instructions
         // and any running summary), the un-summarized recent history, and the expanded prompt.
-        // Intermediate tool messages live here only; they are not persisted.
+        // Intermediate tool messages live here only; they are not persisted. Memory is read fresh
+        // every turn (unlike Kumo's frozen-at-startup snapshot): Kamui is a single interactive
+        // process, not a server shared across many chats, so a fact remembered in this turn should
+        // be visible on the very next one without needing a restart.
         let mut system = prompt::build(active.tools, project.system_message().as_deref());
+        let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
+        if !memory_snapshot.is_empty() {
+            system.push_str("\n\n");
+            system.push_str(&memory_snapshot);
+        }
         if let Some(summary) = &summary {
             system.push_str("\n\nSummary of the earlier conversation so far:\n\n");
             system.push_str(summary);
@@ -349,6 +358,8 @@ where
                             continue 'chat;
                         }
                     }
+                } else if is_memory_tool(&call.name) {
+                    dispatch_memory_tool(database, &call.name, &call.arguments)
                 } else if tools.requires_confirmation(&call.name) {
                     if let Some(preview) = tools.preview(call) {
                         println!("{preview}");
@@ -502,7 +513,12 @@ where
         Vec::new()
     };
 
-    let system = prompt::build(active.tools, project.system_message().as_deref());
+    let mut system = prompt::build(active.tools, project.system_message().as_deref());
+    let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
+    if !memory_snapshot.is_empty() {
+        system.push_str("\n\n");
+        system.push_str(&memory_snapshot);
+    }
     let mut turn_messages = vec![Message::system(system)];
     turn_messages.push(Message::user_with_images(expanded.text, expanded.images));
 
@@ -546,6 +562,8 @@ where
                 "There is no user to ask in non-interactive mode. Proceed using your best \
                  judgment, or state your assumption in the final answer."
                     .to_string()
+            } else if is_memory_tool(&call.name) {
+                dispatch_memory_tool(database, &call.name, &call.arguments)
             } else if tools.requires_confirmation(&call.name) && !auto_approve {
                 println!("    denied: non-interactive mode (pass --auto-approve to allow)");
                 "The user declined to run this command (non-interactive mode).".to_string()
@@ -800,6 +818,34 @@ fn handle_command(
             Some(session) => print_stats(database, session, context_window)?,
             None => println!("This chat has no saved messages yet.\n"),
         },
+        "/memory" => {
+            let entries = database.list_memory()?;
+            if entries.is_empty() {
+                println!("Nothing remembered yet.\n");
+            } else {
+                println!("Remembered facts:");
+                for entry in &entries {
+                    println!("- {}", entry.content);
+                }
+                println!("\nUse /forget <text> or /forget all.\n");
+            }
+        }
+        "/forget" => {
+            if argument.is_empty() {
+                anyhow::bail!("usage: /forget <text> or /forget all");
+            }
+            if argument.eq_ignore_ascii_case("all") {
+                let count = database.clear_memory()?;
+                println!("Forgot all {count} remembered fact(s).\n");
+            } else if database.forget(argument)? {
+                println!("Forgot the fact matching \"{argument}\".\n");
+            } else {
+                println!(
+                    "No remembered fact matches \"{argument}\", or the text matches more than \
+                     one. Use /memory to see exact wording.\n"
+                );
+            }
+        }
         _ => println!("Unknown command. Type /help for available commands.\n"),
     }
 
@@ -1076,6 +1122,113 @@ async fn ask_user(
     Ok(resolved.to_string())
 }
 
+/// Total bytes of stored memory content allowed before `remember` refuses to add more, keeping
+/// the system prompt (which carries every entry on every request) from growing unbounded.
+const MAX_MEMORY_BYTES: i64 = 4 * 1024;
+
+/// Render every remembered fact as a system-prompt block, or an empty string when there is
+/// nothing remembered yet (so callers can skip adding an empty section).
+fn render_memory_snapshot(entries: &[storage::MemoryEntry]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    let mut text =
+        "Remembered facts about the user (persist across sessions and projects):".to_string();
+    for entry in entries {
+        text.push_str("\n- ");
+        text.push_str(&entry.content);
+    }
+    text
+}
+
+fn is_memory_tool(name: &str) -> bool {
+    matches!(
+        name,
+        tools::REMEMBER_TOOL | tools::UPDATE_MEMORY_TOOL | tools::FORGET_TOOL
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct FactArguments {
+    fact: String,
+}
+
+#[derive(serde::Deserialize)]
+struct UpdateMemoryArguments {
+    matching: String,
+    fact: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ForgetArguments {
+    matching: String,
+}
+
+/// Dispatch one of the memory pseudo-tools (`remember`/`update_memory`/`forget`), all of which
+/// need `Database` directly rather than going through `ToolRegistry`. Synchronous and infallible
+/// at the call site (it always returns a tool-result string, `Error: ...` on failure) so it slots
+/// into the same position `tools.dispatch(call).await` would.
+fn dispatch_memory_tool(database: &Database, name: &str, arguments: &str) -> String {
+    let result = (|| -> Result<String> {
+        match name {
+            tools::REMEMBER_TOOL => {
+                let arguments: FactArguments = serde_json::from_str(arguments)
+                    .context("tool arguments were not valid JSON")?;
+                let fact = arguments.fact.trim();
+                if fact.is_empty() {
+                    anyhow::bail!("remember requires a non-empty 'fact' argument");
+                }
+                let existing = database.total_memory_bytes()?;
+                if existing + fact.len() as i64 > MAX_MEMORY_BYTES {
+                    anyhow::bail!(
+                        "memory is full ({existing}/{MAX_MEMORY_BYTES} bytes); use update_memory \
+                         or forget to make room before adding more"
+                    );
+                }
+                database.remember(fact)?;
+                Ok(format!("remembered: {fact}"))
+            }
+            tools::UPDATE_MEMORY_TOOL => {
+                let arguments: UpdateMemoryArguments = serde_json::from_str(arguments)
+                    .context("tool arguments were not valid JSON")?;
+                let matching = arguments.matching.trim();
+                let fact = arguments.fact.trim();
+                if matching.is_empty() || fact.is_empty() {
+                    anyhow::bail!(
+                        "update_memory requires non-empty 'matching' and 'fact' arguments"
+                    );
+                }
+                if database.update_memory(matching, fact)? {
+                    Ok(format!("updated memory matching \"{matching}\" to: {fact}"))
+                } else {
+                    anyhow::bail!(
+                        "no single remembered fact matches \"{matching}\"; it may not exist, or \
+                         the substring matches more than one entry"
+                    )
+                }
+            }
+            tools::FORGET_TOOL => {
+                let arguments: ForgetArguments = serde_json::from_str(arguments)
+                    .context("tool arguments were not valid JSON")?;
+                let matching = arguments.matching.trim();
+                if matching.is_empty() {
+                    anyhow::bail!("forget requires a non-empty 'matching' argument");
+                }
+                if database.forget(matching)? {
+                    Ok(format!("forgot the fact matching \"{matching}\""))
+                } else {
+                    anyhow::bail!(
+                        "no single remembered fact matches \"{matching}\"; it may not exist, or \
+                         the substring matches more than one entry"
+                    )
+                }
+            }
+            _ => unreachable!("is_memory_tool already filtered to a known name"),
+        }
+    })();
+    result.unwrap_or_else(|error| format!("Error: {error:#}"))
+}
+
 fn truncate(text: &str, max: usize) -> String {
     let mut result: String = text.chars().take(max).collect();
     if text.chars().count() > max {
@@ -1137,6 +1290,8 @@ fn print_help() {
     println!("/delete <id>      Delete a session");
     println!("/stats            Show current session usage");
     println!("/status           Show project and connection status");
+    println!("/memory           List facts Kamui remembers across sessions and projects");
+    println!("/forget <text>    Forget one remembered fact, or /forget all");
     println!("/exit             Save and quit\n");
 }
 
@@ -1430,5 +1585,110 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(output, "actually neither");
+    }
+
+    #[test]
+    fn render_memory_snapshot_is_empty_with_no_entries() {
+        assert_eq!(render_memory_snapshot(&[]), "");
+    }
+
+    #[test]
+    fn render_memory_snapshot_lists_every_fact() {
+        let entries = vec![
+            storage::MemoryEntry {
+                content: "Prefers bun over node.".to_owned(),
+            },
+            storage::MemoryEntry {
+                content: "Prefers uv over pip.".to_owned(),
+            },
+        ];
+
+        let rendered = render_memory_snapshot(&entries);
+
+        assert!(rendered.contains("Prefers bun over node."));
+        assert!(rendered.contains("Prefers uv over pip."));
+    }
+
+    #[test]
+    fn dispatch_memory_tool_remembers_a_fact() {
+        let database = Database::open_in_memory_for_tests();
+        let output = dispatch_memory_tool(&database, "remember", r#"{"fact":"Prefers bun."}"#);
+        assert!(output.starts_with("remembered:"), "{output}");
+        assert_eq!(database.list_memory().unwrap()[0].content, "Prefers bun.");
+    }
+
+    #[test]
+    fn dispatch_memory_tool_rejects_a_blank_fact() {
+        let database = Database::open_in_memory_for_tests();
+        let output = dispatch_memory_tool(&database, "remember", r#"{"fact":"  "}"#);
+        assert!(output.starts_with("Error:"), "{output}");
+    }
+
+    #[test]
+    fn dispatch_memory_tool_refuses_once_the_memory_cap_is_reached() {
+        let database = Database::open_in_memory_for_tests();
+        database
+            .remember(&"x".repeat(MAX_MEMORY_BYTES as usize))
+            .unwrap();
+
+        let output = dispatch_memory_tool(&database, "remember", r#"{"fact":"one more"}"#);
+
+        assert!(
+            output.starts_with("Error:") && output.contains("full"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn dispatch_memory_tool_updates_a_matched_fact() {
+        let database = Database::open_in_memory_for_tests();
+        database.remember("Prefers node over bun.").unwrap();
+
+        let output = dispatch_memory_tool(
+            &database,
+            "update_memory",
+            r#"{"matching":"node over bun","fact":"bun over node."}"#,
+        );
+
+        assert!(output.starts_with("updated memory"), "{output}");
+        assert_eq!(database.list_memory().unwrap()[0].content, "bun over node.");
+    }
+
+    #[test]
+    fn dispatch_memory_tool_update_reports_an_error_when_nothing_matches() {
+        let database = Database::open_in_memory_for_tests();
+        let output = dispatch_memory_tool(
+            &database,
+            "update_memory",
+            r#"{"matching":"nonexistent","fact":"x"}"#,
+        );
+        assert!(output.starts_with("Error:"), "{output}");
+    }
+
+    #[test]
+    fn dispatch_memory_tool_forgets_a_matched_fact() {
+        let database = Database::open_in_memory_for_tests();
+        database.remember("Prefers bun.").unwrap();
+
+        let output = dispatch_memory_tool(&database, "forget", r#"{"matching":"bun"}"#);
+
+        assert!(output.starts_with("forgot"), "{output}");
+        assert!(database.list_memory().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dispatch_memory_tool_forget_reports_an_error_when_nothing_matches() {
+        let database = Database::open_in_memory_for_tests();
+        let output = dispatch_memory_tool(&database, "forget", r#"{"matching":"nonexistent"}"#);
+        assert!(output.starts_with("Error:"), "{output}");
+    }
+
+    #[test]
+    fn is_memory_tool_recognizes_only_the_three_memory_tools() {
+        assert!(is_memory_tool("remember"));
+        assert!(is_memory_tool("update_memory"));
+        assert!(is_memory_tool("forget"));
+        assert!(!is_memory_tool("ask_user"));
+        assert!(!is_memory_tool("run_command"));
     }
 }

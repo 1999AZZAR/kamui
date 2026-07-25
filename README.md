@@ -186,6 +186,19 @@ ask; pass `--auto-approve` to run them without prompting:
 kamui -p "run the test suite and summarize failures" --auto-approve
 ```
 
+### Diagnostics
+
+Check that everything is configured and reachable without starting a chat session:
+
+```sh
+kamui doctor
+```
+
+It parses the config, sends a real test request to the default provider profile, connects to
+every configured MCP server, and opens the database — printing a ✓ or ✗ line for each with an
+actionable message on failure, and exiting with a non-zero status if anything failed. Useful as a
+pre-flight check in a script, or just to check on things without leaving the terminal.
+
 ### Session commands
 
 | Command | Description |
@@ -199,6 +212,8 @@ kamui -p "run the test suite and summarize failures" --auto-approve
 | `/compact` | Summarize older messages to free up context |
 | `/delete <id>` | Delete a session |
 | `/stats` | Show current session usage |
+| `/memory` | List facts Kamui remembers across sessions and projects |
+| `/forget <text>` | Forget one remembered fact, or `/forget all` |
 | `/help` | List available commands |
 | `/exit` | Save and quit |
 
@@ -278,10 +293,11 @@ image input; text-only models will reject it.
 
 ## Tools
 
-Kamui offers the model four tools: `list_directory` (discover what is in a folder), `read_file`
-(read a file), `run_command` (run a shell command), and `patch_file` (edit or create a file). When
-you ask about code, the model can explore, read, build, test, and fix on its own instead of
-requiring you to attach files with `@path`:
+Kamui offers the model these tools: `list_directory` (discover what is in a folder), `read_file`
+(read a file), `run_command` (run a shell command), `patch_file` (edit or create a file), `ask_user`
+(pause and ask you a clarifying question), and `remember`/`update_memory`/`forget` (manage
+persistent memory — see below). When you ask about code, the model can explore, read, build, test,
+and fix on its own instead of requiring you to attach files with `@path`:
 
 ```text
 > What does the agent loop in src/chat.rs do?
@@ -312,6 +328,38 @@ line of every result shows the exact command that ran.
 
 The whole turn is saved to session history, including the tool calls and their results, so a resumed
 session replays the tool interactions the model relied on.
+
+`ask_user` pauses a turn so the model can ask you something instead of guessing — which of several
+matching files was meant, a preference between reasonable options. Kamui prints the question (with
+numbered choices, if any) and waits for one line of input; replying with a number resolves to that
+option's text, and anything else is taken as typed. This is not an approval prompt — `run_command`
+and `patch_file` still ask for that automatically — it's for when the model itself decides it needs
+more information to continue. In `-p` non-interactive mode there is no one to ask, so the tool is
+declined and the model is told to proceed on its own judgment instead.
+
+## Memory
+
+Kamui can remember facts across every session and project, not just the current conversation. Ask
+it directly, or state a clear preference:
+
+```
+> Remember that I prefer bun over node, and uv over pip.
+```
+
+The model calls `remember` to store the fact permanently. Unlike project instructions (`KAMUI.md`,
+a file you edit yourself) or session history (scoped to one conversation), memory is global: it
+survives `/new`, resuming a different session, and switching to a different project entirely, and
+is read fresh on every turn — no restart needed to see a fact you just asked it to remember.
+
+- `/memory` lists everything currently remembered.
+- `/forget <text>` removes one fact matched by an unambiguous substring of its exact wording, or
+  `/forget all` clears everything.
+
+The model can also correct or remove a fact itself: `update_memory` replaces an existing entry
+matched the same way `/forget` does, so a stated preference can be corrected in place instead of
+contradicting an older one; `forget` removes one. Both fail with a clear error if the text matches
+more than one stored fact, asking for something more specific rather than guessing. Total stored
+memory is capped at 4 KiB, since every byte of it is sent with every request.
 
 ## MCP servers
 

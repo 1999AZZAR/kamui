@@ -54,6 +54,10 @@ pub struct ModelStat {
     pub total_tokens: i64,
 }
 
+pub struct MemoryEntry {
+    pub content: String,
+}
+
 impl Database {
     pub fn open() -> Result<Self> {
         let data_dir = data_dir()?;
@@ -144,11 +148,111 @@ impl Database {
                  PRAGMA user_version = 5;",
             )?;
         }
+        if version < 6 {
+            // Global, permanent facts the model has been explicitly asked to remember. Not scoped
+            // to a session or project — Kamui's database is already one global file (data_dir(),
+            // not per-project), so a remembered fact is visible from any project the user opens
+            // Kamui in afterward.
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS memory (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     content TEXT NOT NULL,
+                     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 PRAGMA user_version = 6;",
+            )?;
+        }
         Ok(Self { connection, path })
+    }
+
+    #[cfg(test)]
+    pub fn open_in_memory_for_tests() -> Self {
+        Self::initialize(
+            Connection::open_in_memory().unwrap(),
+            PathBuf::from(":memory:"),
+        )
+        .unwrap()
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Every stored memory entry, oldest first (the order they were learned in).
+    pub fn list_memory(&self) -> Result<Vec<MemoryEntry>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT content FROM memory ORDER BY id")?;
+        let rows = statement.query_map([], |row| {
+            Ok(MemoryEntry {
+                content: row.get(0)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Total bytes across all memory content, used to enforce a cap before adding more (see
+    /// `tools::remember`); cheaper than loading every row just to sum lengths.
+    pub fn total_memory_bytes(&self) -> Result<i64> {
+        self.connection
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM memory",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Append a new memory entry.
+    pub fn remember(&self, content: &str) -> Result<()> {
+        self.connection
+            .execute("INSERT INTO memory (content) VALUES (?1)", params![content])?;
+        Ok(())
+    }
+
+    /// Replace the content of an unambiguous entry matched by a case-insensitive substring, so a
+    /// superseded fact (e.g. an old preference) can be corrected in place instead of left to
+    /// contradict a newer one. Returns `Ok(false)` for no match or an ambiguous (multi-match)
+    /// substring, so the caller can ask for something more specific rather than guess.
+    pub fn update_memory(&self, substring: &str, new_content: &str) -> Result<bool> {
+        let pattern = format!("%{}%", substring.replace('%', "\\%").replace('_', "\\_"));
+        let matches: Vec<i64> = self
+            .connection
+            .prepare("SELECT id FROM memory WHERE content LIKE ?1 ESCAPE '\\'")?
+            .query_map([&pattern], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if matches.len() != 1 {
+            return Ok(false);
+        }
+        self.connection.execute(
+            "UPDATE memory SET content = ?2, updated_at = unixepoch() WHERE id = ?1",
+            params![matches[0], new_content],
+        )?;
+        Ok(true)
+    }
+
+    /// Delete an unambiguous entry matched by a case-insensitive substring. Same ambiguity
+    /// handling as `update_memory`.
+    pub fn forget(&self, substring: &str) -> Result<bool> {
+        let pattern = format!("%{}%", substring.replace('%', "\\%").replace('_', "\\_"));
+        let matches: Vec<i64> = self
+            .connection
+            .prepare("SELECT id FROM memory WHERE content LIKE ?1 ESCAPE '\\'")?
+            .query_map([&pattern], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if matches.len() != 1 {
+            return Ok(false);
+        }
+        self.connection
+            .execute("DELETE FROM memory WHERE id = ?1", [matches[0]])?;
+        Ok(true)
+    }
+
+    /// Delete every memory entry.
+    pub fn clear_memory(&self) -> Result<usize> {
+        Ok(self.connection.execute("DELETE FROM memory", [])?)
     }
 
     pub fn create_session(&self, provider: &str, model: &str) -> Result<Session> {
@@ -775,5 +879,99 @@ mod tests {
         database.create_session("test", "model").unwrap();
 
         assert!(database.list_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remember_and_list_memory_round_trip_in_insertion_order() {
+        let database = database();
+        database.remember("Prefers bun over node.").unwrap();
+        database.remember("Prefers uv over pip.").unwrap();
+
+        let entries = database.list_memory().unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].content, "Prefers bun over node.");
+        assert_eq!(entries[1].content, "Prefers uv over pip.");
+    }
+
+    #[test]
+    fn total_memory_bytes_sums_all_entries() {
+        let database = database();
+        database.remember("abc").unwrap();
+        database.remember("de").unwrap();
+
+        assert_eq!(database.total_memory_bytes().unwrap(), 5);
+    }
+
+    #[test]
+    fn update_memory_replaces_an_unambiguous_match() {
+        let database = database();
+        database.remember("Prefers node over bun.").unwrap();
+
+        let updated = database
+            .update_memory("node over bun", "bun over node.")
+            .unwrap();
+
+        assert!(updated);
+        let entries = database.list_memory().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "bun over node.");
+    }
+
+    #[test]
+    fn update_memory_fails_on_no_match_or_ambiguous_match() {
+        let database = database();
+        database.remember("Prefers bun.").unwrap();
+        database.remember("Prefers uv.").unwrap();
+
+        assert!(!database.update_memory("nonexistent", "x").unwrap());
+        // Both entries contain "Prefers", so this is ambiguous.
+        assert!(!database.update_memory("Prefers", "x").unwrap());
+        let entries = database.list_memory().unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn forget_removes_an_unambiguous_match() {
+        let database = database();
+        database.remember("Prefers bun over node.").unwrap();
+        database.remember("Prefers uv over pip.").unwrap();
+
+        assert!(database.forget("bun").unwrap());
+
+        let entries = database.list_memory().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "Prefers uv over pip.");
+    }
+
+    #[test]
+    fn forget_fails_on_no_match_or_ambiguous_match() {
+        let database = database();
+        database.remember("Prefers bun.").unwrap();
+        database.remember("Prefers uv.").unwrap();
+
+        assert!(!database.forget("nonexistent").unwrap());
+        assert!(!database.forget("Prefers").unwrap());
+        assert_eq!(database.list_memory().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn clear_memory_removes_every_entry_and_reports_the_count() {
+        let database = database();
+        database.remember("one").unwrap();
+        database.remember("two").unwrap();
+
+        assert_eq!(database.clear_memory().unwrap(), 2);
+        assert!(database.list_memory().unwrap().is_empty());
+    }
+
+    #[test]
+    fn memory_matching_is_case_insensitive_and_escapes_like_wildcards() {
+        let database = database();
+        database.remember("100% sure about this_thing").unwrap();
+
+        // '%' and '_' are SQL LIKE wildcards; a literal search for them must not match everything.
+        assert!(!database.forget("50%").unwrap());
+        assert!(database.forget("100% SURE").unwrap());
     }
 }

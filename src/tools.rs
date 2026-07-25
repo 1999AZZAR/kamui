@@ -64,6 +64,7 @@ impl ToolRegistry {
         let mut definitions: Vec<ToolDefinition> =
             self.tools.iter().map(|tool| tool.definition()).collect();
         definitions.push(ask_user_definition());
+        definitions.extend(memory_definitions());
         definitions
     }
 
@@ -130,6 +131,80 @@ fn ask_user_definition() -> ToolDefinition {
             "required": ["question"]
         }),
     }
+}
+
+/// Names of the memory pseudo-tools, intercepted by the chat loop the same way `ask_user` is:
+/// they need access to `Database`, which `Tool::run` has no way to receive. Memory is global and
+/// permanent (see `storage::Database::remember`) — unlike project instructions (`KAMUI.md`), which
+/// are a file the user edits, these are facts the model itself records when explicitly asked, and
+/// unlike session history, they are visible from every project Kamui is run in afterward.
+pub const REMEMBER_TOOL: &str = "remember";
+pub const UPDATE_MEMORY_TOOL: &str = "update_memory";
+pub const FORGET_TOOL: &str = "forget";
+
+fn memory_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: REMEMBER_TOOL.to_string(),
+            description: "Save a fact about the user or their preferences permanently. Unlike \
+                          project instructions, this is not scoped to the current project — it \
+                          persists across sessions and is visible in every project Kamui is run \
+                          in afterward. Use it only when explicitly asked to remember something, \
+                          or when the user states a clear, durable preference (e.g. a tool or \
+                          style they always want used). If a similar fact is already remembered, \
+                          use update_memory instead of adding a duplicate."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "fact": {
+                        "type": "string",
+                        "description": "A short, self-contained fact, e.g. \"Prefers bun over node.\" or \"Prefers uv over pip.\""
+                    }
+                },
+                "required": ["fact"]
+            }),
+        },
+        ToolDefinition {
+            name: UPDATE_MEMORY_TOOL.to_string(),
+            description: "Replace a previously remembered fact that is now outdated or wrong. \
+                          Find it by an unambiguous substring of its exact wording; if more than \
+                          one remembered fact matches, this fails and you should use a longer, \
+                          more specific substring."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "matching": {
+                        "type": "string",
+                        "description": "A substring that uniquely identifies the fact to replace, e.g. \"bun over node\"."
+                    },
+                    "fact": {
+                        "type": "string",
+                        "description": "The corrected fact to store in its place."
+                    }
+                },
+                "required": ["matching", "fact"]
+            }),
+        },
+        ToolDefinition {
+            name: FORGET_TOOL.to_string(),
+            description: "Permanently delete a previously remembered fact, found by an \
+                          unambiguous substring of its exact wording (same matching rule as \
+                          update_memory)."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "matching": {
+                        "type": "string",
+                        "description": "A substring that uniquely identifies the fact to delete."
+                    }
+                },
+                "required": ["matching"]
+            }),
+        },
+    ]
 }
 
 /// Reads a UTF-8 text file from within the project, reusing the shared path-safety checks.
