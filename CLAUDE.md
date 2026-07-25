@@ -22,6 +22,12 @@ effort or operational risk is disproportionate to their immediate value.
 
 - Every normal launch starts a new chat. Resume must be explicit with `/resume <id>` or
   `kamui -r <id>`.
+- `kamui -p <prompt> [--auto-approve]` runs one prompt non-interactively through the same agent
+  loop as interactive chat (including tools) and exits. The exchange is persisted as a resumable
+  session exactly like an interactive turn, including a generated title. There is no REPL loop, no
+  stdin reader, and no spinner. Tool calls that require confirmation are denied by default (the
+  model is told the refusal is due to non-interactive mode); `--auto-approve` runs them without
+  prompting instead.
 - Sessions are created lazily after the first successful streamed response. Empty chats are not
   persisted or listed.
 - Completed user/assistant exchanges are stored in SQLite. Partial responses from interrupted or
@@ -125,7 +131,7 @@ Important modules:
   request); the chat loop drives it automatically and via `/compact`.
 - `src/mcp.rs`: MCP client over stdio via the `rmcp` SDK; wraps each server tool as a Kamui `Tool`.
 - `src/chat.rs`: interactive loop, streaming display, session commands, title generation, the
-  streaming tool agent loop, and graceful shutdown.
+  streaming tool agent loop, graceful shutdown, and `run_once` for non-interactive `-p` prompts.
 - `src/context.rs`: project instruction discovery and safe `@file`, `@diff`, and `@staged`
   expansion, including the shared `read_project_file` path-safety helper.
 - `src/tools.rs`: the async `Tool` trait, `ToolRegistry` dispatch, the read-only `read_file` and

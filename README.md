@@ -169,6 +169,23 @@ Resume a saved session directly when starting Kamui:
 kamui -r <session-id>
 ```
 
+### Non-interactive mode
+
+Run a single prompt and exit, for scripting or CI:
+
+```sh
+kamui -p "explain what this project does"
+```
+
+The prompt runs through the same agent loop as interactive chat — including tools — and the
+exchange is saved as a resumable session, just like a normal chat turn. Tool calls that need
+approval (`run_command`, `patch_file`) are denied by default in this mode, since there is no one to
+ask; pass `--auto-approve` to run them without prompting:
+
+```sh
+kamui -p "run the test suite and summarize failures" --auto-approve
+```
+
 ### Session commands
 
 | Command | Description |

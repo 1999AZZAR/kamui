@@ -458,6 +458,151 @@ where
     Ok(())
 }
 
+/// Run a single prompt non-interactively and exit: no REPL loop, no stdin reader, no spinner.
+/// Reuses the same profile selection, tool registry, agent loop, and persistence as interactive
+/// chat, so a `-p` session can later be resumed with `-r` like any other.
+pub async fn run_once<F>(
+    config: Config,
+    tools: ToolRegistry,
+    database: &Database,
+    project: &ProjectContext,
+    prompt: &str,
+    auto_approve: bool,
+    build_provider: F,
+) -> Result<()>
+where
+    F: Fn(&Profile) -> Box<dyn Provider>,
+{
+    let active_name = database
+        .get_setting(ACTIVE_PROFILE_KEY)?
+        .filter(|name| config.find(name).is_some())
+        .unwrap_or_else(|| config.default_profile.clone());
+    let active = config
+        .find(&active_name)
+        .cloned()
+        .unwrap_or_else(|| config.default().clone());
+    let provider = build_provider(&active);
+
+    let expanded = project
+        .expand_file_references(prompt)
+        .context("could not attach file")?;
+    let tool_definitions = if active.tools {
+        tools.definitions()
+    } else {
+        Vec::new()
+    };
+
+    let system = prompt::build(active.tools, project.system_message().as_deref());
+    let mut turn_messages = vec![Message::system(system)];
+    turn_messages.push(Message::user_with_images(expanded.text, expanded.images));
+
+    let user_message = Message::user(prompt);
+    let mut tool_trail: Vec<Message> = Vec::new();
+    let mut round = 0usize;
+    let (assistant_message, final_usage, final_finish) = loop {
+        round += 1;
+        if round > MAX_TOOL_ROUNDS {
+            anyhow::bail!("stopped after {MAX_TOOL_ROUNDS} tool rounds without a final answer");
+        }
+
+        let response = provider
+            .chat(ChatRequest {
+                model: active.model.clone(),
+                messages: turn_messages.clone(),
+                tools: tool_definitions.clone(),
+            })
+            .await
+            .context("request failed")?;
+
+        if response.tool_calls.is_empty() {
+            break (
+                Message::assistant(response.content),
+                response.usage,
+                response.finish_reason,
+            );
+        }
+
+        let request_message = Message::tool_request(response.content, response.tool_calls.clone());
+        turn_messages.push(request_message.clone());
+        tool_trail.push(request_message);
+        for call in &response.tool_calls {
+            println!(
+                "  \u{2192} {}({})",
+                call.name,
+                truncate(call.arguments.trim(), 120)
+            );
+            let output = if tools.requires_confirmation(&call.name) && !auto_approve {
+                println!("    denied: non-interactive mode (pass --auto-approve to allow)");
+                "The user declined to run this command (non-interactive mode).".to_string()
+            } else {
+                tools.dispatch(call).await
+            };
+            match output.strip_prefix("Error: ") {
+                Some(error) => println!("    ! {error}"),
+                None => println!("    ok ({} chars)", output.chars().count()),
+            }
+            let result_message = Message::tool_result(&call.id, output);
+            turn_messages.push(result_message.clone());
+            tool_trail.push(result_message);
+        }
+    };
+
+    println!("\n{}", assistant_message.content);
+
+    let final_answer = assistant_message.content.clone();
+    let mut turn_record = Vec::with_capacity(tool_trail.len() + 2);
+    turn_record.push(user_message);
+    turn_record.append(&mut tool_trail);
+    turn_record.push(assistant_message);
+
+    let mut session = database.create_session(provider.name(), &active.model)?;
+    database.save_turn(
+        &session.id,
+        &turn_record,
+        &final_usage,
+        &active.model,
+        &final_finish,
+    )?;
+    database.rename_session(&session.id, &make_title(prompt))?;
+    session.title = make_title(prompt);
+
+    let title_response = provider
+        .chat(ChatRequest {
+            model: active.model.clone(),
+            messages: vec![
+                Message::system(
+                    "Create a concise title of at most 6 words for this conversation. Return only the title without quotes or punctuation.",
+                ),
+                Message::user(prompt),
+                Message::assistant(final_answer),
+            ],
+            tools: Vec::new(),
+        })
+        .await;
+    match title_response {
+        Ok(response) => {
+            let title = clean_title(&response.content);
+            if !title.is_empty() {
+                database.save_generated_title(
+                    &session.id,
+                    &title,
+                    &response.usage,
+                    &active.model,
+                    &response.finish_reason,
+                )?;
+            }
+        }
+        Err(error) => eprintln!("Could not generate session title: {error:#}"),
+    }
+
+    eprintln!(
+        "\nTo resume this session: kamui -r {}",
+        short_id(&session.id)
+    );
+
+    Ok(())
+}
+
 /// A background task that animates a single-line braille spinner until told to stop.
 struct Spinner {
     stop: Arc<Notify>,
@@ -769,7 +914,7 @@ fn print_history_preview(messages: &[Message]) {
 
     let start = messages.len().saturating_sub(RESUME_PREVIEW_MESSAGES);
     if start > 0 {
-        println!("... {} earlier messages omitted\n", start);
+        println!("... {start} earlier messages omitted\n");
     }
     for message in &messages[start..] {
         let speaker = match message.role_name() {
