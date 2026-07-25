@@ -163,6 +163,31 @@ impl Database {
                  PRAGMA user_version = 6;",
             )?;
         }
+        if version < 7 {
+            // `/index`'s semantic-search store: one row per chunk of an indexed file, with its
+            // embedding vector (little-endian f32s) and the file's content hash so re-indexing can
+            // skip unchanged files. Unlike `memory`, this is project-scoped in spirit but lives in
+            // the same global database as everything else (Kamui has one DB file, not one per
+            // project) — `path` is project-relative, so chunks from different projects indexed into
+            // the same database would collide; this is an accepted v1 limitation (see CLAUDE.md).
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS indexed_files (
+                     path TEXT PRIMARY KEY,
+                     hash TEXT NOT NULL,
+                     indexed_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 CREATE TABLE IF NOT EXISTS code_chunks (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     path TEXT NOT NULL,
+                     start_line INTEGER NOT NULL,
+                     end_line INTEGER NOT NULL,
+                     content TEXT NOT NULL,
+                     embedding BLOB NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS code_chunks_path ON code_chunks(path);
+                 PRAGMA user_version = 7;",
+            )?;
+        }
         Ok(Self { connection, path })
     }
 
@@ -548,6 +573,131 @@ impl Database {
         )?;
         Ok(())
     }
+
+    /// The content hash `/index` stored for a project-relative path last time it was indexed, or
+    /// `None` if the path has never been indexed. Compared against the file's current hash to skip
+    /// re-embedding unchanged files.
+    pub fn indexed_file_hash(&self, path: &str) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT hash FROM indexed_files WHERE path = ?1",
+                [path],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Record (or update) the hash `/index` last saw for a path.
+    pub fn set_indexed_file(&self, path: &str, hash: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO indexed_files (path, hash, indexed_at) VALUES (?1, ?2, unixepoch())
+             ON CONFLICT(path) DO UPDATE SET hash = excluded.hash, indexed_at = excluded.indexed_at",
+            params![path, hash],
+        )?;
+        Ok(())
+    }
+
+    /// Every project-relative path currently indexed, so `/index` can tell which ones no longer
+    /// exist on disk and should be removed.
+    pub fn indexed_paths(&self) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare("SELECT path FROM indexed_files")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn delete_indexed_file(&self, path: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM indexed_files WHERE path = ?1", [path])?;
+        Ok(())
+    }
+
+    /// Drop every chunk previously indexed for a path, before re-chunking it (or because it no
+    /// longer exists).
+    pub fn delete_chunks_for_path(&self, path: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM code_chunks WHERE path = ?1", [path])?;
+        Ok(())
+    }
+
+    pub fn insert_chunk(
+        &self,
+        path: &str,
+        start_line: usize,
+        end_line: usize,
+        content: &str,
+        embedding: &[f32],
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO code_chunks (path, start_line, end_line, content, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                path,
+                start_line as i64,
+                end_line as i64,
+                content,
+                encode_embedding(embedding)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The number of chunks currently indexed, for a quick `/index`/status summary without
+    /// loading every embedding into memory.
+    pub fn chunk_count(&self) -> Result<i64> {
+        self.connection
+            .query_row("SELECT COUNT(*) FROM code_chunks", [], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
+    /// Every indexed chunk, for `search_code` to score against a query embedding. Loaded in full
+    /// (no vector index) — a brute-force scan is simple and fast enough at the scale a single
+    /// project's chunks reach; see CLAUDE.md for the tradeoff.
+    pub fn all_chunks(&self) -> Result<Vec<CodeChunk>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT path, start_line, end_line, content, embedding FROM code_chunks")?;
+        let rows = statement.query_map([], |row| {
+            let start_line: i64 = row.get(1)?;
+            let end_line: i64 = row.get(2)?;
+            let embedding: Vec<u8> = row.get(4)?;
+            Ok(CodeChunk {
+                path: row.get(0)?,
+                start_line: start_line as usize,
+                end_line: end_line as usize,
+                content: row.get(3)?,
+                embedding: decode_embedding(&embedding),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+}
+
+/// One chunk of an indexed file, as scored by `search_code`.
+pub struct CodeChunk {
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub content: String,
+    pub embedding: Vec<f32>,
+}
+
+/// Encode an embedding vector as little-endian `f32` bytes for the `code_chunks.embedding` BLOB
+/// column — simpler than pulling in a serialization crate for a fixed, self-describing layout.
+fn encode_embedding(vector: &[f32]) -> Vec<u8> {
+    vector
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn decode_embedding(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("chunks_exact(4) yields 4 bytes")))
+        .collect()
 }
 
 fn escape_like(input: &str) -> String {
@@ -973,5 +1123,66 @@ mod tests {
         // '%' and '_' are SQL LIKE wildcards; a literal search for them must not match everything.
         assert!(!database.forget("50%").unwrap());
         assert!(database.forget("100% SURE").unwrap());
+    }
+
+    #[test]
+    fn embedding_round_trips_through_the_blob_column() {
+        let database = database();
+        let vector = vec![0.5_f32, -1.25, 0.0, 3.0];
+        database
+            .insert_chunk("src/main.rs", 1, 10, "fn main() {}", &vector)
+            .unwrap();
+
+        let chunks = database.all_chunks().unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].path, "src/main.rs");
+        assert_eq!(chunks[0].start_line, 1);
+        assert_eq!(chunks[0].end_line, 10);
+        assert_eq!(chunks[0].content, "fn main() {}");
+        assert_eq!(chunks[0].embedding, vector);
+    }
+
+    #[test]
+    fn indexed_file_hash_tracks_the_most_recent_hash() {
+        let database = database();
+        assert_eq!(database.indexed_file_hash("a.rs").unwrap(), None);
+
+        database.set_indexed_file("a.rs", "hash1").unwrap();
+        assert_eq!(
+            database.indexed_file_hash("a.rs").unwrap(),
+            Some("hash1".to_string())
+        );
+
+        database.set_indexed_file("a.rs", "hash2").unwrap();
+        assert_eq!(
+            database.indexed_file_hash("a.rs").unwrap(),
+            Some("hash2".to_string())
+        );
+    }
+
+    #[test]
+    fn deleting_a_path_removes_its_chunks_and_index_entry() {
+        let database = database();
+        database.set_indexed_file("a.rs", "hash1").unwrap();
+        database
+            .insert_chunk("a.rs", 1, 5, "content", &[0.1])
+            .unwrap();
+
+        database.delete_chunks_for_path("a.rs").unwrap();
+        database.delete_indexed_file("a.rs").unwrap();
+
+        assert!(database.all_chunks().unwrap().is_empty());
+        assert_eq!(database.indexed_file_hash("a.rs").unwrap(), None);
+        assert!(database.indexed_paths().unwrap().is_empty());
+    }
+
+    #[test]
+    fn chunk_count_reflects_inserted_chunks() {
+        let database = database();
+        assert_eq!(database.chunk_count().unwrap(), 0);
+        database.insert_chunk("a.rs", 1, 5, "x", &[0.1]).unwrap();
+        database.insert_chunk("a.rs", 6, 10, "y", &[0.2]).unwrap();
+        assert_eq!(database.chunk_count().unwrap(), 2);
     }
 }

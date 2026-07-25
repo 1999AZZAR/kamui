@@ -7,6 +7,12 @@ use std::path::{Path, PathBuf};
 const CONFIG_FILE: &str = "kamui.toml";
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_PROFILE_NAME: &str = "default";
+/// Default foreground `run_command` timeout, applied when `[commands].timeout_secs` is unset.
+const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 30;
+/// Default safety cap on a `background: true` job's total lifetime, applied when
+/// `[commands].background_max_secs` is unset. A backstop against runaway/zombie processes, not a
+/// limit meant to constrain legitimate long-running commands.
+const DEFAULT_BACKGROUND_MAX_SECS: u64 = 30 * 60;
 
 const TEMPLATE: &str = "\
 # Kamui configuration (global). This file may contain your API key.
@@ -68,6 +74,28 @@ api_key = \"\"
 # command = \"uvx\"
 # args = [\"mcp-excel\"]
 # trusted = true         # skip the per-call approval for this server
+
+# Commands run_command may run without asking for approval. Exact match only (after
+# trimming), so this never widens beyond exactly what is listed. Global-only, like
+# api_key: a project kamui.toml may not define this.
+#
+# [permissions]
+# allow_commands = [\"git status\", \"git diff\", \"cargo check\"]
+
+# run_command timeout policy. Not security-relevant, so a project kamui.toml may
+# override these. timeout_secs bounds a normal (foreground) command; background_max_secs
+# is a safety cap on a background: true job's total lifetime, not a limit meant to
+# constrain a legitimately long-running command.
+#
+# [commands]
+# timeout_secs = 30
+# background_max_secs = 1800
+
+# Optional: an embedding-capable model on this same provider, enabling /index and the
+# search_code tool. Not every model/endpoint offers an embeddings API; omit this to
+# leave semantic search unavailable.
+# [provider]
+# embedding_model = \"text-embedding-3-small\"
 ";
 
 /// One provider+model configuration the user can run under.
@@ -81,6 +109,10 @@ pub struct Profile {
     /// Whether to offer tools to this model. Disable for endpoints/models that reject the `tools`
     /// field (many small local models), so plain chat still works.
     pub tools: bool,
+    /// The embedding-capable model to use for `/index`/`search_code`, on the same provider
+    /// (base_url/api_key) as this profile. `None` means semantic search is unavailable for this
+    /// profile — not every model/endpoint offers an embeddings API.
+    pub embedding_model: Option<String>,
 }
 
 /// An MCP server Kamui launches and talks to over stdio.
@@ -99,6 +131,14 @@ pub struct Config {
     pub profiles: Vec<Profile>,
     pub default_profile: String,
     pub mcp_servers: Vec<McpServer>,
+    /// Exact-match commands `run_command` runs without asking for approval. Global-only, like
+    /// `api_key`: a project file could otherwise silently grant itself unattended execution.
+    pub allow_commands: Vec<String>,
+    /// Foreground `run_command` timeout. Not security-relevant, so (unlike `allow_commands`) a
+    /// project file may override it, the same way it may override `context_window`.
+    pub command_timeout_secs: u64,
+    /// Safety cap on a `background: true` job's total lifetime.
+    pub background_max_secs: u64,
 }
 
 impl Config {
@@ -136,6 +176,19 @@ struct ConfigFile {
     /// MCP servers to launch. Global-only: a project file must not spawn processes.
     #[serde(default)]
     mcp: HashMap<String, McpSection>,
+    /// Commands `run_command` may run without approval. Global-only: a checked-in project file
+    /// could otherwise grant itself unattended execution.
+    #[serde(default)]
+    permissions: PermissionsSection,
+    /// `run_command` timeout policy. Not security-relevant, so a project file may override it.
+    #[serde(default)]
+    commands: CommandsSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CommandsSection {
+    timeout_secs: Option<u64>,
+    background_max_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -148,21 +201,29 @@ struct McpSection {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct PermissionsSection {
+    #[serde(default)]
+    allow_commands: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct ProviderSection {
     base_url: Option<String>,
     api_key: Option<String>,
     tools: Option<bool>,
+    embedding_model: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct ProfileSection {
-    /// Name of a `[providers.*]` block to inherit base_url/api_key/tools from.
+    /// Name of a `[providers.*]` block to inherit base_url/api_key/tools/embedding_model from.
     provider: Option<String>,
     model: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
     context_window: Option<u64>,
     tools: Option<bool>,
+    embedding_model: Option<String>,
 }
 
 impl Config {
@@ -266,15 +327,38 @@ fn resolve(mut global: ConfigFile, project: Option<ConfigFile>) -> Result<Config
                 "a project kamui.toml must not define [mcp.*] servers; declare them in the global config"
             );
         }
+        // An allowlisted command skips the approval prompt entirely, so a checked-in project file
+        // could otherwise grant itself unattended execution the same way an embedded api_key could
+        // leak a credential.
+        if !project.permissions.allow_commands.is_empty() {
+            anyhow::bail!(
+                "a project kamui.toml must not define [permissions]; declare allow_commands in the global config"
+            );
+        }
     }
 
+    let command_timeout_secs = project
+        .as_ref()
+        .and_then(|file| file.commands.timeout_secs)
+        .or(global.commands.timeout_secs)
+        .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS);
+    let background_max_secs = project
+        .as_ref()
+        .and_then(|file| file.commands.background_max_secs)
+        .or(global.commands.background_max_secs)
+        .unwrap_or(DEFAULT_BACKGROUND_MAX_SECS);
+
     let mcp_servers = resolve_mcp_servers(std::mem::take(&mut global.mcp))?;
+    let allow_commands = std::mem::take(&mut global.permissions).allow_commands;
     let mut config = if global.profiles.is_empty() {
         resolve_flat(global, project)?
     } else {
         resolve_profiles(global, project)?
     };
     config.mcp_servers = mcp_servers;
+    config.allow_commands = allow_commands;
+    config.command_timeout_secs = command_timeout_secs;
+    config.background_max_secs = background_max_secs;
     Ok(config)
 }
 
@@ -336,6 +420,10 @@ fn resolve_flat(global: ConfigFile, project: Option<ConfigFile>) -> Result<Confi
         .or_else(|| global_provider.and_then(|provider| provider.tools))
         .unwrap_or(true);
 
+    let embedding_model = project_provider
+        .and_then(|provider| provider.embedding_model.clone())
+        .or_else(|| global_provider.and_then(|provider| provider.embedding_model.clone()));
+
     let profile = Profile {
         name: DEFAULT_PROFILE_NAME.to_string(),
         model,
@@ -343,11 +431,15 @@ fn resolve_flat(global: ConfigFile, project: Option<ConfigFile>) -> Result<Confi
         api_key,
         context_window,
         tools,
+        embedding_model,
     };
     Ok(Config {
         default_profile: profile.name.clone(),
         profiles: vec![profile],
         mcp_servers: Vec::new(),
+        allow_commands: Vec::new(),
+        command_timeout_secs: DEFAULT_COMMAND_TIMEOUT_SECS,
+        background_max_secs: DEFAULT_BACKGROUND_MAX_SECS,
     })
 }
 
@@ -384,6 +476,10 @@ fn resolve_profiles(global: ConfigFile, project: Option<ConfigFile>) -> Result<C
             .tools
             .or_else(|| shared.and_then(|provider| provider.tools))
             .unwrap_or(true);
+        let embedding_model = section
+            .embedding_model
+            .clone()
+            .or_else(|| shared.and_then(|provider| provider.embedding_model.clone()));
         profiles.push(Profile {
             name: name.clone(),
             model,
@@ -391,6 +487,7 @@ fn resolve_profiles(global: ConfigFile, project: Option<ConfigFile>) -> Result<C
             api_key,
             context_window: section.context_window,
             tools,
+            embedding_model,
         });
     }
     // Stable ordering for listing, since the source is a hash map.
@@ -413,6 +510,9 @@ fn resolve_profiles(global: ConfigFile, project: Option<ConfigFile>) -> Result<C
         profiles,
         default_profile,
         mcp_servers: Vec::new(),
+        allow_commands: Vec::new(),
+        command_timeout_secs: DEFAULT_COMMAND_TIMEOUT_SECS,
+        background_max_secs: DEFAULT_BACKGROUND_MAX_SECS,
     })
 }
 
@@ -682,6 +782,53 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("missing a command"));
+    }
+
+    #[test]
+    fn resolves_the_command_allowlist_from_the_global_file() {
+        let config = resolve(
+            file(
+                "model = \"m\"\n[provider]\napi_key = \"k\"\n\
+                 [permissions]\nallow_commands = [\"git status\", \"cargo check\"]",
+            ),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.allow_commands,
+            vec!["git status".to_string(), "cargo check".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_an_allowlist_in_a_project_file() {
+        let global = file("model = \"m\"\n[provider]\napi_key = \"k\"");
+        let project = file("[permissions]\nallow_commands = [\"rm -rf /\"]");
+
+        let error = resolve(global, Some(project)).unwrap_err();
+        assert!(error.to_string().contains("must not define [permissions]"));
+    }
+
+    #[test]
+    fn command_limits_default_when_unset() {
+        let config = resolve(file("model = \"m\"\n[provider]\napi_key = \"k\""), None).unwrap();
+
+        assert_eq!(config.command_timeout_secs, DEFAULT_COMMAND_TIMEOUT_SECS);
+        assert_eq!(config.background_max_secs, DEFAULT_BACKGROUND_MAX_SECS);
+    }
+
+    #[test]
+    fn a_project_may_override_command_limits() {
+        let global = file(
+            "model = \"m\"\n[provider]\napi_key = \"k\"\n[commands]\ntimeout_secs = 60\nbackground_max_secs = 600",
+        );
+        let project = file("[commands]\ntimeout_secs = 120");
+
+        let config = resolve(global, Some(project)).unwrap();
+
+        assert_eq!(config.command_timeout_secs, 120); // project overrides global
+        assert_eq!(config.background_max_secs, 600); // falls back to global
     }
 
     #[test]

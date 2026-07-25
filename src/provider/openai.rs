@@ -215,6 +215,46 @@ fn wire_tools(tools: &[ToolDefinition]) -> Vec<WireTool<'_>> {
 
 // Response wire types.
 
+// Embeddings request/response wire types, for `/index`/`search_code`.
+
+#[derive(Serialize)]
+struct EmbeddingsRequest<'a> {
+    model: &'a str,
+    input: &'a [String],
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddingsResponse {
+    data: Vec<EmbeddingData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddingData {
+    embedding: Vec<f32>,
+    index: usize,
+}
+
+/// Sort embeddings back into input order (the API is expected to already return them in order,
+/// but the wire contract only guarantees `index`, not array position) and check the count matches
+/// so a caller zipping the result against its input never silently misaligns.
+fn embeddings_into_vectors(
+    mut response: EmbeddingsResponse,
+    expected: usize,
+) -> Result<Vec<Vec<f32>>> {
+    response.data.sort_by_key(|item| item.index);
+    if response.data.len() != expected {
+        bail!(
+            "provider returned {} embedding(s) for {expected} input(s)",
+            response.data.len()
+        );
+    }
+    Ok(response
+        .data
+        .into_iter()
+        .map(|item| item.embedding)
+        .collect())
+}
+
 #[derive(Debug, Deserialize)]
 struct OpenAIResponse {
     choices: Vec<Choice>,
@@ -404,6 +444,36 @@ impl Provider for OpenAIProvider {
             }
         });
         Ok(receiver)
+    }
+
+    async fn embed(&self, model: &str, input: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body = EmbeddingsRequest {
+            model,
+            input: &input,
+        };
+        let response = self
+            .client
+            .post(format!("{}/embeddings", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .context("failed to call provider")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            bail!("provider returned {status}: {body}");
+        }
+
+        let response: EmbeddingsResponse = response
+            .json()
+            .await
+            .context("provider returned an invalid embeddings response")?;
+        embeddings_into_vectors(response, input.len())
     }
 }
 
@@ -706,6 +776,26 @@ mod tests {
         let mut state = StreamState::default();
 
         assert!(parse_event(b"data: {not json}", &sender, &mut state).is_err());
+    }
+
+    #[test]
+    fn embeddings_are_reordered_by_index() {
+        let response: EmbeddingsResponse = serde_json::from_str(
+            r#"{"data":[{"embedding":[0.2],"index":1},{"embedding":[0.1],"index":0}]}"#,
+        )
+        .unwrap();
+
+        let vectors = embeddings_into_vectors(response, 2).unwrap();
+
+        assert_eq!(vectors, vec![vec![0.1], vec![0.2]]);
+    }
+
+    #[test]
+    fn embeddings_count_mismatch_is_an_error() {
+        let response: EmbeddingsResponse =
+            serde_json::from_str(r#"{"data":[{"embedding":[0.1],"index":0}]}"#).unwrap();
+
+        assert!(embeddings_into_vectors(response, 2).is_err());
     }
 
     #[test]

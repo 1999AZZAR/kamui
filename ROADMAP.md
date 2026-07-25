@@ -45,6 +45,8 @@ re-add without a concrete user request.
 - [x] Read file tool
 - [x] List directory tool
 - [x] Safe terminal command runner with permission, timeout, and output limits
+- [x] Background command execution (`run_command(background: true)`, `command_status`,
+  `stop_command`, `/jobs`)
 - [x] Preserve raw output on failures and command exit codes
 - [x] Optional RTK execution backend with direct-command fallback
 - [x] Patch file tool with confirmation
@@ -85,10 +87,18 @@ requested tools and feeds results back until the model returns a plain answer. T
 returned to the model as text so it can recover.
 
 The `run_command` tool executes shell commands in the project directory. Kamui owns the permission
-policy: any tool that reports `requires_confirmation` (only `run_command` so far) is shown to the
-user and must be approved with `y`/`yes` before it runs; declining feeds a refusal back to the
-model. Commands run with stdin disabled, a 30-second timeout that kills the process, and a 16 KiB
-output cap; the result carries the exit code plus captured stdout and stderr.
+policy: any tool that reports `requires_confirmation` (`run_command` and `patch_file`) is shown to
+the user and must be approved with `y`/`yes` before it runs, unless it matches the global
+`[permissions] allow_commands` exact-match allowlist or `--auto-approve` is active; declining feeds
+a refusal back to the model. Commands run with stdin disabled, a configurable timeout that kills the
+process (`[commands].timeout_secs`, default 30 seconds), and a 16 KiB output cap; the result carries
+the exit code plus captured stdout and stderr.
+
+`run_command(background: true)` starts a job without waiting: it returns a job id immediately, a
+`tokio::task` drains the process independently (so output survives a kill/timeout), and
+`command_status`/`stop_command`/`/jobs` check on or stop it. Jobs are in-memory only, bounded by
+`[commands].background_max_secs` (default 30 minutes) as a runaway-process backstop, and are killed
+on shutdown so nothing outlives the Kamui process.
 
 RTK routing is in place: the `rtk` binary is detected once per process, and simple commands are
 prefixed with `rtk` so compressed output reaches model context. Commands containing shell operators,
@@ -120,8 +130,8 @@ Raw `git diff` remains available for code review because a condensed diff can om
 - [x] Clipboard context (`@clipboard`, text or image)
 - [x] Conversation summarization
 - [x] Context compression
-- [ ] Project indexing
-- [ ] Semantic search
+- [x] Project indexing (a deliberately simple v1 — see below; a larger-scale version remains open)
+- [x] Semantic search (`/index`, `search_code`)
 - [x] Image input
 - [ ] PDF input (not planned — handled via MCP)
 
@@ -147,7 +157,25 @@ messages are folded into a rolling summary via one non-streaming request, and th
 sends the agentic prompt plus that summary plus the most recent messages verbatim. `/compact`
 triggers it manually. The full history stays in storage; only the per-request message list is
 compressed, and the summary is in-memory (regenerated after a resume). Excel/PDF input are handled
-through MCP; project indexing and semantic search remain deferred as large, separate efforts.
+through MCP.
+
+Semantic search shipped as a deliberately simple v1 rather than the larger effort originally
+deferred. `Provider` gained an `embed(model, texts) -> Vec<Vec<f32>>` method
+(`src/provider/openai.rs`, via the OpenAI-compatible `/embeddings` endpoint), and a profile can set
+`embedding_model` to enable it. `/index` (`chat::run_index`) walks the project the same
+`.gitignore`-aware way `grep`/`glob` do, splits each file into fixed, non-overlapping 50-line
+chunks (`tools::chunk_text` — no syntax awareness), and skips any file whose content hash
+(`chat::content_hash`) matches what `indexed_files` (`user_version = 7`) recorded last run, so a
+second `/index` after a small edit only re-embeds what changed. Chunks and their embedding vectors
+(little-endian `f32` bytes in a BLOB column) live in `code_chunks`. `search_code` embeds the query
+and ranks every stored chunk by cosine similarity (`chat::cosine_similarity`) — a brute-force scan,
+no vector index — returning the top 8 as `path:start-end` with the chunk text. Without
+`embedding_model` configured, `search_code` is not offered to the model at all.
+
+Two accepted v1 limitations, worth revisiting only if they become real problems: chunk boundaries
+are fixed-size, not syntax- or semantically-aware, and `code_chunks`/`indexed_files` store a
+project-relative `path` with no project-id column, so indexing two different projects into the
+same global database would collide.
 
 ## Phase 5: Providers and Models
 
@@ -202,12 +230,13 @@ animates until the first token, and `Ctrl+C` mid-turn returns to the prompt inst
 ## Later: Extensibility and Remote Work
 
 - [x] MCP client
-- [ ] Plugin API and manager
-- [ ] Background jobs and job queue
+- [ ] Plugin API and manager (not planned — see "Plugin decision" below)
+- [ ] Background jobs and job queue (a narrower form — `run_command(background: true)` — shipped in
+  Phase 3; this item is the broader, general-purpose async job queue, still open)
 - [ ] Scheduled tasks
 - [ ] Worker nodes and remote execution
 - [ ] Local memory and RAG
-- [ ] Multi-agent workflows
+- [x] Multi-agent workflows (a first, deliberately narrow form: `spawn_agent`)
 
 The MCP client is built (`src/mcp.rs`, via the `rmcp` SDK). Servers declared as `[mcp.<name>]` in the
 global `kamui.toml` are launched as child processes over stdio; each tool they advertise is wrapped
@@ -217,6 +246,23 @@ server is marked `trusted`. Project files may not declare servers, because launc
 code execution. A server that fails to start is reported and skipped rather than blocking startup.
 Only stdio transport and the tools capability are supported; HTTP transport, resources, and prompts
 are not.
+
+**Plugin decision**: a dedicated plugin runtime was considered and rejected. Kamui is already an
+MCP *client*, so "write a plugin" already means "write (or reuse) an MCP server" — the gap is
+packaging/discovery (no `kamui plugin install <name>`), not the extension mechanism. A realistic
+native plugin API would mean either unsafe/version-fragile dylib loading, or a WASM sandbox that
+converges back on "an MCP server, in our own protocol." Closing MCP's actual gaps (HTTP transport,
+resources, prompts) is a better use of effort than a bespoke plugin system.
+
+`spawn_agent` (`src/tools.rs`/`chat::run_spawned_agent`) is Kamui's first multi-agent primitive: it
+delegates a self-contained task to an isolated sub-agent — fresh system prompt, no shared history
+with the parent — and returns only the sub-agent's final answer, so its own tool-call trace never
+enters the parent's context. Deliberately narrow for v1: the sub-agent runs against
+`ToolRegistry::read_only` (`read_file`/`list_directory`/`grep`/`glob` only, no `run_command`,
+`patch_file`, memory tools, or recursive `spawn_agent`), so none of its calls ever need
+confirmation and there is no approval flow to reproduce. It also runs sequentially, blocking the
+parent turn — concurrent sub-agents are future work, gated on rethinking how approval prompts and
+the single-consumer stdin channel would interleave across multiple agents running at once.
 
 ## Not Planned Soon
 

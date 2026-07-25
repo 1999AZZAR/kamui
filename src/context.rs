@@ -29,7 +29,7 @@ impl ProjectContext {
         Self::from_root(std::env::current_dir().context("could not determine working directory")?)
     }
 
-    fn from_root(root: PathBuf) -> Result<Self> {
+    pub(crate) fn from_root(root: PathBuf) -> Result<Self> {
         let root = root
             .canonicalize()
             .with_context(|| format!("failed to access {}", root.display()))?;
@@ -175,7 +175,7 @@ fn file_references(input: &str) -> Vec<String> {
 /// Resolve a project-relative reference to a real path inside the project root, rejecting absolute
 /// paths and anything that escapes the root once symlinks are resolved. Shared by `@file` expansion
 /// and the read-only tools so path safety lives in one place.
-fn resolve_within_root(root: &Path, reference: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_within_root(root: &Path, reference: &str) -> Result<PathBuf> {
     let relative = Path::new(reference);
     if relative.is_absolute() {
         anyhow::bail!("path must be relative to the project: {reference}");

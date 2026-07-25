@@ -112,6 +112,64 @@ active provider and model for the next messages. Your choice is remembered acros
 banner always shows which model is active — handy for comparing the same prompt across models. A
 profile can still set `base_url`/`api_key` inline instead of referencing a provider.
 
+### Semantic search
+
+Set an `embedding_model` on a profile (same provider, a different model than the one used for
+chat) to enable `/index` and the `search_code` tool:
+
+```toml
+[provider]
+embedding_model = "text-embedding-3-small"
+```
+
+Run `/index` to build the index, then ask a question the model can answer with `search_code`
+instead of literal `grep`:
+
+```text
+> /index
+Indexed 42 file(s) (118 new chunks), skipped 0 unchanged, removed 0 deleted. 118 chunk(s) total.
+
+> Where do we validate the API key?
+```
+
+How it works: `/index` walks the project the same `.gitignore`-aware way `grep`/`glob` do, splits
+each file into fixed 50-line chunks, and embeds any chunk from a file whose content changed since
+the last run (tracked by a content hash, so re-running `/index` after a small edit only re-embeds
+the files that actually changed). `search_code` embeds your query and ranks every stored chunk by
+cosine similarity, returned as `path:start-end` with the chunk text — read the file for full
+context. Without an `embedding_model` configured, `search_code` is not offered to the model at all
+rather than erroring.
+
+This is a v1 baseline: chunking is fixed-size line windows with no syntax awareness, and matching
+is a brute-force scan (no vector index) — both simple choices that hold up fine at a single
+project's scale. Project indexing at a larger scale, and richer chunking, are open future work.
+
+### Skipping approval
+
+Every `run_command`/`patch_file` call asks for approval by default, even for something as safe as
+`git status`. Two ways to reduce that friction, in the global `kamui.toml` only — never in a
+project file, since either one would let a checked-in file grant unattended execution:
+
+```toml
+[permissions]
+allow_commands = ["git status", "git diff", "cargo check"]
+```
+
+`allow_commands` is an exact match (after trimming) against the whole command string, so
+`"git status"` does not also cover `"git status --short"` — list each command you want to skip.
+
+For everything else, start Kamui (or `-p`) with `--auto-approve` to skip every confirmation prompt
+for the whole session:
+
+```sh
+kamui --auto-approve
+kamui --auto-approve -r <session-id>
+```
+
+Kamui prints a banner when it starts this way, since it removes every safety prompt for the
+session. `-p`'s `--auto-approve` (see [Non-interactive mode](#non-interactive-mode)) works the
+same way for a single scripted turn.
+
 ## Install
 
 Windows PowerShell:
@@ -199,6 +257,17 @@ every configured MCP server, and opens the database — printing a ✓ or ✗ li
 actionable message on failure, and exiting with a non-zero status if anything failed. Useful as a
 pre-flight check in a script, or just to check on things without leaving the terminal.
 
+For a quicker look with no network calls at all:
+
+```sh
+kamui status
+```
+
+`status` reads the config file and local database directly and prints a summary — active profile
+and model, configured profiles, `embedding_model`, MCP servers, the command allowlist, project
+path, database path, session count, remembered-fact count, and indexed-chunk count. Unlike
+`doctor`, it never contacts the provider or an MCP server, so it works even when those would fail.
+
 ### Session commands
 
 | Command | Description |
@@ -210,6 +279,9 @@ pre-flight check in a script, or just to check on things without leaving the ter
 | `/rename <id> <title>` | Rename a session |
 | `/search <text>` | Search saved messages across all sessions |
 | `/compact` | Summarize older messages to free up context |
+| `/undo` | Revert the files patched by the last turn |
+| `/jobs` | List background jobs started with run_command |
+| `/index` | Rebuild the semantic-search index (needs `embedding_model`) |
 | `/delete <id>` | Delete a session |
 | `/stats` | Show current session usage |
 | `/memory` | List facts Kamui remembers across sessions and projects |
@@ -294,10 +366,15 @@ image input; text-only models will reject it.
 ## Tools
 
 Kamui offers the model these tools: `list_directory` (discover what is in a folder), `read_file`
-(read a file), `run_command` (run a shell command), `patch_file` (edit or create a file), `ask_user`
-(pause and ask you a clarifying question), and `remember`/`update_memory`/`forget` (manage
-persistent memory — see below). When you ask about code, the model can explore, read, build, test,
-and fix on its own instead of requiring you to attach files with `@path`:
+(read a file), `grep` (search file contents by regular expression), `glob` (find files by a glob
+pattern), `run_command` (run a shell command, optionally in the background), `command_status`/
+`stop_command` (check on or stop a background job), `patch_file` (edit or create a file),
+`update_plan` (declare a live checklist for a multi-step task), `spawn_agent` (delegate a
+self-contained, read-only task to an isolated sub-agent), `search_code` (semantic code search,
+only offered when `embedding_model` is configured — see below), `ask_user` (pause and ask you a
+clarifying question), and `remember`/`update_memory`/`forget` (manage persistent memory — see
+below). When you ask about code, the model can explore, read, build, test, and fix on its own
+instead of requiring you to attach files with `@path`:
 
 ```text
 > What does the agent loop in src/chat.rs do?
@@ -305,21 +382,70 @@ and fix on its own instead of requiring you to attach files with `@path`:
 > Fix the typo in the README heading.
 ```
 
+`grep` and `glob` are read-only, so they never prompt for approval. Both respect `.gitignore` the
+same way directory context (`@dir`) does. `grep` takes a regular expression plus optional `path`
+(scope), `glob` (filename filter), and `case_insensitive`; `glob` takes a pattern like
+`"src/**/*.rs"` plus an optional `path` scope. The model is steered to prefer these over shelling
+out to `grep`/`find` through `run_command`, since they need no approval and are cheaper to run.
+
+For multi-step tasks, the model can call `update_plan` with a checklist (`{step, status}` for each
+step, replacing the whole list each call) instead of leaving its progress buried in the raw tool
+trace. Kamui renders it live as a checklist:
+
+```
+  → plan
+    [x] Explore the codebase
+    [~] Implement the change
+    [ ] Run tests
+```
+
+`[x]` is completed, `[~]` is in progress, `[ ]` is pending. Like `grep`/`glob`, it never prompts
+for approval — it has no effect outside the conversation and round-trips through session history
+like any other tool call, so a resumed session shows the plan as it stood at each point.
+
 If the model calls a tool, Kamui prints a short trace of each call, runs it, feeds the result back,
 and continues streaming until a final answer. The read tools reuse the same path safety as `@file`
 (project-relative only, no escaping the root, 64 KiB per file) and the loop is bounded so it cannot
 run away.
 
 `run_command` never runs on its own. Kamui shows you the exact command and waits for you to approve
-it (`y`/`yes`); anything else declines and tells the model so. Commands run in the project directory
-with input disabled, a 30-second timeout, and a capped amount of captured output, and the model sees
-the exit code alongside stdout and stderr.
+it (`y`/`yes`); anything else declines and tells the model so. A third answer, `a`/`always`, both
+approves this call and grants that *tool* (not that specific command — every future call to it,
+e.g. any `run_command` invocation) a standing pass for the rest of the active session, so further
+calls skip the prompt entirely until `/new` clears it. This is separate from the global
+`[permissions] allow_commands` allowlist below: "always allow" is a one-tap, session-only grant you
+make from the prompt itself, not something you configure ahead of time. Commands run in the project
+directory with input disabled and a capped amount of captured output, and the model sees the exit
+code alongside stdout and stderr. The foreground timeout defaults to 30 seconds and is configurable —
+see `[commands]` below.
 
-`patch_file` edits one file per call and is also gated behind your approval: Kamui shows the change
-as removed (`-`) and added (`+`) lines before asking. A patch replaces text that must match the file
+For something that legitimately runs longer than that — a dev server, a slow test suite — the model
+can pass `background: true` instead. It returns a job id immediately rather than waiting, and can
+check on it with `command_status` (omit `job_id` to list every job) or stop it early with
+`stop_command`. `/jobs` lists them directly without going through the model. Background jobs are
+in-memory only: they are killed when Kamui exits (including a plain `-p` run) and do not survive a
+restart, and each has a `background_max_secs` (default 30 minutes) safety cap against a runaway or
+zombie process — not a limit meant to constrain a legitimately long-running command.
+
+```toml
+[commands]
+timeout_secs = 30            # foreground run_command
+background_max_secs = 1800   # safety cap for a background: true job
+```
+
+`patch_file` edits one file per call and is also gated behind your approval (the same `y`/`yes`/
+`a`/`always` prompt): Kamui shows the change as removed (`-`) and added (`+`) lines before asking. A
+patch replaces text that must match the file
 exactly once — if it does not, the patch is rejected and the model is told to re-read the file, so a
 stale edit can never overwrite unexpected content. An empty `old_text` creates a new file. Writes are
-atomic, and paths cannot escape the project root.
+atomic per file, and paths cannot escape the project root.
+
+Each file `patch_file` touches is approved individually, exactly as before, but Kamui also keeps a
+snapshot of what every touched file looked like before the turn started. If a multi-file edit is
+interrupted with `Ctrl+C` partway through, the files it already changed are automatically reverted
+so the turn never leaves the repository half-edited with no trace in session history. `/undo`
+reverts the same way for a turn that *did* complete — one level, most recent turn only; a second
+`/undo` has nothing left to do.
 
 If the [RTK](https://github.com/rtk-ai/rtk) binary is installed, simple approved commands are
 automatically prefixed with `rtk` so their output is compressed before it reaches the model. RTK is
@@ -336,6 +462,29 @@ option's text, and anything else is taken as typed. This is not an approval prom
 and `patch_file` still ask for that automatically — it's for when the model itself decides it needs
 more information to continue. In `-p` non-interactive mode there is no one to ask, so the tool is
 declined and the model is told to proceed on its own judgment instead.
+
+## Sub-agents
+
+`spawn_agent` delegates a self-contained task to an isolated sub-agent and returns only its final
+answer — the sub-agent's own tool calls and intermediate output never enter the main
+conversation's context:
+
+```text
+> Summarize how error handling works across the codebase
+```
+
+The model might call `spawn_agent` internally to explore before answering, instead of doing that
+exploration in the main conversation itself. The sub-agent:
+
+- Starts fresh with no memory of the conversation, so its prompt must be self-contained.
+- Can only `read_file`, `list_directory`, `grep`, and `glob` — it cannot run commands, edit files,
+  touch memory, or spawn another sub-agent, so it never needs your approval for anything it does.
+- Runs sequentially (it blocks the turn until it returns), not concurrently with the main
+  conversation — a deliberate v1 scope, since concurrent sub-agents would need their own approval
+  prompts interleaved with the main one.
+
+This is a good fit for a well-scoped question like "find every place X is used and summarize how"
+or "explain what module Y does," not a substitute for tools the model can already call directly.
 
 ## Memory
 

@@ -13,19 +13,31 @@ const TOOLS: &str = "\
 You can call tools to work in the repository:
 - list_directory: see what a folder contains.
 - read_file: read a file's contents.
+- grep: search file contents by regular expression across the project.
+- glob: find files by a glob pattern, e.g. \"src/**/*.rs\".
 - run_command: run a shell command (the user must approve it before it runs).
 - patch_file: create or edit one file by exact-text replacement (the user must approve it).
+- update_plan: declare or replace the checklist for a multi-step task, shown live to the user.
+- spawn_agent: delegate a self-contained, read-only exploration task to an isolated sub-agent.
 - ask_user: pause and ask the user a clarifying question, waiting for their actual answer.
 
 Use tools to gather real information instead of guessing. Read a file before you answer questions \
 about it or edit it. To change code, read the target first, then call patch_file with an old_text \
 that occurs exactly once; prefer the smallest correct change and keep the surrounding style. Use \
-run_command for builds, tests, and searches. Never claim you read, ran, or edited something unless \
-you actually called the matching tool. If a tool returns an error, read it and adjust instead of \
-repeating the same call. When you need information only the user can provide — which of several \
-options they want, a preference, a missing detail — call ask_user instead of writing the question \
-as plain text and guessing at their reply from what they say next; asking in plain text does not \
-pause the turn or wait for a real answer.";
+run_command for builds and tests. Prefer grep/glob over run_command with shell grep/find/ls for \
+locating code or files — they are faster, need no approval, and already respect .gitignore. For \
+tasks with three or more distinct steps, call update_plan with the full checklist before starting \
+and update it as you go, marking at most one step in_progress at a time; skip it for simple, \
+single-step requests. For a well-scoped, self-contained exploration question — \"find every place \
+X is used and summarize how\", \"explain what module Y does\" — consider spawn_agent so the \
+sub-agent's own tool trace does not fill your context; do not use it for anything that needs to \
+run commands, edit files, or see this conversation's history. Never claim you read, ran, or \
+edited something unless you actually called the matching tool. If a tool returns an error, read \
+it and adjust instead of repeating the same call. \
+When you need information only the user can provide — which of several options they want, a \
+preference, a missing detail — \
+call ask_user instead of writing the question as plain text and guessing at their reply from what \
+they say next; asking in plain text does not pause the turn or wait for a real answer.";
 
 /// Build the system prompt. The tool guidance is included only when the active profile offers tools,
 /// and any project instructions are appended after it.

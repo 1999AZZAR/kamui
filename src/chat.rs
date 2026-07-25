@@ -10,7 +10,9 @@ use crate::tools;
 use crate::tools::ToolRegistry;
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{path::Path, process::Command};
@@ -24,6 +26,7 @@ const MAX_TOOL_ROUNDS: usize = 25;
 /// Settings key for the persisted active provider profile.
 const ACTIVE_PROFILE_KEY: &str = "active_profile";
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_chat<F>(
     config: Config,
     tools: ToolRegistry,
@@ -31,6 +34,7 @@ pub async fn start_chat<F>(
     database: &Database,
     project: &ProjectContext,
     resume_id: Option<String>,
+    auto_approve: bool,
     build_provider: F,
 ) -> Result<()>
 where
@@ -47,9 +51,21 @@ where
         .unwrap_or_else(|| config.default().clone());
     let mut provider = build_provider(&active);
     let mut context_window = active.context_window;
+    let job_registry = tools.jobs();
 
-    print_status(project, &active, &tools, &mcp_statuses);
+    print_status(
+        project,
+        &active,
+        &tools,
+        &mcp_statuses,
+        &config.allow_commands,
+    );
     println!("Data: {}", database.path().display());
+    if auto_approve {
+        println!(
+            "\u{26a0} --auto-approve is active: commands and file edits will run without asking."
+        );
+    }
     println!("Type /help for commands or exit to quit.\n");
 
     let (mut session, mut messages) = match resume_id {
@@ -78,6 +94,13 @@ where
     // `messages` is sent verbatim. Both reset whenever a command replaces the loaded history.
     let mut summary: Option<String> = None;
     let mut summarized_upto: usize = 0;
+    // The most recently completed turn's pre-edit file snapshot, if it touched any files, so
+    // `/undo` can revert it. `None` once nothing is left to undo.
+    let mut last_turn_snapshot: Option<HashMap<PathBuf, Option<String>>> = None;
+    // Tool names granted a standing "always allow" for the rest of this session (ported from
+    // Kumo's "Always allow" approval button). Session-scoped: cleared whenever a chat effectively
+    // restarts (`/new`, or `/delete` of the active session), same as `last_turn_snapshot`.
+    let mut always_allowed: HashSet<String> = HashSet::new();
 
     'chat: loop {
         print!("> ");
@@ -87,21 +110,21 @@ where
             input = input_rx.recv() => match input {
                 Some(input) => input,
                 None => {
-                    shutdown(database, session.as_ref(), context_window)?;
+                    shutdown(database, session.as_ref(), context_window, &job_registry)?;
                     break;
                 }
             },
             signal = tokio::signal::ctrl_c() => {
                 signal.context("failed to listen for Ctrl+C")?;
                 println!();
-                shutdown(database, session.as_ref(), context_window)?;
+                shutdown(database, session.as_ref(), context_window, &job_registry)?;
                 break;
             }
         };
         let input = input.trim();
 
         if input.eq_ignore_ascii_case("exit") || input == "/exit" {
-            shutdown(database, session.as_ref(), context_window)?;
+            shutdown(database, session.as_ref(), context_window, &job_registry)?;
             break;
         }
         if input.is_empty() {
@@ -124,7 +147,13 @@ where
                 continue;
             }
             if command == "/status" {
-                print_status(project, &active, &tools, &mcp_statuses);
+                print_status(
+                    project,
+                    &active,
+                    &tools,
+                    &mcp_statuses,
+                    &config.allow_commands,
+                );
                 continue;
             }
             if command == "/compact" {
@@ -149,6 +178,35 @@ where
                 }
                 continue;
             }
+            if command == "/undo" {
+                match last_turn_snapshot.take() {
+                    Some(snapshot) => {
+                        let reverted = revert_snapshot(&snapshot);
+                        println!("Reverted {reverted} file(s) from the last turn.\n");
+                    }
+                    None => println!("Nothing to undo.\n"),
+                }
+                continue;
+            }
+            if command == "/jobs" {
+                println!("{}\n", tools::describe_jobs(&job_registry));
+                continue;
+            }
+            if command == "/index" {
+                let outcome = tokio::select! {
+                    result = run_index(provider.as_ref(), &active, database, project) => result,
+                    signal = tokio::signal::ctrl_c() => {
+                        signal.context("failed to listen for Ctrl+C")?;
+                        println!("\n(interrupted — back to prompt)\n");
+                        continue;
+                    }
+                };
+                match outcome {
+                    Ok(summary) => println!("{summary}\n"),
+                    Err(error) => eprintln!("Index failed: {error:#}\n"),
+                }
+                continue;
+            }
             let messages_before = messages.len();
             if let Err(error) = handle_command(
                 input,
@@ -157,6 +215,8 @@ where
                 database,
                 &mut session,
                 &mut messages,
+                &mut always_allowed,
+                &mut last_turn_snapshot,
             ) {
                 eprintln!("Command failed: {error:#}\n");
             }
@@ -179,11 +239,15 @@ where
 
         let model = active.model.clone();
         // Some models/endpoints reject the `tools` field; a profile can opt out so plain chat works.
-        let tool_definitions = if active.tools {
+        let mut tool_definitions = if active.tools {
             tools.definitions()
         } else {
             Vec::new()
         };
+        // search_code is only offered when this profile has somewhere to embed a query against.
+        if active.tools && active.embedding_model.is_some() {
+            tool_definitions.push(tools::search_code_definition());
+        }
 
         // Auto-compact older history once the recent portion grows past the threshold.
         summarized_upto = summarized_upto.min(messages.len());
@@ -238,6 +302,10 @@ where
         let mut final_finish = String::new();
         let mut last_content = String::new();
         let mut tool_trail: Vec<Message> = Vec::new();
+        // Pre-edit snapshot of every file an approved patch_file call touches this turn, so an
+        // interrupted multi-file edit can be reverted instead of left half-applied (see
+        // `snapshot_patch_target`/`revert_on_cancel`).
+        let mut turn_snapshot: HashMap<PathBuf, Option<String>> = HashMap::new();
         let mut round = 0usize;
         let assistant_message = 'agent: loop {
             round += 1;
@@ -268,12 +336,14 @@ where
                     Err(error) => {
                         stop_spinner(&mut spinner).await;
                         eprintln!("\nRequest failed: {error:#}\n");
+                        revert_on_cancel(&turn_snapshot);
                         continue 'chat;
                     }
                 },
                 signal = tokio::signal::ctrl_c() => {
                     stop_spinner(&mut spinner).await;
                     signal.context("failed to listen for Ctrl+C")?;
+                    revert_on_cancel(&turn_snapshot);
                     println!("\n(interrupted — back to prompt)\n");
                     continue 'chat;
                 }
@@ -287,6 +357,7 @@ where
                     signal = tokio::signal::ctrl_c() => {
                         stop_spinner(&mut spinner).await;
                         signal.context("failed to listen for Ctrl+C")?;
+                        revert_on_cancel(&turn_snapshot);
                         println!("\n(interrupted — back to prompt)\n");
                         continue 'chat;
                     }
@@ -313,11 +384,13 @@ where
                     Some(Err(error)) => {
                         stop_spinner(&mut spinner).await;
                         eprintln!("\n\nRequest failed: {error:#}\n");
+                        revert_on_cancel(&turn_snapshot);
                         continue 'chat;
                     }
                     None => {
                         stop_spinner(&mut spinner).await;
                         eprintln!("\n\nRequest failed: provider stream closed unexpectedly\n");
+                        revert_on_cancel(&turn_snapshot);
                         continue 'chat;
                     }
                 }
@@ -344,45 +417,108 @@ where
             turn_messages.push(request_message.clone());
             tool_trail.push(request_message);
             for call in &tool_calls {
-                println!(
-                    "  \u{2192} {}({})",
-                    call.name,
-                    truncate(call.arguments.trim(), 120)
-                );
+                if call.name == tools::UPDATE_PLAN_TOOL
+                    && let Some(rendered) = tools::render_plan(&call.arguments)
+                {
+                    println!("  \u{2192} plan");
+                    println!("{rendered}");
+                } else {
+                    println!(
+                        "  \u{2192} {}({})",
+                        call.name,
+                        truncate(call.arguments.trim(), 120)
+                    );
+                }
                 let output = if call.name == tools::ASK_USER_TOOL {
                     tokio::select! {
                         output = ask_user(&mut input_rx, &call.arguments) => output?,
                         signal = tokio::signal::ctrl_c() => {
                             signal.context("failed to listen for Ctrl+C")?;
+                            revert_on_cancel(&turn_snapshot);
                             println!("\n(interrupted — back to prompt)\n");
                             continue 'chat;
                         }
                     }
+                } else if call.name == tools::SPAWN_AGENT_TOOL {
+                    tokio::select! {
+                        output = dispatch_spawn_agent(
+                            provider.as_ref(),
+                            &active.model,
+                            project,
+                            &call.arguments,
+                        ) => output,
+                        signal = tokio::signal::ctrl_c() => {
+                            signal.context("failed to listen for Ctrl+C")?;
+                            revert_on_cancel(&turn_snapshot);
+                            println!("\n(interrupted — back to prompt)\n");
+                            continue 'chat;
+                        }
+                    }
+                } else if call.name == tools::SEARCH_CODE_TOOL {
+                    match active.embedding_model.as_deref() {
+                        Some(embedding_model) => {
+                            tokio::select! {
+                                output = dispatch_search_code(
+                                    provider.as_ref(),
+                                    embedding_model,
+                                    database,
+                                    &call.arguments,
+                                ) => output,
+                                signal = tokio::signal::ctrl_c() => {
+                                    signal.context("failed to listen for Ctrl+C")?;
+                                    revert_on_cancel(&turn_snapshot);
+                                    println!("\n(interrupted — back to prompt)\n");
+                                    continue 'chat;
+                                }
+                            }
+                        }
+                        None => "Error: this profile has no embedding_model configured; \
+                                 search_code is unavailable"
+                            .to_string(),
+                    }
                 } else if is_memory_tool(&call.name) {
                     dispatch_memory_tool(database, &call.name, &call.arguments)
-                } else if tools.requires_confirmation(&call.name) {
+                } else if tools.requires_confirmation_for(&call.name, &call.arguments)
+                    && !auto_approve
+                    && !always_allowed.contains(&call.name)
+                {
                     if let Some(preview) = tools.preview(call) {
                         println!("{preview}");
                     }
-                    print!("    approve? [y/N] ");
+                    print!("    approve? [y/N/a] ");
                     io::stdout().flush()?;
                     let answer = tokio::select! {
                         answer = input_rx.recv() => answer,
                         signal = tokio::signal::ctrl_c() => {
                             signal.context("failed to listen for Ctrl+C")?;
+                            revert_on_cancel(&turn_snapshot);
                             println!("\n(interrupted — back to prompt)\n");
                             continue 'chat;
                         }
                     };
-                    let approved = matches!(
-                        answer.as_deref().map(str::trim),
-                        Some("y" | "Y" | "yes" | "Yes")
-                    );
+                    let trimmed = answer.as_deref().map(str::trim);
+                    let always = matches!(trimmed, Some("a" | "A" | "always" | "Always"));
+                    let approved = always || matches!(trimmed, Some("y" | "Y" | "yes" | "Yes"));
+                    if always {
+                        always_allowed.insert(call.name.clone());
+                        println!(
+                            "    (always allowing {} for the rest of this session — /new clears this)",
+                            call.name
+                        );
+                    }
                     if approved {
+                        if call.name == tools::PATCH_FILE_TOOL {
+                            snapshot_patch_target(
+                                project.root(),
+                                &call.arguments,
+                                &mut turn_snapshot,
+                            );
+                        }
                         tokio::select! {
                             output = tools.dispatch(call) => output,
                             signal = tokio::signal::ctrl_c() => {
                                 signal.context("failed to listen for Ctrl+C")?;
+                                revert_on_cancel(&turn_snapshot);
                                 println!("\n    (interrupted — back to prompt)\n");
                                 continue 'chat;
                             }
@@ -392,10 +528,18 @@ where
                         "The user declined to run this command.".to_string()
                     }
                 } else {
+                    // Reached because the tool never needs confirmation, --auto-approve overrode
+                    // one that normally would, or it was granted a standing "always allow" this
+                    // session; either way, still snapshot a patch so it can be reverted like an
+                    // approved one.
+                    if call.name == tools::PATCH_FILE_TOOL {
+                        snapshot_patch_target(project.root(), &call.arguments, &mut turn_snapshot);
+                    }
                     tokio::select! {
                         output = tools.dispatch(call) => output,
                         signal = tokio::signal::ctrl_c() => {
                             signal.context("failed to listen for Ctrl+C")?;
+                            revert_on_cancel(&turn_snapshot);
                             println!("\n    (interrupted — back to prompt)\n");
                             continue 'chat;
                         }
@@ -410,6 +554,9 @@ where
                 tool_trail.push(result_message);
             }
         };
+
+        // The turn completed normally (not cancelled): keep its file snapshot around for /undo.
+        last_turn_snapshot = (!turn_snapshot.is_empty()).then_some(turn_snapshot);
 
         // Assemble the full turn: the original prompt, any tool trail, then the final answer.
         let final_answer = assistant_message.content.clone();
@@ -452,7 +599,7 @@ where
                 signal = tokio::signal::ctrl_c() => {
                     signal.context("failed to listen for Ctrl+C")?;
                     println!();
-                    shutdown(database, session.as_ref(), context_window)?;
+                    shutdown(database, session.as_ref(), context_window, &job_registry)?;
                     break;
                 }
             };
@@ -507,11 +654,14 @@ where
     let expanded = project
         .expand_file_references(prompt)
         .context("could not attach file")?;
-    let tool_definitions = if active.tools {
+    let mut tool_definitions = if active.tools {
         tools.definitions()
     } else {
         Vec::new()
     };
+    if active.tools && active.embedding_model.is_some() {
+        tool_definitions.push(tools::search_code_definition());
+    }
 
     let mut system = prompt::build(active.tools, project.system_message().as_deref());
     let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
@@ -552,19 +702,45 @@ where
         turn_messages.push(request_message.clone());
         tool_trail.push(request_message);
         for call in &response.tool_calls {
-            println!(
-                "  \u{2192} {}({})",
-                call.name,
-                truncate(call.arguments.trim(), 120)
-            );
+            if call.name == tools::UPDATE_PLAN_TOOL
+                && let Some(rendered) = tools::render_plan(&call.arguments)
+            {
+                println!("  \u{2192} plan");
+                println!("{rendered}");
+            } else {
+                println!(
+                    "  \u{2192} {}({})",
+                    call.name,
+                    truncate(call.arguments.trim(), 120)
+                );
+            }
             let output = if call.name == tools::ASK_USER_TOOL {
                 println!("    skipped: ask_user is not available in non-interactive mode");
                 "There is no user to ask in non-interactive mode. Proceed using your best \
                  judgment, or state your assumption in the final answer."
                     .to_string()
+            } else if call.name == tools::SPAWN_AGENT_TOOL {
+                dispatch_spawn_agent(provider.as_ref(), &active.model, project, &call.arguments)
+                    .await
+            } else if call.name == tools::SEARCH_CODE_TOOL {
+                match active.embedding_model.as_deref() {
+                    Some(embedding_model) => {
+                        dispatch_search_code(
+                            provider.as_ref(),
+                            embedding_model,
+                            database,
+                            &call.arguments,
+                        )
+                        .await
+                    }
+                    None => "Error: this profile has no embedding_model configured; search_code \
+                             is unavailable"
+                        .to_string(),
+                }
             } else if is_memory_tool(&call.name) {
                 dispatch_memory_tool(database, &call.name, &call.arguments)
-            } else if tools.requires_confirmation(&call.name) && !auto_approve {
+            } else if tools.requires_confirmation_for(&call.name, &call.arguments) && !auto_approve
+            {
                 println!("    denied: non-interactive mode (pass --auto-approve to allow)");
                 "The user declined to run this command (non-interactive mode).".to_string()
             } else {
@@ -632,6 +808,10 @@ where
         "\nTo resume this session: kamui -r {}",
         short_id(&session.id)
     );
+
+    // Nothing outlives a single -p invocation: a background job has no way to be checked on or
+    // stopped once the process exits.
+    tools::kill_all_jobs(&tools.jobs());
 
     Ok(())
 }
@@ -708,6 +888,8 @@ fn handle_command(
     database: &Database,
     session: &mut Option<Session>,
     messages: &mut Vec<Message>,
+    always_allowed: &mut HashSet<String>,
+    last_turn_snapshot: &mut Option<HashMap<PathBuf, Option<String>>>,
 ) -> Result<()> {
     let (command, argument) = input.split_once(' ').unwrap_or((input, ""));
     let argument = argument.trim();
@@ -717,6 +899,8 @@ fn handle_command(
         "/new" => {
             *session = None;
             messages.clear();
+            always_allowed.clear();
+            *last_turn_snapshot = None;
             println!("Started a new chat. It will be saved after the first response.\n");
         }
         "/sessions" => {
@@ -769,6 +953,8 @@ fn handle_command(
             {
                 *session = None;
                 messages.clear();
+                always_allowed.clear();
+                *last_turn_snapshot = None;
                 println!("Started a new chat. It will be saved after the first response.\n");
             }
         }
@@ -958,13 +1144,77 @@ fn shutdown(
     database: &Database,
     session: Option<&Session>,
     context_window: Option<u64>,
+    jobs: &tools::JobRegistry,
 ) -> Result<()> {
+    // Nothing should outlive the process: a still-running background job has no way to be
+    // checked on or stopped once Kamui exits.
+    tools::kill_all_jobs(jobs);
     if let Some(session) = session {
         print_stats(database, session, context_window)?;
         println!("To resume this session: kamui -r {}", short_id(&session.id));
     }
     println!("Goodbye");
     Ok(())
+}
+
+/// Snapshot a `patch_file` call's target before it is dispatched, so the turn can be reverted if
+/// cancelled. First-touch-wins: if this path was already snapshotted earlier in the turn, the
+/// existing entry (the file's state *before this turn*) is kept, not overwritten with an
+/// intermediate edit. If the file exists but cannot be read as UTF-8, it is left unsnapshotted
+/// rather than guessing — `patch_file` itself will fail the same way, so nothing gets written and
+/// there is nothing to revert for that path.
+fn snapshot_patch_target(
+    root: &Path,
+    arguments: &str,
+    snapshot: &mut HashMap<PathBuf, Option<String>>,
+) {
+    let Some(target) = tools::patch_target(root, arguments) else {
+        return;
+    };
+    if snapshot.contains_key(&target) {
+        return;
+    }
+    if target.is_file() {
+        if let Ok(content) = std::fs::read_to_string(&target) {
+            snapshot.insert(target, Some(content));
+        }
+    } else {
+        snapshot.insert(target, None);
+    }
+}
+
+/// Revert every file in a turn's patch snapshot back to its pre-turn state: restore the original
+/// content, or delete a file that did not exist before the turn. Best-effort — a failure on one
+/// file is reported but does not stop the rest from being reverted. Returns how many files were
+/// successfully reverted.
+fn revert_snapshot(snapshot: &HashMap<PathBuf, Option<String>>) -> usize {
+    let mut reverted = 0;
+    for (path, original) in snapshot {
+        let result = match original {
+            Some(content) => tools::write_atomic(path, content),
+            None => match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            },
+        };
+        match result {
+            Ok(()) => reverted += 1,
+            Err(error) => eprintln!("    ! could not revert {}: {error:#}", display_path(path)),
+        }
+    }
+    reverted
+}
+
+/// If this turn touched any files, revert them and report how many. Called right before
+/// abandoning a cancelled or failed turn so a Ctrl+C (or a dropped request) never leaves a
+/// multi-file edit half-applied with no trace in session history.
+fn revert_on_cancel(snapshot: &HashMap<PathBuf, Option<String>>) {
+    if snapshot.is_empty() {
+        return;
+    }
+    let reverted = revert_snapshot(snapshot);
+    println!("(reverted {reverted} file(s) changed before this turn was interrupted)");
 }
 
 fn print_history_preview(messages: &[Message]) {
@@ -1067,7 +1317,7 @@ fn short_id(id: &str) -> &str {
 /// Render a path for display, trimming the Windows verbatim prefix that `canonicalize` adds
 /// (`\\?\C:\...` and `\\?\UNC\server\share`). The canonical form stays in use internally for
 /// path-safety checks.
-fn display_path(path: &std::path::Path) -> String {
+pub(crate) fn display_path(path: &std::path::Path) -> String {
     let text = path.display().to_string();
     if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{unc}")
@@ -1120,6 +1370,238 @@ async fn ask_user(
         .map(String::as_str)
         .unwrap_or(answer);
     Ok(resolved.to_string())
+}
+
+#[derive(serde::Deserialize)]
+struct SpawnAgentArguments {
+    prompt: String,
+}
+
+/// Dispatch `spawn_agent`, converting any failure to an `Error: ...` string (same convention as
+/// `ToolRegistry::dispatch`) so a misbehaving sub-agent fails the tool call, not the whole turn.
+async fn dispatch_spawn_agent(
+    provider: &dyn Provider,
+    model: &str,
+    project: &ProjectContext,
+    arguments: &str,
+) -> String {
+    match run_spawned_agent(provider, model, project, arguments).await {
+        Ok(output) => output,
+        Err(error) => format!("Error: {error:#}"),
+    }
+}
+
+/// Run an isolated sub-agent to completion and return just its final answer: a fresh system
+/// prompt and no shared history with the parent conversation, so the parent's context is not
+/// polluted by the sub-agent's own exploration trace. Scoped to `ToolRegistry::read_only` — none
+/// of those tools ever require confirmation, so there is no approval flow to reproduce here, and
+/// `tool_definitions_only` omits `spawn_agent` itself, so a sub-agent cannot recurse.
+async fn run_spawned_agent(
+    provider: &dyn Provider,
+    model: &str,
+    project: &ProjectContext,
+    arguments: &str,
+) -> Result<String> {
+    let arguments: SpawnAgentArguments = serde_json::from_str(arguments)
+        .context("spawn_agent requires a 'prompt' string argument")?;
+    if arguments.prompt.trim().is_empty() {
+        anyhow::bail!("spawn_agent requires a non-empty 'prompt' argument");
+    }
+
+    let sub_tools = tools::ToolRegistry::read_only(project.root().to_path_buf());
+    let tool_definitions = sub_tools.tool_definitions_only();
+    let system = prompt::build(true, project.system_message().as_deref());
+    let mut messages = vec![Message::system(system), Message::user(&arguments.prompt)];
+
+    let mut round = 0usize;
+    loop {
+        round += 1;
+        if round > MAX_TOOL_ROUNDS {
+            anyhow::bail!(
+                "sub-agent stopped after {MAX_TOOL_ROUNDS} tool rounds without a final answer"
+            );
+        }
+
+        let response = provider
+            .chat(ChatRequest {
+                model: model.to_string(),
+                messages: messages.clone(),
+                tools: tool_definitions.clone(),
+            })
+            .await
+            .context("sub-agent request failed")?;
+
+        if response.tool_calls.is_empty() {
+            return Ok(response.content);
+        }
+
+        messages.push(Message::tool_request(
+            response.content,
+            response.tool_calls.clone(),
+        ));
+        for call in &response.tool_calls {
+            let output = sub_tools.dispatch(call).await;
+            messages.push(Message::tool_result(&call.id, output));
+        }
+    }
+}
+
+/// Rebuild the semantic-search index: walk the project the same `.gitignore`-aware way `grep`/
+/// `glob` do, skip any file whose content hash matches what was indexed last time, chunk and embed
+/// the rest, and drop entries for files that no longer exist. Returns a one-line summary.
+async fn run_index(
+    provider: &dyn Provider,
+    active: &Profile,
+    database: &Database,
+    project: &ProjectContext,
+) -> Result<String> {
+    let embedding_model = active.embedding_model.as_deref().context(
+        "this profile has no embedding_model configured; set one under [provider] or \
+         [profiles.*] in kamui.toml to use semantic search",
+    )?;
+
+    let root = project.root();
+    let mut seen = std::collections::HashSet::new();
+    let mut indexed = 0usize;
+    let mut skipped = 0usize;
+    let mut chunk_total = 0usize;
+
+    for path in tools::walk(root) {
+        let relative = tools::relative_slug(root, &path);
+        seen.insert(relative.clone());
+        // Binary or otherwise unreadable-as-text files are simply not indexable, same as grep.
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let hash = content_hash(&content);
+        if database.indexed_file_hash(&relative)?.as_deref() == Some(hash.as_str()) {
+            skipped += 1;
+            continue;
+        }
+
+        let chunks = tools::chunk_text(&content);
+        database.delete_chunks_for_path(&relative)?;
+        if !chunks.is_empty() {
+            let texts: Vec<String> = chunks.iter().map(|(_, _, text)| text.clone()).collect();
+            let embeddings = provider
+                .embed(embedding_model, texts)
+                .await
+                .with_context(|| format!("failed to embed {relative}"))?;
+            for ((start, end, text), embedding) in chunks.into_iter().zip(embeddings) {
+                database.insert_chunk(&relative, start, end, &text, &embedding)?;
+                chunk_total += 1;
+            }
+        }
+        database.set_indexed_file(&relative, &hash)?;
+        indexed += 1;
+    }
+
+    // Anything indexed before but not seen on this walk no longer exists (or is now ignored).
+    let mut removed = 0usize;
+    for path in database.indexed_paths()? {
+        if !seen.contains(&path) {
+            database.delete_chunks_for_path(&path)?;
+            database.delete_indexed_file(&path)?;
+            removed += 1;
+        }
+    }
+
+    Ok(format!(
+        "Indexed {indexed} file(s) ({chunk_total} new chunks), skipped {skipped} unchanged, \
+         removed {removed} deleted. {} chunk(s) total.",
+        database.chunk_count()?
+    ))
+}
+
+/// A fast, non-cryptographic change-detection hash — good enough to decide whether a file needs
+/// re-embedding, not a security primitive.
+fn content_hash(content: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
+#[derive(serde::Deserialize)]
+struct SearchCodeArguments {
+    query: String,
+}
+
+/// How many of the highest-scoring chunks `search_code` returns.
+const SEARCH_CODE_RESULTS: usize = 8;
+
+/// Dispatch `search_code`, converting any failure to an `Error: ...` string (same convention as
+/// `ToolRegistry::dispatch`) so a bad query or a missing index fails the tool call, not the turn.
+async fn dispatch_search_code(
+    provider: &dyn Provider,
+    embedding_model: &str,
+    database: &Database,
+    arguments: &str,
+) -> String {
+    match run_search_code(provider, embedding_model, database, arguments).await {
+        Ok(output) => output,
+        Err(error) => format!("Error: {error:#}"),
+    }
+}
+
+async fn run_search_code(
+    provider: &dyn Provider,
+    embedding_model: &str,
+    database: &Database,
+    arguments: &str,
+) -> Result<String> {
+    let arguments: SearchCodeArguments = serde_json::from_str(arguments)
+        .context("search_code requires a 'query' string argument")?;
+    if arguments.query.trim().is_empty() {
+        anyhow::bail!("search_code requires a non-empty 'query' argument");
+    }
+
+    let chunks = database.all_chunks()?;
+    if chunks.is_empty() {
+        anyhow::bail!("no code index found; run /index first");
+    }
+
+    let mut query_embedding = provider
+        .embed(embedding_model, vec![arguments.query.clone()])
+        .await
+        .context("failed to embed the query")?;
+    let query_vector = query_embedding
+        .pop()
+        .context("provider returned no embedding for the query")?;
+
+    let mut scored: Vec<(f32, storage::CodeChunk)> = chunks
+        .into_iter()
+        .map(|chunk| (cosine_similarity(&query_vector, &chunk.embedding), chunk))
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    scored.truncate(SEARCH_CODE_RESULTS);
+
+    Ok(scored
+        .into_iter()
+        .map(|(score, chunk)| {
+            format!(
+                "{}:{}-{} (score={score:.2})\n{}",
+                chunk.path, chunk.start_line, chunk.end_line, chunk.content
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n"))
+}
+
+/// Standard cosine similarity, in `[-1.0, 1.0]` for non-zero vectors (`0.0` for a mismatched or
+/// zero vector, which should not occur for embeddings from the same model but is handled rather
+/// than panicking on a division by zero).
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm_a = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    dot / (norm_a * norm_b)
 }
 
 /// Total bytes of stored memory content allowed before `remember` refuses to add more, keeping
@@ -1287,6 +1769,9 @@ fn print_help() {
     println!("/rename <id> <t>  Rename a session");
     println!("/search <text>    Search saved messages");
     println!("/compact          Summarize older messages to free up context");
+    println!("/undo             Revert the files patched by the last turn");
+    println!("/jobs             List background jobs started with run_command");
+    println!("/index            Rebuild the semantic-search index (needs embedding_model)");
     println!("/delete <id>      Delete a session");
     println!("/stats            Show current session usage");
     println!("/status           Show project and connection status");
@@ -1305,6 +1790,7 @@ fn print_status(
     active: &Profile,
     tools: &ToolRegistry,
     mcp_statuses: &[ConnectionStatus],
+    allow_commands: &[String],
 ) {
     let git = git_status(project.root());
     let project_name = project
@@ -1327,6 +1813,9 @@ fn print_status(
     }
     println!("│ Model    {}  ({})", active.model, active.name);
     println!("│ Tools    {} available", tools.len());
+    if !allow_commands.is_empty() {
+        println!("│ Allow    {}", allow_commands.join(", "));
+    }
     if mcp_statuses.is_empty() {
         println!("│ MCP      none configured");
     } else {
@@ -1684,11 +2173,277 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_patch_target_keeps_the_pre_turn_content_on_repeated_edits() {
+        // patch_target canonicalizes internally, so the root must be canonical too for the
+        // returned keys to compare equal to `root.join(...)`.
+        let root = temporary_directory().canonicalize().unwrap();
+        fs::write(root.join("a.txt"), "original").unwrap();
+        let mut snapshot = HashMap::new();
+
+        snapshot_patch_target(
+            &root,
+            r#"{"path":"a.txt","old_text":"original","new_text":"first edit"}"#,
+            &mut snapshot,
+        );
+        // A second, later call for the same path must not overwrite the pre-turn baseline.
+        snapshot_patch_target(
+            &root,
+            r#"{"path":"a.txt","old_text":"first edit","new_text":"second edit"}"#,
+            &mut snapshot,
+        );
+
+        assert_eq!(
+            snapshot.get(&root.join("a.txt")).unwrap().as_deref(),
+            Some("original")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_patch_target_records_none_for_a_new_file() {
+        let root = temporary_directory().canonicalize().unwrap();
+        let mut snapshot = HashMap::new();
+
+        snapshot_patch_target(
+            &root,
+            r#"{"path":"new.txt","old_text":"","new_text":"hello"}"#,
+            &mut snapshot,
+        );
+
+        assert_eq!(snapshot.get(&root.join("new.txt")), Some(&None));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn revert_snapshot_restores_edited_files_and_deletes_created_ones() {
+        let root = temporary_directory();
+        fs::write(root.join("edited.txt"), "changed").unwrap();
+        fs::write(root.join("created.txt"), "new content").unwrap();
+        let mut snapshot = HashMap::new();
+        snapshot.insert(root.join("edited.txt"), Some("original".to_string()));
+        snapshot.insert(root.join("created.txt"), None);
+
+        let reverted = revert_snapshot(&snapshot);
+
+        assert_eq!(reverted, 2);
+        assert_eq!(
+            fs::read_to_string(root.join("edited.txt")).unwrap(),
+            "original"
+        );
+        assert!(!root.join("created.txt").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn revert_snapshot_treats_an_already_missing_file_as_reverted() {
+        let root = temporary_directory();
+        let mut snapshot = HashMap::new();
+        snapshot.insert(root.join("never-written.txt"), None);
+
+        assert_eq!(revert_snapshot(&snapshot), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn is_memory_tool_recognizes_only_the_three_memory_tools() {
         assert!(is_memory_tool("remember"));
         assert!(is_memory_tool("update_memory"));
         assert!(is_memory_tool("forget"));
         assert!(!is_memory_tool("ask_user"));
         assert!(!is_memory_tool("run_command"));
+    }
+
+    #[test]
+    fn new_command_clears_always_allowed_and_undo_state() {
+        let database = Database::open_in_memory_for_tests();
+        let mut session: Option<Session> = None;
+        let mut messages: Vec<Message> = vec![Message::user("hi")];
+        let mut always_allowed: HashSet<String> = HashSet::from(["run_command".to_string()]);
+        let mut last_turn_snapshot: Option<HashMap<PathBuf, Option<String>>> = Some(HashMap::from(
+            [(PathBuf::from("a.txt"), Some("x".to_string()))],
+        ));
+
+        handle_command(
+            "/new",
+            &UnreachableProvider,
+            None,
+            &database,
+            &mut session,
+            &mut messages,
+            &mut always_allowed,
+            &mut last_turn_snapshot,
+        )
+        .unwrap();
+
+        assert!(session.is_none());
+        assert!(messages.is_empty());
+        assert!(always_allowed.is_empty());
+        assert!(last_turn_snapshot.is_none());
+    }
+
+    #[test]
+    fn delete_command_clears_state_when_deleting_the_active_session() {
+        let database = Database::open_in_memory_for_tests();
+        let created = database.create_session("test", "m").unwrap();
+        let id = created.id.clone();
+        let mut session = Some(created);
+        let mut messages: Vec<Message> = vec![Message::user("hi")];
+        let mut always_allowed: HashSet<String> = HashSet::from(["patch_file".to_string()]);
+        let mut last_turn_snapshot: Option<HashMap<PathBuf, Option<String>>> = Some(HashMap::new());
+
+        handle_command(
+            &format!("/delete {id}"),
+            &UnreachableProvider,
+            None,
+            &database,
+            &mut session,
+            &mut messages,
+            &mut always_allowed,
+            &mut last_turn_snapshot,
+        )
+        .unwrap();
+
+        assert!(session.is_none());
+        assert!(messages.is_empty());
+        assert!(always_allowed.is_empty());
+        assert!(last_turn_snapshot.is_none());
+    }
+
+    /// A `Provider` that panics if actually called — for tests asserting that `spawn_agent`
+    /// rejects bad input before ever making a request.
+    struct UnreachableProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for UnreachableProvider {
+        fn name(&self) -> &'static str {
+            "unreachable"
+        }
+        async fn chat(&self, _request: ChatRequest) -> Result<crate::provider::ChatResponse> {
+            panic!("spawn_agent should have rejected this input before calling the provider");
+        }
+        async fn chat_stream(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<mpsc::UnboundedReceiver<Result<crate::provider::StreamEvent>>> {
+            panic!("spawn_agent should have rejected this input before calling the provider");
+        }
+        async fn embed(&self, _model: &str, _input: Vec<String>) -> Result<Vec<Vec<f32>>> {
+            panic!("search_code should have rejected this input before calling the provider");
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_rejects_invalid_json_without_calling_the_provider() {
+        let root = temporary_directory().canonicalize().unwrap();
+        let project = ProjectContext::from_root(root.clone()).unwrap();
+
+        let output =
+            dispatch_spawn_agent(&UnreachableProvider, "gpt-5", &project, "not json").await;
+
+        assert!(output.starts_with("Error:"), "{output}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_rejects_an_empty_prompt_without_calling_the_provider() {
+        let root = temporary_directory().canonicalize().unwrap();
+        let project = ProjectContext::from_root(root.clone()).unwrap();
+
+        let output = dispatch_spawn_agent(
+            &UnreachableProvider,
+            "gpt-5",
+            &project,
+            r#"{"prompt":"   "}"#,
+        )
+        .await;
+
+        assert!(output.starts_with("Error:"), "{output}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cosine_similarity_of_identical_vectors_is_one() {
+        let vector = vec![1.0_f32, 2.0, 3.0];
+        assert!((cosine_similarity(&vector, &vector) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_of_orthogonal_vectors_is_zero() {
+        assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_handles_mismatched_or_empty_vectors() {
+        assert_eq!(cosine_similarity(&[1.0, 2.0], &[1.0]), 0.0);
+        assert_eq!(cosine_similarity(&[], &[]), 0.0);
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+    }
+
+    #[test]
+    fn content_hash_is_stable_and_change_sensitive() {
+        assert_eq!(content_hash("hello"), content_hash("hello"));
+        assert_ne!(content_hash("hello"), content_hash("world"));
+    }
+
+    #[tokio::test]
+    async fn search_code_rejects_invalid_json_without_calling_the_provider() {
+        let database = Database::open_in_memory_for_tests();
+        let output = dispatch_search_code(
+            &UnreachableProvider,
+            "text-embedding-3-small",
+            &database,
+            "not json",
+        )
+        .await;
+        assert!(output.starts_with("Error:"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn search_code_rejects_an_empty_query_without_calling_the_provider() {
+        let database = Database::open_in_memory_for_tests();
+        let output = dispatch_search_code(
+            &UnreachableProvider,
+            "text-embedding-3-small",
+            &database,
+            r#"{"query":"   "}"#,
+        )
+        .await;
+        assert!(output.starts_with("Error:"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn search_code_reports_a_missing_index_without_calling_the_provider() {
+        let database = Database::open_in_memory_for_tests();
+        let output = dispatch_search_code(
+            &UnreachableProvider,
+            "text-embedding-3-small",
+            &database,
+            r#"{"query":"how does auth work"}"#,
+        )
+        .await;
+        assert!(output.contains("no code index found"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn run_index_requires_an_embedding_model() {
+        let root = temporary_directory().canonicalize().unwrap();
+        let project = ProjectContext::from_root(root.clone()).unwrap();
+        let database = Database::open_in_memory_for_tests();
+        let active = Profile {
+            name: "default".to_string(),
+            model: "gpt-5".to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            api_key: "k".to_string(),
+            context_window: None,
+            tools: true,
+            embedding_model: None,
+        };
+
+        let error = run_index(&UnreachableProvider, &active, &database, &project)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("embedding_model"));
+        fs::remove_dir_all(root).unwrap();
     }
 }

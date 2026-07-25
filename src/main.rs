@@ -30,6 +30,9 @@ async fn main() -> Result<()> {
         Command::Doctor => {
             return run_doctor().await;
         }
+        Command::Status => {
+            return run_status().await;
+        }
         command => command,
     };
 
@@ -50,7 +53,16 @@ async fn main() -> Result<()> {
 
     // Connect MCP servers before the chat starts so their tools are offered from the first turn.
     let mcp = mcp::connect_all(&config.mcp_servers).await;
-    let tools = tools::ToolRegistry::with_defaults(project.root().to_path_buf(), mcp.tools);
+    let command_limits = tools::CommandLimits {
+        timeout: std::time::Duration::from_secs(config.command_timeout_secs),
+        background_max: std::time::Duration::from_secs(config.background_max_secs),
+    };
+    let tools = tools::ToolRegistry::with_defaults(
+        project.root().to_path_buf(),
+        mcp.tools,
+        config.allow_commands.clone(),
+        command_limits,
+    );
     let build_provider = |profile: &config::Profile| {
         Box::new(OpenAIProvider::new(
             profile.api_key.clone(),
@@ -59,7 +71,10 @@ async fn main() -> Result<()> {
     };
 
     match command {
-        Command::Chat(resume_id) => {
+        Command::Chat {
+            resume_id,
+            auto_approve,
+        } => {
             chat::start_chat(
                 config,
                 tools,
@@ -67,6 +82,7 @@ async fn main() -> Result<()> {
                 &database,
                 &project,
                 resume_id,
+                auto_approve,
                 build_provider,
             )
             .await?;
@@ -86,16 +102,25 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        Command::Help | Command::Version | Command::Doctor => unreachable!("handled above"),
+        Command::Help | Command::Version | Command::Doctor | Command::Status => {
+            unreachable!("handled above")
+        }
     }
 
     Ok(())
 }
 
 enum Command {
-    Chat(Option<String>),
-    Once { prompt: String, auto_approve: bool },
+    Chat {
+        resume_id: Option<String>,
+        auto_approve: bool,
+    },
+    Once {
+        prompt: String,
+        auto_approve: bool,
+    },
     Doctor,
+    Status,
     Help,
     Version,
 }
@@ -105,22 +130,21 @@ fn parse_command() -> Result<Command> {
 }
 
 fn parse_command_from(arguments: impl Iterator<Item = String>) -> Result<Command> {
-    let mut arguments = arguments;
-    match arguments.next().as_deref() {
-        None => Ok(Command::Chat(None)),
-        Some("-r" | "--resume") => {
-            let id = arguments.next().context("usage: kamui -r <session-id>")?;
-            if arguments.next().is_some() {
-                anyhow::bail!("usage: kamui -r <session-id>");
-            }
-            Ok(Command::Chat(Some(id)))
-        }
+    let tokens: Vec<String> = arguments.collect();
+    const CHAT_USAGE: &str = "usage: kamui [-r <session-id>] [--auto-approve]";
+
+    match tokens.first().map(String::as_str) {
+        None => Ok(Command::Chat {
+            resume_id: None,
+            auto_approve: false,
+        }),
         Some("-p" | "--print") => {
-            let prompt = arguments
-                .next()
+            let prompt = tokens
+                .get(1)
+                .cloned()
                 .context("usage: kamui -p <prompt> [--auto-approve]")?;
             let mut auto_approve = false;
-            for rest in arguments {
+            for rest in &tokens[2..] {
                 match rest.as_str() {
                     "--auto-approve" => auto_approve = true,
                     _ => anyhow::bail!("usage: kamui -p <prompt> [--auto-approve]"),
@@ -132,10 +156,100 @@ fn parse_command_from(arguments: impl Iterator<Item = String>) -> Result<Command
             })
         }
         Some("doctor") => Ok(Command::Doctor),
+        Some("status") => Ok(Command::Status),
         Some("-h" | "--help") => Ok(Command::Help),
         Some("-V" | "--version") => Ok(Command::Version),
-        Some(_) => anyhow::bail!("usage: kamui [-r <session-id>] [-p <prompt> [--auto-approve]]"),
+        Some(_) => {
+            // Chat mode: -r/--resume <id> and --auto-approve are both accepted, in any order.
+            let mut resume_id = None;
+            let mut auto_approve = false;
+            let mut rest = tokens.iter();
+            while let Some(token) = rest.next() {
+                match token.as_str() {
+                    "-r" | "--resume" => {
+                        resume_id = Some(rest.next().context(CHAT_USAGE)?.clone());
+                    }
+                    "--auto-approve" => auto_approve = true,
+                    _ => anyhow::bail!(CHAT_USAGE),
+                }
+            }
+            Ok(Command::Chat {
+                resume_id,
+                auto_approve,
+            })
+        }
     }
+}
+
+/// `kamui status`: read configuration and the local database directly and print a summary,
+/// without connecting to a provider or any MCP server — unlike `doctor`, this makes no network
+/// calls. Useful for checking on a Kamui setup from a terminal without starting a chat session.
+/// Ported from Kumo's `kumo status` (a sibling project, a Telegram gateway that delegates coding
+/// work to Kamui), adapted for Kamui's per-project rather than per-process configuration.
+async fn run_status() -> Result<()> {
+    println!("Kamui v{}", env!("CARGO_PKG_VERSION"));
+    println!();
+
+    let config = match Config::load() {
+        Ok(config::Loaded::Ready(config)) => config,
+        Ok(config::Loaded::NeedsSetup(path)) => {
+            println!(
+                "Config:    not set up yet at {} (run `kamui` to finish onboarding)",
+                path.display()
+            );
+            return Ok(());
+        }
+        Err(error) => {
+            println!("Config:    invalid: {error:#}");
+            return Ok(());
+        }
+    };
+
+    let default = config.default();
+    println!("Profile:   {} ({})", default.name, default.model);
+    println!("Base URL:  {}", default.base_url);
+    if config.profiles.len() > 1 {
+        let names: Vec<&str> = config.profiles.iter().map(|p| p.name.as_str()).collect();
+        println!(
+            "Profiles:  {} configured ({})",
+            config.profiles.len(),
+            names.join(", ")
+        );
+    }
+    match &default.embedding_model {
+        Some(model) => println!("Embedding: {model}"),
+        None => println!("Embedding: not configured (search_code unavailable)"),
+    }
+    if config.mcp_servers.is_empty() {
+        println!("MCP:       none configured");
+    } else {
+        println!(
+            "MCP:       {} server(s) configured",
+            config.mcp_servers.len()
+        );
+        for server in &config.mcp_servers {
+            println!("             - {}", server.name);
+        }
+    }
+    if !config.allow_commands.is_empty() {
+        println!(
+            "Allowlist: {} command(s) auto-approved",
+            config.allow_commands.len()
+        );
+    }
+
+    let project = ProjectContext::discover()?;
+    println!("Project:   {}", chat::display_path(project.root()));
+
+    let database = Database::open()?;
+    println!("Database:  {}", chat::display_path(database.path()));
+    println!("Sessions:  {}", database.list_sessions()?.len());
+    println!("Memory:    {} fact(s)", database.list_memory()?.len());
+    if default.embedding_model.is_some() {
+        println!("Index:     {} chunk(s)", database.chunk_count()?);
+    }
+
+    Ok(())
 }
 
 /// `kamui doctor`: check configuration, provider connectivity, and MCP servers one at a time,
@@ -239,8 +353,9 @@ fn print_help() {
     println!("Options:");
     println!("  -r, --resume <ID>   Resume a saved session");
     println!("  -p, --print <TEXT>  Run one prompt non-interactively and exit");
-    println!("      --auto-approve  With -p, approve tool calls without prompting");
+    println!("      --auto-approve  Approve tool calls without prompting (with -p, or standalone)");
     println!("  doctor              Check configuration, provider, and MCP servers");
+    println!("  status              Print a config/database summary (no network calls)");
     println!("  -h, --help          Print help");
     println!("  -V, --version       Print version");
 }
@@ -261,19 +376,49 @@ mod tests {
     fn no_arguments_starts_a_new_chat() {
         assert!(matches!(
             parse_command_from(args(&[])).unwrap(),
-            Command::Chat(None)
+            Command::Chat {
+                resume_id: None,
+                auto_approve: false,
+            }
         ));
     }
 
     #[test]
     fn resume_flag_carries_the_session_id() {
         let command = parse_command_from(args(&["-r", "abc123"])).unwrap();
-        assert!(matches!(command, Command::Chat(Some(id)) if id == "abc123"));
+        assert!(matches!(
+            command,
+            Command::Chat { resume_id: Some(id), auto_approve: false } if id == "abc123"
+        ));
     }
 
     #[test]
     fn resume_flag_rejects_trailing_arguments() {
         assert!(parse_command_from(args(&["-r", "abc123", "extra"])).is_err());
+    }
+
+    #[test]
+    fn auto_approve_flag_works_standalone_and_with_resume_in_either_order() {
+        let standalone = parse_command_from(args(&["--auto-approve"])).unwrap();
+        assert!(matches!(
+            standalone,
+            Command::Chat {
+                resume_id: None,
+                auto_approve: true
+            }
+        ));
+
+        let after_resume = parse_command_from(args(&["-r", "abc123", "--auto-approve"])).unwrap();
+        assert!(matches!(
+            after_resume,
+            Command::Chat { resume_id: Some(id), auto_approve: true } if id == "abc123"
+        ));
+
+        let before_resume = parse_command_from(args(&["--auto-approve", "-r", "abc123"])).unwrap();
+        assert!(matches!(
+            before_resume,
+            Command::Chat { resume_id: Some(id), auto_approve: true } if id == "abc123"
+        ));
     }
 
     #[test]
@@ -346,6 +491,14 @@ mod tests {
         assert!(matches!(
             parse_command_from(args(&["doctor"])).unwrap(),
             Command::Doctor
+        ));
+    }
+
+    #[test]
+    fn status_flag_is_recognized() {
+        assert!(matches!(
+            parse_command_from(args(&["status"])).unwrap(),
+            Command::Status
         ));
     }
 }

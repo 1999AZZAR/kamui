@@ -180,6 +180,10 @@ pub trait Provider: Send + Sync {
         &self,
         request: ChatRequest,
     ) -> Result<mpsc::UnboundedReceiver<Result<StreamEvent>>>;
+
+    /// Embed a batch of texts for `/index`/`search_code`, returned in the same order as `input`.
+    /// Only called when the active profile's `config::Profile::embedding_model` is configured.
+    async fn embed(&self, model: &str, input: Vec<String>) -> Result<Vec<Vec<f32>>>;
 }
 
 #[cfg(test)]

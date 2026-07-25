@@ -45,8 +45,8 @@ effort or operational risk is disproportionate to their immediate value.
   prompt shuts down gracefully. Windows stdin uses a reader thread and Tokio channel so the async
   runtime does not block on terminal input.
 - Supported chat commands are `/help`, `/new`, `/sessions`, `/resume <id>`, `/model [name]`,
-  `/rename <id> <title>`, `/search <text>`, `/compact`, `/delete <id>`, `/stats`, `/memory`,
-  `/forget <text>` (or `/forget all`), and `/exit`. Plain `exit` also quits.
+  `/rename <id> <title>`, `/search <text>`, `/compact`, `/undo`, `/jobs`, `/index`, `/delete <id>`,
+  `/stats`, `/memory`, `/forget <text>` (or `/forget all`), and `/exit`. Plain `exit` also quits.
 - Long sessions are compacted automatically: when the un-summarized recent history exceeds a byte
   threshold (about half the profile's `context_window`, or a default), older messages are folded
   into a rolling summary and the request sends the summary plus recent messages. `/compact` forces
@@ -56,15 +56,37 @@ effort or operational risk is disproportionate to their immediate value.
   `settings` table so it survives restarts. The banner shows the active model and profile.
 - After each streamed response the usage line reports time-to-first-token and total response time.
   These latency figures are displayed only, not persisted.
-- Chat requests offer the model read-only `read_file` and `list_directory` tools plus a
+- Chat requests offer the model read-only `read_file`, `list_directory`, `grep`, `glob`, and
+  `update_plan` tools, `command_status`/`stop_command` for background jobs, plus a
   confirmation-gated `run_command` tool. When the model calls one, Kamui runs a bounded streaming
-  agent loop: it executes the tool, prints a one-line trace, feeds the result back, and continues
-  until the model returns a plain answer. The whole turn is persisted, including the tool requests
-  and results, so resumed sessions replay them.
-- `run_command` never runs unattended. Kamui prints the requested command and requires a `y`/`yes`
-  approval; declining feeds a refusal back to the model. Commands run in the project directory with
-  stdin disabled, a 30-second kill timeout, and a 16 KiB output cap, and the result includes the
-  exit code with captured stdout and stderr.
+  agent loop: it executes the tool, prints a one-line trace (or, for `update_plan`, a rendered
+  `[ ]`/`[~]`/`[x]` checklist), feeds the result back, and continues until the model returns a
+  plain answer. The whole turn is persisted, including the tool requests and results, so resumed
+  sessions replay them.
+- `run_command` never runs unattended by default. Kamui prints the requested command and prompts
+  `[y/N/a]`; `y`/`yes` approves once, declining feeds a refusal back to the model. Three ways to
+  skip the prompt: `a`/`always` — ported from the sibling Kumo project's "Always allow" button,
+  adapted from Telegram inline buttons to a plain third answer — both approves that call and grants
+  the *tool* (not that specific command) a standing pass in `start_chat`'s `always_allowed:
+  HashSet<String>` for the rest of the active session, cleared on `/new` or deleting the active
+  session (`handle_command` takes `&mut HashSet<String>` for this); a global-only `[permissions]
+  allow_commands = [...]` exact-match allowlist (`Tool::requires_confirmation_for`, checked instead
+  of the no-arg `requires_confirmation` at dispatch time), configured ahead of time rather than
+  granted from the prompt; or launching with `--auto-approve` (accepted by the bare `kamui` command
+  too, not just `-p`), which prints a startup banner and skips every confirmation prompt —
+  including `[permissions]`-unlisted commands and `patch_file` — for the whole session. Commands run
+  in the project directory with stdin disabled, a configurable kill timeout
+  (`[commands].timeout_secs`, default 30 seconds), and a 16 KiB output cap, and the result includes
+  the exit code with captured stdout and stderr.
+- `run_command(background: true)` starts a job without waiting for it: a `tokio::task`
+  (`run_background_job`) owns the child process, drains its stdout/stderr independently so a killed
+  or timed-out job still reports whatever it produced, and races `child.wait()` against a
+  `[commands].background_max_secs` safety timer (default 30 minutes — a backstop against a runaway
+  process, not a limit on legitimate long-running commands) and a `tokio::sync::watch` kill signal.
+  `command_status` (omit `job_id` to list every job) and `stop_command` read/signal the shared
+  in-memory `JobRegistry`; `/jobs` reads it directly without going through the model. Jobs do not
+  survive a restart and are killed on shutdown (`tools::kill_all_jobs`, called from `chat::shutdown`
+  and the end of `run_once`) so nothing outlives the process.
 - When the external `rtk` binary is available (detected once per process), simple approved commands
   are prefixed with `rtk` to compress their output. Commands with shell operators, commands already
   prefixed with `rtk`, and all commands on systems without RTK run directly. The first result line
@@ -80,6 +102,13 @@ effort or operational risk is disproportionate to their immediate value.
   line-ending-agnostic (CRLF files are compared in LF space and rewritten with their original
   endings), so LF `old_text` still matches a CRLF file. Writes are atomic (temp file plus rename)
   and paths pass the same containment checks as reads.
+- Approval stays per-file, but the chat loop snapshots each `patch_file` target's pre-turn content
+  the first time it is touched in a turn (`chat::snapshot_patch_target`). If the turn is cancelled
+  with `Ctrl+C` before it finishes, every file it already changed is reverted automatically
+  (`chat::revert_on_cancel`/`revert_snapshot`) so a multi-file edit can never be left half-applied
+  with no trace in session history. `/undo` performs the same revert for the most recently
+  *completed* turn — one level, in-memory only (not persisted to SQLite), cleared after use or when
+  a new turn starts.
 - Session IDs may be resolved from an unambiguous prefix. The UI normally displays the first eight
   characters.
 - Resume displays the six most recent messages and reports how many earlier messages were omitted.
@@ -91,6 +120,25 @@ effort or operational risk is disproportionate to their immediate value.
   to ask, so it is declined with a message telling the model to proceed on its own judgment. It is
   intercepted by the chat loop before `ToolRegistry::dispatch`, since it needs the interactive
   stdin channel that `Tool::run` has no way to receive.
+- `spawn_agent` delegates a self-contained task to an isolated sub-agent (`chat::run_spawned_agent`)
+  and returns only its final text, so the sub-agent's own tool trace never enters the parent
+  conversation. Intercepted the same way `ask_user` is, since it needs the active `Provider`/model
+  and `ProjectContext` directly. The sub-agent gets a fresh system prompt, no shared history with
+  the parent, and runs against `ToolRegistry::read_only` (`read_file`/`list_directory`/`grep`/
+  `glob` only — no `run_command`, `patch_file`, memory tools, or recursive `spawn_agent`), so none
+  of its tool calls ever need confirmation and it cannot mutate anything. It runs sequentially and
+  blocks the parent turn; concurrent sub-agents are not supported, since the interactive approval
+  prompt and stdin channel are single-consumer.
+- `/index` rebuilds the semantic-search index (`chat::run_index`): walks the project the same
+  `.gitignore`-aware way `grep`/`glob` do, splits each file into fixed 50-line chunks
+  (`tools::chunk_text`), skips any file whose content hash (`chat::content_hash`, a non-cryptographic
+  change-detection hash) matches what was stored last run, embeds the rest via the active profile's
+  `Provider::embed`, and removes chunks for files no longer present. Requires
+  `Profile::embedding_model` to be set; otherwise it fails with a clear message and `search_code` is
+  never offered to the model. `search_code` (also intercepted like `ask_user`, since it needs
+  `Provider`/`Database`) embeds the query and ranks every stored chunk by cosine similarity
+  (`chat::cosine_similarity`), a brute-force scan with no vector index — see "Storage Decisions" and
+  README for the v1 scope this accepts.
 - `remember`, `update_memory`, and `forget` manage a global memory table (`user_version = 6`),
   intercepted the same way `ask_user` is (they need `Database` directly). Unlike project
   instructions (`KAMUI.md`, a file the user edits) or session history (scoped to one conversation),
@@ -104,6 +152,12 @@ effort or operational risk is disproportionate to their immediate value.
 - `kamui doctor` checks configuration, provider connectivity (a real test request), and MCP
   server connections one at a time with pass/fail output, exiting non-zero if anything failed —
   usable as a pre-flight check without starting a full chat session.
+- `kamui status` (`main::run_status`) prints a config/database summary with no network calls at
+  all — profile, model, base URL, all configured profiles, `embedding_model`, MCP server names,
+  the `[permissions]` allowlist, project and database paths, session count, memory count, and
+  indexed-chunk count. Ported from the sibling Kumo project's `kumo status` (read-only summary,
+  distinct from `doctor`'s active checks), adapted from Kumo's single-workspace/single-provider
+  config to Kamui's per-project root and multi-profile config.
 
 ## Repository Context
 
@@ -154,11 +208,17 @@ Important modules:
   streaming tool agent loop, graceful shutdown, and `run_once` for non-interactive `-p` prompts.
 - `src/context.rs`: project instruction discovery and safe `@file`, `@diff`, and `@staged`
   expansion, including the shared `read_project_file` path-safety helper.
-- `src/tools.rs`: the async `Tool` trait, `ToolRegistry` dispatch, the read-only `read_file` and
-  `list_directory` tools, and the confirmation-gated `run_command` and `patch_file` tools.
+- `src/tools.rs`: the async `Tool` trait, `ToolRegistry` dispatch, the read-only `read_file`,
+  `list_directory`, `grep`, `glob`, `update_plan`, `command_status`, and `stop_command` tools, and
+  the confirmation-gated `run_command` and `patch_file` tools. `run_command`'s background-job
+  registry (`JobRegistry`, `JobEntry`, `run_background_job`) also lives here, as does
+  `ToolRegistry::read_only` (the restricted registry `spawn_agent`'s sub-loop runs against) and
+  `chunk_text`/`search_code_definition` (the fixed-size chunker and conditionally-offered
+  `search_code` definition that `chat::run_index`/`chat::dispatch_search_code` use).
 - `src/provider/mod.rs`: provider-independent request, response, message, usage, and streaming types.
 - `src/provider/openai.rs`: OpenAI-compatible Chat Completions HTTP and SSE implementation.
-- `src/storage.rs`: SQLite schema, migration, sessions, messages, usage, and persistence tests.
+- `src/storage.rs`: SQLite schema, migration, sessions, messages, usage, persistence tests, and the
+  `/index` semantic-search store (`code_chunks`/`indexed_files`, `CodeChunk`).
 - `.github/workflows/release.yml`: tag-triggered multi-platform release builds.
 - `install.ps1` and `install.sh`: release-binary installers with SHA-256 verification.
 
@@ -166,8 +226,11 @@ Keep the core provider-agnostic. Provider-specific payloads and parsing belong u
 implementation. Do not leak OpenAI response structures into chat, storage, context, or future tool
 runtime APIs.
 
-The current `Provider` trait supports non-streaming `chat` and streaming `chat_stream`. The
-non-streaming path is used for title generation and is the intended path for tool-calling turns.
+The current `Provider` trait supports non-streaming `chat` and streaming `chat_stream`, plus `embed`
+(a batch text-to-vector call for `/index`/`search_code`, `src/provider/openai.rs` via the
+OpenAI-compatible `/embeddings` endpoint). The non-streaming `chat` path is used for title
+generation and is the intended path for tool-calling turns. `embed` is only ever called when the
+active profile's `Profile::embedding_model` is set.
 
 The provider-agnostic tool-call protocol is modeled in `provider/mod.rs` as `ToolDefinition`,
 `ToolCall`, and tool-request/tool-result `Message` variants; `ChatRequest` carries `tools` and both
@@ -178,9 +241,10 @@ Native Anthropic and Gemini adapters must reuse these same neutral types.
 
 Tools live in `src/tools.rs`. `ToolRegistry` holds boxed async `Tool` implementations, exposes their
 `ToolDefinition`s, and dispatches a `ToolCall` by name, returning any failure as an `Error: ...`
-string so the model can recover rather than aborting the turn. Read-only `read_file` and
-`list_directory` reuse `context::resolve_within_root` for path safety; `run_command` executes shell
-commands with a timeout and output cap. Permission policy stays in Kamui, not the tools: a tool
+string so the model can recover rather than aborting the turn. Read-only `read_file`,
+`list_directory`, `grep`, and `glob` reuse `context::resolve_within_root` for path safety and the
+`ignore` crate's `.gitignore`-aware walking (also used by `@dir` expansion); `run_command` executes
+shell commands with a timeout and output cap. Permission policy stays in Kamui, not the tools: a tool
 advertises `requires_confirmation`, and the chat loop prompts the user before dispatching any such
 call, feeding a refusal back to the model if declined. The chat loop runs a streaming agent loop
 bounded by `MAX_TOOL_ROUNDS`: it streams a turn, and if the model requested tools it records the
@@ -202,6 +266,10 @@ The terminal runner, mutation tools, per-turn usage accounting, and a durable au
   by copying a live SQLite database.
 - Foreign keys and cascading session deletion must remain enabled.
 - Save an exchange and its usage atomically.
+- `code_chunks`/`indexed_files` (`user_version = 7`) are a known, accepted exception to "one global
+  database": `path` is project-relative, not project-scoped, so indexing two different projects
+  into the same database would collide. Fixing this (e.g. a project-id column) is future work if it
+  becomes a real problem; not worth the complexity for a single-project v1.
 
 ## Configuration
 
@@ -234,6 +302,16 @@ Fields:
 - `tools` (under `[provider]` or `[profiles.*]`): whether to offer tools to that model, default
   true. Set false for endpoints/models that reject the `tools` field (many small local models) so
   plain chat still works; `/model` marks such profiles `[no tools]`.
+- `[permissions].allow_commands`: exact-match `run_command` commands that skip approval, global-only
+  like `api_key` — a project file that defines `[permissions]` at all is rejected, since an
+  allowlisted command grants unattended execution the same way a leaked key would.
+- `[commands].timeout_secs` / `[commands].background_max_secs`: `run_command`'s foreground timeout
+  (default 30) and the safety cap on a `background: true` job's lifetime (default 1800). Not
+  security-relevant, so unlike `[permissions]` a project file may override either.
+- `[provider].embedding_model` / `[profiles.*].embedding_model`: an embedding-capable model on the
+  same provider, enabling `/index` and `search_code`. Inherits from a shared `[providers.*]` block
+  the same way `base_url`/`api_key`/`tools` do. `None` (the default) leaves semantic search
+  unavailable — `search_code` is then not offered to the model at all, rather than erroring.
 
 On first run, when no global `kamui.toml` exists, Kamui scaffolds the global config directory with a
 commented template and exits, asking the user to fill in the key. `KAMUI_DATA_DIR` remains an
@@ -293,25 +371,33 @@ The source of truth is `ROADMAP.md`. Current priority order is:
 
 1. Phase 2 is complete. Custom global instructions and Markdown export were descoped; do not start
    them without a concrete user request.
-2. Phase 3 is complete: the provider-agnostic tool-call protocol, streaming agent loop, read/list
-   tools, the confirmation-gated command runner with optional RTK routing, the confirmation-gated
-   `patch_file` editor, whole-turn persistence including tool messages, per-turn usage accounting,
-   and interrupt-and-continue cancellation. Multi-file editing is repeated `patch_file` calls within
-   a turn; Git works through `run_command` plus `@diff`/`@staged`; the audit trail is the persisted
-   tool messages.
+2. Phase 3 is complete and has grown past its original scope: the provider-agnostic tool-call
+   protocol, streaming agent loop, read/search tools (`read_file`/`list_directory`/`grep`/`glob`),
+   the confirmation-gated command runner (configurable timeout, optional RTK routing, a global
+   `[permissions]` allowlist, `--auto-approve`, and `background: true` jobs with
+   `command_status`/`stop_command`/`/jobs`), the confirmation-gated `patch_file` editor with a
+   turn-scoped snapshot/auto-revert safety net and `/undo`, `update_plan` for a live checklist,
+   `spawn_agent` for a narrow (sequential, read-only) sub-agent, whole-turn persistence including
+   tool messages, per-turn usage accounting, and interrupt-and-continue cancellation. Multi-file
+   editing is repeated `patch_file` calls within a turn; Git works through `run_command` plus
+   `@diff`/`@staged`; the audit trail is the persisted tool messages.
 3. Phase 5 is complete for its planned scope (config, runtime `/model` switching with profiles and
    shared credentials, OpenAI-compatible docs, per-model stats). An agentic system prompt
    (`src/prompt.rs`) now ships on every request.
-4. Remaining focus is Phase 4 context management (the largest quality gap for long sessions).
-   Conversation summarization and compression are deliberately deferred to last; image input is the
-   next planned Phase 4 item. Excel/PDF input are handled via MCP, and Anthropic/Gemini native
-   providers, project indexing, and semantic search are not planned.
+4. Phase 4 context management: image input, directory context, and context compaction are done.
+   Semantic search (`/index`/`search_code`) shipped as a deliberately simple v1 — fixed-size line
+   chunking, brute-force cosine similarity, no vector index — rather than the larger effort
+   originally deferred; project indexing *at a larger scale* (richer chunking, a real vector index)
+   remains open future work if the v1 approach stops scaling. Excel/PDF input are handled via MCP;
+   Anthropic/Gemini native providers are not planned.
 
 Avoid starting these early because their true scope is large:
 
-- Project indexing and semantic search.
-- Context compression.
-- MCP, plugin systems, remote workers, background jobs, or multi-agent execution.
+- Project indexing at scale (a real vector index, syntax-aware chunking) beyond the v1 semantic
+  search already shipped.
+- Further context compression beyond the rolling-summary compaction already shipped.
+- Plugin systems, remote workers, or a general-purpose background job queue (`run_command`'s own
+  background jobs and `spawn_agent`'s narrow sequential sub-agent are already done — see above).
 - GUI, mobile, and voice clients.
 
 ## Coding Principles
