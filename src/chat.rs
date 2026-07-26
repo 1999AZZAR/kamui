@@ -1,6 +1,8 @@
+use crate::commands;
 use crate::compaction;
 use crate::config::{Config, Profile};
 use crate::context::ProjectContext;
+use crate::markdown;
 use crate::mcp::ConnectionStatus;
 use crate::prompt;
 use crate::provider::{ChatRequest, Message, Provider, StreamEvent, Usage};
@@ -52,6 +54,7 @@ where
     let mut provider = build_provider(&active);
     let mut context_window = active.context_window;
     let job_registry = tools.jobs();
+    let command_library = commands::CommandLibrary::load(project.root());
 
     print_status(
         project,
@@ -130,8 +133,20 @@ where
         if input.is_empty() {
             continue;
         }
-        if input.starts_with('/') {
+
+        // A custom command (`/review`, `/test`, ...) expands into this turn's prompt and then
+        // takes the ordinary path below; built-in commands are handled in the block after it. The
+        // original line is kept for titling, since an expanded body can be hundreds of lines.
+        let expanded_command = command_library.expand(input);
+        let title_source = input;
+        let input: &str = expanded_command.as_deref().unwrap_or(input);
+
+        if expanded_command.is_none() && input.starts_with('/') {
             let (command, argument) = input.split_once(' ').unwrap_or((input, ""));
+            if command == "/commands" {
+                print_commands(&command_library);
+                continue;
+            }
             if command == "/model" {
                 if let Err(error) = switch_profile(
                     argument.trim(),
@@ -351,12 +366,17 @@ where
 
             let mut content = String::new();
             let mut ttft: Option<Duration> = None;
+            // Styles the streamed text a line at a time. `content` keeps the raw markdown, since
+            // that is what gets persisted and re-sent to the model.
+            let mut renderer = markdown::Renderer::for_stdout();
             let (usage, finish_reason, tool_calls) = loop {
                 let event = tokio::select! {
                     event = stream.recv() => event,
                     signal = tokio::signal::ctrl_c() => {
                         stop_spinner(&mut spinner).await;
                         signal.context("failed to listen for Ctrl+C")?;
+                        // Show the partial line still held by the line buffer before leaving.
+                        print!("{}", renderer.finish());
                         revert_on_cancel(&turn_snapshot);
                         println!("\n(interrupted — back to prompt)\n");
                         continue 'chat;
@@ -368,7 +388,7 @@ where
                         if ttft.is_none() {
                             ttft = Some(started.elapsed());
                         }
-                        print!("{delta}");
+                        print!("{}", renderer.push(&delta));
                         io::stdout().flush()?;
                         content.push_str(&delta);
                     }
@@ -378,17 +398,20 @@ where
                         tool_calls,
                     })) => {
                         stop_spinner(&mut spinner).await;
+                        print!("{}", renderer.finish());
                         println!();
                         break (usage, finish_reason, tool_calls);
                     }
                     Some(Err(error)) => {
                         stop_spinner(&mut spinner).await;
+                        print!("{}", renderer.finish());
                         eprintln!("\n\nRequest failed: {error:#}\n");
                         revert_on_cancel(&turn_snapshot);
                         continue 'chat;
                     }
                     None => {
                         stop_spinner(&mut spinner).await;
+                        print!("{}", renderer.finish());
                         eprintln!("\n\nRequest failed: provider stream closed unexpectedly\n");
                         revert_on_cancel(&turn_snapshot);
                         continue 'chat;
@@ -578,7 +601,7 @@ where
             &final_finish,
         )?;
         if active_session.title == "New chat" {
-            active_session.title = make_title(input);
+            active_session.title = make_title(title_source);
         }
         messages.extend(turn_record);
 
@@ -589,7 +612,7 @@ where
                     Message::system(
                         "Create a concise title of at most 6 words for this conversation. Return only the title without quotes or punctuation.",
                     ),
-                    Message::user(input),
+                    Message::user(title_source),
                     Message::assistant(final_answer),
                 ],
                 tools: Vec::new(),
@@ -650,6 +673,13 @@ where
         .cloned()
         .unwrap_or_else(|| config.default().clone());
     let provider = build_provider(&active);
+
+    // `kamui -p /review` expands the same custom command interactive chat would, so a command is
+    // scriptable too. The original line is kept for titling, as in `start_chat`.
+    let command_library = commands::CommandLibrary::load(project.root());
+    let expanded_command = command_library.expand(prompt);
+    let title_source = prompt;
+    let prompt: &str = expanded_command.as_deref().unwrap_or(prompt);
 
     let expanded = project
         .expand_file_references(prompt)
@@ -756,7 +786,10 @@ where
         }
     };
 
-    println!("\n{}", assistant_message.content);
+    println!(
+        "\n{}",
+        markdown::Renderer::for_stdout().render_block(&assistant_message.content)
+    );
 
     let final_answer = assistant_message.content.clone();
     let mut turn_record = Vec::with_capacity(tool_trail.len() + 2);
@@ -772,8 +805,8 @@ where
         &active.model,
         &final_finish,
     )?;
-    database.rename_session(&session.id, &make_title(prompt))?;
-    session.title = make_title(prompt);
+    database.rename_session(&session.id, &make_title(title_source))?;
+    session.title = make_title(title_source);
 
     let title_response = provider
         .chat(ChatRequest {
@@ -782,7 +815,7 @@ where
                 Message::system(
                     "Create a concise title of at most 6 words for this conversation. Return only the title without quotes or punctuation.",
                 ),
-                Message::user(prompt),
+                Message::user(title_source),
                 Message::assistant(final_answer),
             ],
             tools: Vec::new(),
@@ -1004,6 +1037,7 @@ fn handle_command(
             Some(session) => print_stats(database, session, context_window)?,
             None => println!("This chat has no saved messages yet.\n"),
         },
+        "/usage" => print_usage_report(database)?,
         "/memory" => {
             let entries = database.list_memory()?;
             if entries.is_empty() {
@@ -1772,12 +1806,79 @@ fn print_help() {
     println!("/undo             Revert the files patched by the last turn");
     println!("/jobs             List background jobs started with run_command");
     println!("/index            Rebuild the semantic-search index (needs embedding_model)");
+    println!("/commands         List your own prompt commands");
     println!("/delete <id>      Delete a session");
     println!("/stats            Show current session usage");
+    println!("/usage            Show token usage by day and month, across all sessions");
     println!("/status           Show project and connection status");
     println!("/memory           List facts Kamui remembers across sessions and projects");
     println!("/forget <text>    Forget one remembered fact, or /forget all");
     println!("/exit             Save and quit\n");
+}
+
+/// How much history `/usage` reports before summarizing everything into the lifetime total.
+const USAGE_REPORT_DAYS: usize = 14;
+const USAGE_REPORT_MONTHS: usize = 6;
+
+/// Token usage across every session, by day and by month. Unlike `/stats`, which is scoped to the
+/// active session, this answers "how much have I spent lately" over the whole database.
+fn print_usage_report(database: &Database) -> Result<()> {
+    let daily = database.usage_by_day(USAGE_REPORT_DAYS)?;
+    if daily.is_empty() {
+        println!("No usage recorded yet.\n");
+        return Ok(());
+    }
+
+    let row = |period: &storage::UsagePeriod| {
+        println!(
+            "  {:<10} {:>4} req  {:>10} in  {:>10} out  {:>10} total",
+            period.period,
+            period.request_count,
+            period.input_tokens,
+            period.output_tokens,
+            period.total_tokens
+        );
+    };
+
+    println!("\nLast {USAGE_REPORT_DAYS} days");
+    for period in &daily {
+        row(period);
+    }
+
+    let monthly = database.usage_by_month(USAGE_REPORT_MONTHS)?;
+    if monthly.len() > 1 {
+        println!("\nBy month");
+        for period in &monthly {
+            row(period);
+        }
+    }
+
+    let total = database.usage_total()?;
+    println!("\nAll time");
+    row(&total);
+    println!("\nRequests count chat turns only; tokens include title generation.\n");
+    Ok(())
+}
+
+/// List the user's own prompt commands, or explain where to put one when there are none yet.
+fn print_commands(library: &commands::CommandLibrary) {
+    if library.is_empty() {
+        println!("No custom commands yet.");
+        println!("Add a markdown file to create one:");
+        println!("  <project>/.kamui/commands/review.md  ->  /review   (this project only)");
+        println!("  <config dir>/kamui/commands/review.md ->  /review   (every project)\n");
+        return;
+    }
+    println!("Your commands:");
+    for command in library.list() {
+        let description = command.description.as_deref().unwrap_or("");
+        println!(
+            "  /{:<18} {:<9} {description}",
+            command.name,
+            command.source.label()
+        );
+    }
+    println!("\nInvoke one with /<name>; anything after it is appended to the prompt.\n");
 }
 
 struct GitStatus {

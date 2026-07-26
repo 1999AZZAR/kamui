@@ -45,8 +45,32 @@ effort or operational risk is disproportionate to their immediate value.
   prompt shuts down gracefully. Windows stdin uses a reader thread and Tokio channel so the async
   runtime does not block on terminal input.
 - Supported chat commands are `/help`, `/new`, `/sessions`, `/resume <id>`, `/model [name]`,
-  `/rename <id> <title>`, `/search <text>`, `/compact`, `/undo`, `/jobs`, `/index`, `/delete <id>`,
-  `/stats`, `/memory`, `/forget <text>` (or `/forget all`), and `/exit`. Plain `exit` also quits.
+  `/rename <id> <title>`, `/search <text>`, `/compact`, `/undo`, `/jobs`, `/index`, `/commands`,
+  `/delete <id>`, `/stats`, `/usage`, `/memory`, `/forget <text>` (or `/forget all`), and `/exit`.
+  Plain `exit` also quits.
+- Users define their own slash commands as markdown files (`src/commands.rs`): global ones in
+  `<config dir>/kamui/commands/*.md`, project ones in `<project>/.kamui/commands/*.md`, with a
+  project command shadowing a global one of the same name — the same precedence `kamui.toml`
+  already uses. Invoking `/<name>` substitutes the file's body as that turn's prompt and appends
+  any trailing text, so `/review @src/a.rs` still goes through normal `@file` expansion. This is
+  text substitution only: it grants no capability and bypasses no approval, making its risk
+  identical to the `KAMUI.md` instructions that already ship. Optional frontmatter supplies a
+  `description` for `/commands`; unknown keys are ignored so a file written for another tool works
+  unchanged. Files named after a built-in command are skipped (`commands::RESERVED`, kept in sync
+  with `chat::print_help`). Works in `-p` as well as interactive chat. There is deliberately no
+  chaining between commands — each is invoked independently.
+- Streamed responses are rendered with a small markdown-to-ANSI subset (`src/markdown.rs`):
+  headings, `**bold**`, `` `code` ``, fenced blocks, list markers, blockquotes. Rendering is
+  line-buffered — a line is styled only once its newline arrives — so streaming still appears live
+  while each line can be styled as a whole; `chat.rs` flushes the buffer on stream end *and* on
+  interrupt so a partial line is never swallowed. Raw markdown (not the styled text) is what gets
+  persisted and re-sent to the model. `_italic_` and single-`*` italics are deliberately
+  unsupported: they would corrupt `snake_case` identifiers and globs like `src/*.rs`. Styling is
+  disabled when stdout is not a terminal, or when `NO_COLOR` is set.
+- `/stats` reports the active session; `/usage` aggregates every session by day and by month
+  (`storage::usage_by_day`/`usage_by_month`/`usage_total`). Both follow the same convention: the
+  request count covers only `kind = 'chat'` rows while token sums include every kind, so title
+  generation is counted in spend but not in request totals.
 - Long sessions are compacted automatically: when the un-summarized recent history exceeds a byte
   threshold (about half the profile's `context_window`, or a default), older messages are folded
   into a rolling summary and the request sends the summary plus recent messages. `/compact` forces
@@ -199,7 +223,12 @@ Important modules:
 
 - `src/main.rs`: CLI argument parsing, configuration loading, dependency construction, and startup.
 - `src/config.rs`: `kamui.toml` discovery, global/project layering, named provider profiles, and the
-  first-run scaffold.
+  first-run scaffold. `global_config_dir` is the shared lookup for the OS config directory Kamui
+  owns, reused by `commands` for the global command folder beside `kamui.toml`.
+- `src/commands.rs`: user-defined slash commands loaded from markdown files, global and
+  project-local, with built-in names reserved.
+- `src/markdown.rs`: line-buffered markdown-to-ANSI rendering for streamed output, disabled when
+  stdout is not a terminal.
 - `src/prompt.rs`: the agentic system prompt, combined with project instructions per request.
 - `src/compaction.rs`: rolling-summary context compaction (threshold, message selection, summary
   request); the chat loop drives it automatically and via `/compact`.
@@ -398,7 +427,12 @@ Avoid starting these early because their true scope is large:
 - Further context compression beyond the rolling-summary compaction already shipped.
 - Plugin systems, remote workers, or a general-purpose background job queue (`run_command`'s own
   background jobs and `spawn_agent`'s narrow sequential sub-agent are already done — see above).
-- GUI, mobile, and voice clients.
+- GUI, mobile, and voice clients. This includes Kamui Dispatch (a phone-to-host remote-control
+  system, see ROADMAP.md's "Later" section for the planned architecture) — it is a separate
+  project (a Flutter app, a small relay backend, and a host-side dispatch agent binary), not a
+  change to Kamui itself. Kamui already exposes the exact interface a dispatcher needs (`-p
+  <prompt>`, denying unattended mutation by default); do not add HTTP server, daemon, or
+  network-facing code to the Kamui binary for this.
 
 ## Coding Principles
 

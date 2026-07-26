@@ -516,10 +516,17 @@ fn resolve_profiles(global: ConfigFile, project: Option<ConfigFile>) -> Result<C
     })
 }
 
-fn global_config_path() -> Result<PathBuf> {
+/// The OS configuration directory Kamui owns (`.../kamui`). Public so other modules that keep
+/// user-editable files beside `kamui.toml` — currently `commands::global_dir` — resolve the same
+/// location instead of duplicating the platform lookup.
+pub fn global_config_dir() -> Result<PathBuf> {
     BaseDirs::new()
-        .map(|dirs| dirs.config_dir().join("kamui").join(CONFIG_FILE))
+        .map(|dirs| dirs.config_dir().join("kamui"))
         .context("could not determine the operating system config directory")
+}
+
+fn global_config_path() -> Result<PathBuf> {
+    global_config_dir().map(|dir| dir.join(CONFIG_FILE))
 }
 
 fn read_config_file(path: &Path) -> Result<ConfigFile> {

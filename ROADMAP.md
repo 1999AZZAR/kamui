@@ -216,16 +216,52 @@ animates until the first token, and `Ctrl+C` mid-turn returns to the prompt inst
 ## Phase 6: Terminal Experience
 
 - [x] Project status card and `/status` refresh
-- [ ] Markdown rendering
-- [ ] Syntax highlighting
+- [x] Markdown rendering (`src/markdown.rs`)
+- [ ] Syntax highlighting (not planned for now — see below)
 - [x] Thinking indicator (braille spinner until the first token)
 - [ ] Rich terminal UI
-- [ ] Session pinning
-- [ ] Prompt templates
-- [ ] System prompt profiles
-- [ ] Daily and monthly usage reports
+- [ ] Session pinning (not planned — see below)
+- [x] Prompt templates and system prompt profiles (one feature: user-defined `/commands`)
+- [x] Daily and monthly usage reports (`/usage`)
 - [ ] Optional cost tracking
 - [ ] Benchmark mode
+
+Markdown rendering (`src/markdown.rs`) styles streamed output a line at a time: deltas accumulate
+in a buffer and a line is rendered only once its newline arrives, which keeps streaming visibly
+live while letting each line be styled as a whole. That works because nearly every construct worth
+rendering (headings, fences, list markers, blockquotes) is line-scoped, and the inline ones (bold,
+code spans) practically never straddle a line break. The buffer is flushed both at stream end and
+on `Ctrl+C`, so an interrupt never swallows the partial line already received.
+
+The supported subset is deliberately narrow, because mangling code is worse than under-styling
+prose: `_italic_` is unsupported (it would corrupt `snake_case` identifiers) and so is single-`*`
+italic (it would corrupt globs like `src/*.rs`). Bold requires non-padded content, the standard
+rule that also keeps `src/**/*.rs` intact. Code spans are never reinterpreted, so a backticked
+`**literal**` stays literal. Styling is skipped when stdout is not a terminal, and when `NO_COLOR`
+is set. Syntax highlighting inside fenced blocks is a much larger job (a grammar per language, or
+a heavy dependency like `syntect`) for a marginal gain over the current single-colour blocks; it is
+not planned unless it turns out to matter.
+
+Prompt templates and system prompt profiles turned out to be the same feature, and shipped as
+user-defined commands (`src/commands.rs`): a markdown file in `<project>/.kamui/commands/` or
+`<config dir>/kamui/commands/` becomes `/<name>`, expanding into that turn's prompt. Project
+commands shadow global ones by name, matching `kamui.toml` precedence — which maps directly onto
+the real-world split that motivated the feature, where a prompt library has both general-purpose
+agents (a code reviewer, a test engineer) and ones encoding a single codebase's conventions. It is
+text substitution and nothing more: no new capability, no approval bypass, so the risk matches the
+`KAMUI.md` project instructions that already ship. Chaining between commands is deliberately absent
+— the pipeline in a prompt library is a recommended reading order, not something the tool needs to
+model, and each command stands alone.
+
+Usage reporting split cleanly from the existing `/stats`: that stays scoped to the active session,
+while `/usage` aggregates every session by day and by month over the `usage_records` rows already
+being written (no migration needed). Both count requests as `kind = 'chat'` only while summing
+tokens across all kinds, so title generation shows up in spend but not in request counts.
+
+Session pinning was considered and dropped. Kamui sessions are task-scoped — opened for a job,
+finished, rarely revisited — so the case for pinning is weak, and `/search` already covers the
+real need (finding an old session by what was discussed, which is what you actually remember).
+Revisit only if a concrete "I return to these exact sessions daily" case appears.
 
 ## Later: Extensibility and Remote Work
 
@@ -235,6 +271,8 @@ animates until the first token, and `Ctrl+C` mid-turn returns to the prompt inst
   Phase 3; this item is the broader, general-purpose async job queue, still open)
 - [ ] Scheduled tasks
 - [ ] Worker nodes and remote execution
+- [ ] Kamui Dispatch: remote prompt dispatch from a phone (planned architecture, not started —
+  see below; distinct from "Worker nodes," which is about distributing compute, not remote control)
 - [ ] Local memory and RAG
 - [x] Multi-agent workflows (a first, deliberately narrow form: `spawn_agent`)
 
@@ -264,10 +302,54 @@ confirmation and there is no approval flow to reproduce. It also runs sequential
 parent turn — concurrent sub-agents are future work, gated on rethinking how approval prompts and
 the single-consumer stdin channel would interleave across multiple agents running at once.
 
+**Kamui Dispatch (planned architecture, not started)**: lets a phone trigger Kamui running on a
+host machine — "prompt your coding agent from your pocket." Two shapes were weighed: a VPN-mesh
+alternative (Tailscale/WireGuard between phone and host, plus a new local `kamui serve` HTTP mode —
+no backend at all, simpler and more private, but every device needs the VPN client installed first)
+versus a relayed backend, chosen because it works from an arbitrary phone/network without asking
+the user to set up a mesh VPN first.
+
+Three separate pieces of software, none of them living inside the Kamui binary — the same boundary
+Kumo already draws for itself ("Kamui remains an independent coding agent and does not need to know
+about Telegram"):
+
+- **Flutter app** (phone): pairing UI, prompt input, response view. Talks to the backend over
+  ordinary HTTPS — nothing unusual here, since the backend has a public address.
+- **Backend** (new, a small relay service): a pairing endpoint (one-time code/QR, the same shape
+  Kumo's Telegram pairing already uses), a submit-prompt endpoint for the phone, and a
+  fetch-pending-work endpoint for the host to poll. It queues one prompt at a time per paired host
+  and relays the result back; it does not need to store conversation history itself — Kamui's own
+  SQLite already does that on the host.
+- **Dispatch agent** (new, a separate small binary on the host machine — not Kamui itself): holds
+  the outbound connection to the backend and invokes `kamui -p <prompt>` when a prompt arrives,
+  exactly the way Kumo already delegates to Kamui today via `delegate_to_kamui`. Kamui needs *zero*
+  code changes for this: `-p` (see "Current Product Behavior" in `CLAUDE.md`) is already the exact
+  interface a remote dispatcher needs.
+
+Why the backend-to-host leg can't be plain HTTP: the host machine (a laptop or desktop) almost never
+has a public IP or an open inbound port, so the backend cannot connect to it — the connection has to
+be initiated by the host instead. Either long polling (the host repeatedly asks "anything for me?",
+simple, no special infrastructure) or a persistent WebSocket (lower latency, more moving parts:
+reconnect and heartbeat logic). Long polling is the recommended v1; a WebSocket upgrade is a later,
+independent improvement if latency turns out to matter in practice. The phone-to-backend leg has no
+such constraint — the backend is always reachable, so it's ordinary REST.
+
+The open safety question matters more than the transport choice: the dispatch agent's natural call
+is `kamui -p <prompt>`, and Kamui's own non-interactive default is to *deny* any tool that would
+need confirmation (`run_command`, `patch_file`) rather than silently allow it (see "Current Product
+Behavior") — the dispatcher does not need `--auto-approve` to be useful, and should not default to
+it. A stolen phone or leaked pairing token that can only read files and answer questions is a much
+smaller blast radius than one that can run arbitrary commands unattended. If mutating actions from a
+phone turn out to be a real need later, the right shape is very likely a remote approval flow
+modeled on Kumo's own Telegram inline-button approval (surface the pending command back through the
+backend, wait for a tap, same bounded timeout) — not a blanket `--auto-approve` on every remote
+prompt.
+
 ## Not Planned Soon
 
 - [ ] GUI and dashboard
-- [ ] Mobile app
+- [ ] Mobile app (Kamui itself running natively on a phone — distinct from the Kamui Dispatch
+  companion app above, which remotely controls a Kamui that still runs on a host machine)
 - [ ] Voice mode
 - [ ] MCP server
 - [ ] Infrastructure-specific plugins (Docker, Kubernetes, PostgreSQL)

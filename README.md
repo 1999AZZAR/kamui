@@ -282,8 +282,10 @@ path, database path, session count, remembered-fact count, and indexed-chunk cou
 | `/undo` | Revert the files patched by the last turn |
 | `/jobs` | List background jobs started with run_command |
 | `/index` | Rebuild the semantic-search index (needs `embedding_model`) |
+| `/commands` | List your own prompt commands |
 | `/delete <id>` | Delete a session |
 | `/stats` | Show current session usage |
+| `/usage` | Show token usage by day and month, across all sessions |
 | `/memory` | List facts Kamui remembers across sessions and projects |
 | `/forget <text>` | Forget one remembered fact, or `/forget all` |
 | `/help` | List available commands |
@@ -299,12 +301,58 @@ case-insensitively (literal `%` and `_` are not treated as wildcards) and prints
 session ID, timestamp, title, and a snippet centered on the match.
 
 After each streamed response, Kamui reports time-to-first-token (`TTFT`) and total response time
-(`Time`) alongside token usage and the finish reason.
+(`Time`) alongside token usage and the finish reason. Responses are rendered with light markdown
+styling — headings and `**bold**` in bold, `` `code` `` and fenced blocks coloured. Styling is
+skipped automatically when output is piped or redirected, and when `NO_COLOR` is set.
+
+`/stats` covers the current session; `/usage` zooms out to every session, reporting tokens per day
+and per month so you can see what a week of work actually cost.
 
 Long conversations are compacted automatically: once the recent history grows large, Kamui folds the
 older messages into a running summary so the session can continue without overflowing the model's
 context. Run `/compact` to do it on demand. The full history is always kept in storage — only what
 is sent to the model each turn is compressed.
+
+### Your own commands
+
+Any markdown file can become a slash command. Drop it in one of two places:
+
+```text
+<project>/.kamui/commands/review.md    ->  /review   (this project only)
+<config dir>/kamui/commands/review.md  ->  /review   (every project)
+```
+
+The config directory is the same one holding your global `kamui.toml` (see
+[Configuration](#configuration)). A project command shadows a global one with the same name, so a
+repo can specialise `/review` without losing your general-purpose one everywhere else.
+
+Invoking `/review` sends that file's contents as your prompt. Anything typed after the command is
+appended below it, so file references still work:
+
+```text
+> /review @src/auth.rs
+```
+
+This is plain text expansion — exactly what you would get by pasting the file in yourself, which
+means a command grants no new permission and approval prompts behave as usual. Commands work in
+`-p` too (`kamui -p "/review"`), so they are scriptable.
+
+An optional frontmatter block sets the description shown by `/commands`:
+
+```markdown
+---
+description: Pragmatic code reviewer — sharp, practical, no fluff
+---
+
+You are a Senior Code Reviewer...
+```
+
+Frontmatter is optional, and any keys Kamui does not recognise are ignored — a prompt file written
+for another tool (with `tags:`, `agents:`, and so on) can be dropped in unchanged. Files named
+after a built-in command are ignored, so nothing can shadow `/new` or `/exit`.
+
+Commands are independent: there is no chaining or pipeline between them. Each one can be invoked
+at any time, in any order, as often as you like.
 
 ## Repository context
 

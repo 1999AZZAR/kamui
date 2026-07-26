@@ -58,6 +58,16 @@ pub struct MemoryEntry {
     pub content: String,
 }
 
+/// Token usage aggregated over one calendar period (a day or a month), across every session.
+/// `period` is already formatted for display in the user's local timezone.
+pub struct UsagePeriod {
+    pub period: String,
+    pub request_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+}
+
 impl Database {
     pub fn open() -> Result<Self> {
         let data_dir = data_dir()?;
@@ -553,6 +563,66 @@ impl Database {
         self.connection
             .execute("DELETE FROM sessions WHERE id = ?1", [session_id])?;
         Ok(())
+    }
+
+    /// Token usage per day across every session, most recent first. Like `session_stats`, the
+    /// request count covers only primary chat requests while the token sums include every kind
+    /// (notably `title`), so the totals reflect what was actually spent.
+    pub fn usage_by_day(&self, limit: usize) -> Result<Vec<UsagePeriod>> {
+        self.usage_by_period("%Y-%m-%d", limit)
+    }
+
+    /// Token usage per calendar month across every session, most recent first.
+    pub fn usage_by_month(&self, limit: usize) -> Result<Vec<UsagePeriod>> {
+        self.usage_by_period("%Y-%m", limit)
+    }
+
+    /// Group `usage_records` by a `strftime` format applied to `created_at`. Periods are computed
+    /// in local time so a report lines up with the timestamps `/sessions` already displays.
+    fn usage_by_period(&self, format: &str, limit: usize) -> Result<Vec<UsagePeriod>> {
+        let mut statement = self.connection.prepare(
+            "SELECT strftime(?1, created_at, 'unixepoch', 'localtime') AS period,
+                    COUNT(*) FILTER (WHERE kind = 'chat'),
+                    COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(total_tokens), 0)
+             FROM usage_records
+             GROUP BY period
+             ORDER BY period DESC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![format, limit as i64], |row| {
+            Ok(UsagePeriod {
+                period: row.get(0)?,
+                request_count: row.get(1)?,
+                input_tokens: row.get(2)?,
+                output_tokens: row.get(3)?,
+                total_tokens: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Lifetime totals across every session, for the footer of a usage report.
+    pub fn usage_total(&self) -> Result<UsagePeriod> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FILTER (WHERE kind = 'chat'),
+                        COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                        COALESCE(SUM(total_tokens), 0)
+                 FROM usage_records",
+                [],
+                |row| {
+                    Ok(UsagePeriod {
+                        period: "all time".to_string(),
+                        request_count: row.get(0)?,
+                        input_tokens: row.get(1)?,
+                        output_tokens: row.get(2)?,
+                        total_tokens: row.get(3)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
     }
 
     /// A durable key-value store for small UI state, such as the active provider profile.
@@ -1123,6 +1193,67 @@ mod tests {
         // '%' and '_' are SQL LIKE wildcards; a literal search for them must not match everything.
         assert!(!database.forget("50%").unwrap());
         assert!(database.forget("100% SURE").unwrap());
+    }
+
+    #[test]
+    fn usage_reports_group_by_day_and_month_and_total() {
+        let database = database();
+        let session = database.create_session("test", "m").unwrap();
+        // Two chat turns plus one title generation, all "today" from SQLite's point of view.
+        for _ in 0..2 {
+            database
+                .save_turn(
+                    &session.id,
+                    &[Message::user("hi"), Message::assistant("hello")],
+                    &Usage {
+                        prompt_tokens: 10,
+                        completion_tokens: 5,
+                        total_tokens: 15,
+                    },
+                    "m",
+                    "stop",
+                )
+                .unwrap();
+        }
+        database
+            .save_generated_title(
+                &session.id,
+                "A title",
+                &Usage {
+                    prompt_tokens: 4,
+                    completion_tokens: 1,
+                    total_tokens: 5,
+                },
+                "m",
+                "stop",
+            )
+            .unwrap();
+
+        let daily = database.usage_by_day(30).unwrap();
+        assert_eq!(daily.len(), 1);
+        // Requests count only chat turns; tokens include the title call's usage.
+        assert_eq!(daily[0].request_count, 2);
+        assert_eq!(daily[0].total_tokens, 35);
+        assert_eq!(daily[0].period.len(), 10); // YYYY-MM-DD
+
+        let monthly = database.usage_by_month(12).unwrap();
+        assert_eq!(monthly.len(), 1);
+        assert_eq!(monthly[0].period.len(), 7); // YYYY-MM
+        assert_eq!(monthly[0].total_tokens, 35);
+
+        let total = database.usage_total().unwrap();
+        assert_eq!(total.request_count, 2);
+        assert_eq!(total.input_tokens, 24);
+        assert_eq!(total.output_tokens, 11);
+        assert_eq!(total.total_tokens, 35);
+    }
+
+    #[test]
+    fn usage_reports_are_empty_without_any_usage() {
+        let database = database();
+        assert!(database.usage_by_day(30).unwrap().is_empty());
+        assert!(database.usage_by_month(12).unwrap().is_empty());
+        assert_eq!(database.usage_total().unwrap().total_tokens, 0);
     }
 
     #[test]

@@ -1,7 +1,9 @@
 mod chat;
+mod commands;
 mod compaction;
 mod config;
 mod context;
+mod markdown;
 mod mcp;
 mod onboarding;
 mod prompt;
