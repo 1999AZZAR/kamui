@@ -49,6 +49,14 @@ impl ProjectContext {
         &self.root
     }
 
+    /// A stable identifier for this project, used to scope rows belonging to one project inside
+    /// Kamui's single global database (`/index`'s `code_chunks`/`indexed_files`). The canonical
+    /// root path: unique per checkout, and readable when inspecting the database by hand — unlike
+    /// a hash, which would buy nothing here since the value is never shown to the model.
+    pub fn key(&self) -> String {
+        self.root.to_string_lossy().into_owned()
+    }
+
     pub fn instruction_name(&self) -> Option<&str> {
         self.instructions.as_ref().map(|(name, _)| name.as_str())
     }

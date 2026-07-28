@@ -64,6 +64,19 @@ where
         &config.allow_commands,
     );
     println!("Data: {}", database.path().display());
+    // A hint, not an action: an out-of-date index is only worth mentioning to someone who already
+    // runs `/index`, and refreshing it costs the user's own embedding budget, so Kamui reports the
+    // drift and leaves the decision to them. Interactive chat only — `-p` output is script input.
+    // A failed check is not worth interrupting startup over; semantic search still works without it.
+    if active.embedding_model.is_some()
+        && let Ok(Some(staleness)) = index_staleness(database, project)
+        && !staleness.is_fresh()
+    {
+        println!(
+            "Index: {} since last /index — run /index to refresh.",
+            staleness.describe()
+        );
+    }
     if auto_approve {
         println!(
             "\u{26a0} --auto-approve is active: commands and file edits will run without asking."
@@ -485,6 +498,7 @@ where
                                     provider.as_ref(),
                                     embedding_model,
                                     database,
+                                    project,
                                     &call.arguments,
                                 ) => output,
                                 signal = tokio::signal::ctrl_c() => {
@@ -605,6 +619,21 @@ where
         }
         messages.extend(turn_record);
 
+        // Only after the turn is safely persisted: a refresh failure must never cost the exchange.
+        if let Some(snapshot) = last_turn_snapshot.as_ref() {
+            let edited: Vec<PathBuf> = snapshot.keys().cloned().collect();
+            report_index_refresh(tokio::select! {
+                result = refresh_index_for_paths(
+                    provider.as_ref(), &active, database, project, edited,
+                ) => result,
+                signal = tokio::signal::ctrl_c() => {
+                    signal.context("failed to listen for Ctrl+C")?;
+                    println!("\n(interrupted — the index may be stale; /index refreshes it)");
+                    Ok(0)
+                }
+            });
+        }
+
         if is_first_exchange {
             let title_request = provider.chat(ChatRequest {
                 model: active.model.clone(),
@@ -704,6 +733,9 @@ where
 
     let user_message = Message::user(prompt);
     let mut tool_trail: Vec<Message> = Vec::new();
+    // Files `patch_file` targeted this turn, so the code index can be refreshed once at the end.
+    // Interactive chat reads the same set out of its revert snapshot, which `-p` has no use for.
+    let mut edited: Vec<PathBuf> = Vec::new();
     let mut round = 0usize;
     let (assistant_message, final_usage, final_finish) = loop {
         round += 1;
@@ -759,6 +791,7 @@ where
                             provider.as_ref(),
                             embedding_model,
                             database,
+                            project,
                             &call.arguments,
                         )
                         .await
@@ -774,6 +807,12 @@ where
                 println!("    denied: non-interactive mode (pass --auto-approve to allow)");
                 "The user declined to run this command (non-interactive mode).".to_string()
             } else {
+                if call.name == tools::PATCH_FILE_TOOL
+                    && let Some(target) = tools::patch_target(project.root(), &call.arguments)
+                    && !edited.contains(&target)
+                {
+                    edited.push(target);
+                }
                 tools.dispatch(call).await
             };
             match output.strip_prefix("Error: ") {
@@ -807,6 +846,11 @@ where
     )?;
     database.rename_session(&session.id, &make_title(title_source))?;
     session.title = make_title(title_source);
+
+    // Only after the turn is safely persisted: a refresh failure must never cost the exchange.
+    report_index_refresh(
+        refresh_index_for_paths(provider.as_ref(), &active, database, project, edited).await,
+    );
 
     let title_response = provider
         .chat(ChatRequest {
@@ -1495,6 +1539,7 @@ async fn run_index(
     )?;
 
     let root = project.root();
+    let key = project.key();
     let mut seen = std::collections::HashSet::new();
     let mut indexed = 0usize;
     let mut skipped = 0usize;
@@ -1508,34 +1553,30 @@ async fn run_index(
             continue;
         };
         let hash = content_hash(&content);
-        if database.indexed_file_hash(&relative)?.as_deref() == Some(hash.as_str()) {
+        if database.indexed_file_hash(&key, &relative)?.as_deref() == Some(hash.as_str()) {
             skipped += 1;
             continue;
         }
 
-        let chunks = tools::chunk_text(&content);
-        database.delete_chunks_for_path(&relative)?;
-        if !chunks.is_empty() {
-            let texts: Vec<String> = chunks.iter().map(|(_, _, text)| text.clone()).collect();
-            let embeddings = provider
-                .embed(embedding_model, texts)
-                .await
-                .with_context(|| format!("failed to embed {relative}"))?;
-            for ((start, end, text), embedding) in chunks.into_iter().zip(embeddings) {
-                database.insert_chunk(&relative, start, end, &text, &embedding)?;
-                chunk_total += 1;
-            }
-        }
-        database.set_indexed_file(&relative, &hash)?;
+        chunk_total += index_file(
+            provider,
+            embedding_model,
+            database,
+            &key,
+            &relative,
+            &content,
+            &hash,
+        )
+        .await?;
         indexed += 1;
     }
 
     // Anything indexed before but not seen on this walk no longer exists (or is now ignored).
     let mut removed = 0usize;
-    for path in database.indexed_paths()? {
-        if !seen.contains(&path) {
-            database.delete_chunks_for_path(&path)?;
-            database.delete_indexed_file(&path)?;
+    for file in database.indexed_files(&key)? {
+        if !seen.contains(&file.path) {
+            database.delete_chunks_for_path(&key, &file.path)?;
+            database.delete_indexed_file(&key, &file.path)?;
             removed += 1;
         }
     }
@@ -1543,8 +1584,190 @@ async fn run_index(
     Ok(format!(
         "Indexed {indexed} file(s) ({chunk_total} new chunks), skipped {skipped} unchanged, \
          removed {removed} deleted. {} chunk(s) total.",
-        database.chunk_count()?
+        database.chunk_count(&key)?
     ))
+}
+
+/// Chunk, embed, and store one file's content for a project, replacing whatever was indexed for
+/// that path before, and record the hash so a later run can skip it while it stays unchanged.
+/// Returns how many chunks were written. Shared by `/index` and the post-turn refresh so both
+/// store chunks the same way.
+#[allow(clippy::too_many_arguments)]
+async fn index_file(
+    provider: &dyn Provider,
+    embedding_model: &str,
+    database: &Database,
+    project_key: &str,
+    relative: &str,
+    content: &str,
+    hash: &str,
+) -> Result<usize> {
+    let chunks = tools::chunk_text(content);
+    database.delete_chunks_for_path(project_key, relative)?;
+    let mut written = 0;
+    if !chunks.is_empty() {
+        let texts: Vec<String> = chunks.iter().map(|(_, _, text)| text.clone()).collect();
+        let embeddings = provider
+            .embed(embedding_model, texts)
+            .await
+            .with_context(|| format!("failed to embed {relative}"))?;
+        for ((start, end, text), embedding) in chunks.into_iter().zip(embeddings) {
+            database.insert_chunk(project_key, relative, start, end, &text, &embedding)?;
+            written += 1;
+        }
+    }
+    database.set_indexed_file(project_key, relative, hash)?;
+    Ok(written)
+}
+
+/// Re-embed the files a completed turn edited, so `search_code` cannot answer with text that no
+/// longer exists at the lines it reports.
+///
+/// Refresh only: a file the turn *created* is not added to the index on Kamui's own initiative.
+/// Stale content in an already-indexed file is actively misleading, while a file missing from the
+/// index is merely incomplete — and the startup staleness hint already surfaces it — so only the
+/// former justifies spending the user's embedding budget unasked. Having run `/index` at least
+/// once is what opts a project in; without that, or without an `embedding_model`, this does
+/// nothing and costs nothing.
+///
+/// Best-effort by contract: callers report a failure and carry on, since the turn's real work is
+/// already done and persisted, and `/index` can always rebuild.
+async fn refresh_index_for_paths(
+    provider: &dyn Provider,
+    active: &Profile,
+    database: &Database,
+    project: &ProjectContext,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<usize> {
+    let Some(embedding_model) = active.embedding_model.as_deref() else {
+        return Ok(0);
+    };
+    let key = project.key();
+    let root = project.root();
+    let mut refreshed = 0;
+    for path in paths {
+        let relative = tools::relative_slug(root, &path);
+        let Some(stored_hash) = database.indexed_file_hash(&key, &relative)? else {
+            continue;
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            // Gone, or no longer readable as text: dropping its chunks is cheaper than embedding
+            // and safer than serving text nothing can be checked against.
+            database.delete_chunks_for_path(&key, &relative)?;
+            database.delete_indexed_file(&key, &relative)?;
+            refreshed += 1;
+            continue;
+        };
+        // A turn can edit a file and end up back at the indexed content — patched then reverted,
+        // or an edit that cancels out. Nothing to re-embed then.
+        let hash = content_hash(&content);
+        if hash == stored_hash {
+            continue;
+        }
+        index_file(
+            provider,
+            embedding_model,
+            database,
+            &key,
+            &relative,
+            &content,
+            &hash,
+        )
+        .await?;
+        refreshed += 1;
+    }
+    Ok(refreshed)
+}
+
+/// Report the outcome of a post-turn index refresh on one line, saying nothing when there was
+/// nothing to refresh.
+fn report_index_refresh(outcome: Result<usize>) {
+    match outcome {
+        Ok(0) => {}
+        Ok(count) => println!("(refreshed {count} file(s) in the code index)"),
+        Err(error) => eprintln!("(index refresh failed: {error:#} — /index rebuilds it)"),
+    }
+}
+
+/// How far the stored index has drifted from what is on disk, as counts of files that changed,
+/// appeared, or disappeared since they were last indexed.
+#[derive(Default, PartialEq, Eq, Debug)]
+struct IndexStaleness {
+    changed: usize,
+    added: usize,
+    removed: usize,
+}
+
+impl IndexStaleness {
+    fn is_fresh(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// A one-line summary listing only the non-zero counts, e.g. `3 changed, 1 new`.
+    fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if self.changed > 0 {
+            parts.push(format!("{} changed", self.changed));
+        }
+        if self.added > 0 {
+            parts.push(format!("{} new", self.added));
+        }
+        if self.removed > 0 {
+            parts.push(format!("{} removed", self.removed));
+        }
+        parts.join(", ")
+    }
+}
+
+/// Compare the stored index against the project tree, returning `None` when this project has never
+/// been indexed (so nothing is reported to a user who has not opted into semantic search).
+///
+/// Deliberately cheap: it walks the tree and compares each file's mtime against when it was
+/// indexed, rather than reading and hashing every file the way `/index` does. That makes it a hint
+/// — a checkout can bump an mtime without changing content — but it costs no file reads, no
+/// network, and no embedding spend at startup, and `/index` still does the authoritative hash
+/// comparison before re-embedding anything.
+fn index_staleness(
+    database: &Database,
+    project: &ProjectContext,
+) -> Result<Option<IndexStaleness>> {
+    let indexed: HashMap<String, i64> = database
+        .indexed_files(&project.key())?
+        .into_iter()
+        .map(|file| (file.path, file.indexed_at))
+        .collect();
+    if indexed.is_empty() {
+        return Ok(None);
+    }
+
+    let root = project.root();
+    let mut staleness = IndexStaleness::default();
+    let mut seen = HashSet::new();
+    for path in tools::walk(root) {
+        let relative = tools::relative_slug(root, &path);
+        match indexed.get(&relative) {
+            Some(indexed_at) => {
+                if modified_at(&path).is_some_and(|modified| modified > *indexed_at) {
+                    staleness.changed += 1;
+                }
+            }
+            None => staleness.added += 1,
+        }
+        seen.insert(relative);
+    }
+    staleness.removed = indexed.keys().filter(|path| !seen.contains(*path)).count();
+
+    Ok(Some(staleness))
+}
+
+/// A file's modification time as a Unix timestamp, or `None` when the platform or filesystem does
+/// not report one — treated as "unchanged" rather than guessed at.
+fn modified_at(path: &Path) -> Option<i64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_secs() as i64)
 }
 
 /// A fast, non-cryptographic change-detection hash — good enough to decide whether a file needs
@@ -1570,9 +1793,10 @@ async fn dispatch_search_code(
     provider: &dyn Provider,
     embedding_model: &str,
     database: &Database,
+    project: &ProjectContext,
     arguments: &str,
 ) -> String {
-    match run_search_code(provider, embedding_model, database, arguments).await {
+    match run_search_code(provider, embedding_model, database, project, arguments).await {
         Ok(output) => output,
         Err(error) => format!("Error: {error:#}"),
     }
@@ -1582,6 +1806,7 @@ async fn run_search_code(
     provider: &dyn Provider,
     embedding_model: &str,
     database: &Database,
+    project: &ProjectContext,
     arguments: &str,
 ) -> Result<String> {
     let arguments: SearchCodeArguments = serde_json::from_str(arguments)
@@ -1590,9 +1815,9 @@ async fn run_search_code(
         anyhow::bail!("search_code requires a non-empty 'query' argument");
     }
 
-    let chunks = database.all_chunks()?;
+    let chunks = database.all_chunks(&project.key())?;
     if chunks.is_empty() {
-        anyhow::bail!("no code index found; run /index first");
+        anyhow::bail!("no code index found for this project; run /index first");
     }
 
     let mut query_embedding = provider
@@ -2410,8 +2635,8 @@ mod tests {
         assert!(last_turn_snapshot.is_none());
     }
 
-    /// A `Provider` that panics if actually called — for tests asserting that `spawn_agent`
-    /// rejects bad input before ever making a request.
+    /// A `Provider` that panics if actually called — for tests asserting that some check rejects
+    /// or skips its input before ever making a request.
     struct UnreachableProvider;
 
     #[async_trait::async_trait]
@@ -2420,17 +2645,180 @@ mod tests {
             "unreachable"
         }
         async fn chat(&self, _request: ChatRequest) -> Result<crate::provider::ChatResponse> {
-            panic!("spawn_agent should have rejected this input before calling the provider");
+            panic!("the provider should not have been called");
         }
         async fn chat_stream(
             &self,
             _request: ChatRequest,
         ) -> Result<mpsc::UnboundedReceiver<Result<crate::provider::StreamEvent>>> {
-            panic!("spawn_agent should have rejected this input before calling the provider");
+            panic!("the provider should not have been called");
         }
         async fn embed(&self, _model: &str, _input: Vec<String>) -> Result<Vec<Vec<f32>>> {
-            panic!("search_code should have rejected this input before calling the provider");
+            panic!("the provider should not have been asked to embed anything");
         }
+    }
+
+    /// A `Provider` that answers `embed` with a deterministic vector per input, so index writes can
+    /// be asserted without a network call.
+    struct StubEmbeddingProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for StubEmbeddingProvider {
+        fn name(&self) -> &'static str {
+            "stub-embeddings"
+        }
+        async fn chat(&self, _request: ChatRequest) -> Result<crate::provider::ChatResponse> {
+            panic!("these tests only exercise embedding");
+        }
+        async fn chat_stream(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<mpsc::UnboundedReceiver<Result<crate::provider::StreamEvent>>> {
+            panic!("these tests only exercise embedding");
+        }
+        async fn embed(&self, _model: &str, input: Vec<String>) -> Result<Vec<Vec<f32>>> {
+            Ok(input.iter().map(|text| vec![text.len() as f32]).collect())
+        }
+    }
+
+    fn profile_with_embedding(embedding_model: Option<&str>) -> Profile {
+        Profile {
+            name: "default".to_string(),
+            model: "gpt-5".to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            api_key: "k".to_string(),
+            context_window: None,
+            tools: true,
+            embedding_model: embedding_model.map(str::to_string),
+        }
+    }
+
+    /// Seed the index for a project-relative path without going through a provider, so a test can
+    /// start from "already indexed" and assert what a refresh does next.
+    fn seed_index(database: &Database, project: &ProjectContext, relative: &str, content: &str) {
+        let key = project.key();
+        database
+            .set_indexed_file(&key, relative, &content_hash(content))
+            .unwrap();
+        database
+            .insert_chunk(&key, relative, 1, 1, content, &[1.0])
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_re_embeds_an_indexed_file_that_changed() {
+        let database = Database::open_in_memory_for_tests();
+        let project = temporary_project();
+        let path = project.root().join("a.rs");
+        seed_index(&database, &project, "a.rs", "fn old() {}");
+        fs::write(&path, "fn new() {}").unwrap();
+
+        let refreshed = refresh_index_for_paths(
+            &StubEmbeddingProvider,
+            &profile_with_embedding(Some("embed-1")),
+            &database,
+            &project,
+            vec![path],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(refreshed, 1);
+        let chunks = database.all_chunks(&project.key()).unwrap();
+        assert_eq!(chunks.len(), 1, "the old chunk should have been replaced");
+        assert_eq!(chunks[0].content, "fn new() {}");
+        assert_eq!(
+            database.indexed_file_hash(&project.key(), "a.rs").unwrap(),
+            Some(content_hash("fn new() {}")),
+            "the stored hash should follow the new content"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_skips_a_file_that_still_matches_the_index() {
+        let database = Database::open_in_memory_for_tests();
+        let project = temporary_project();
+        let path = project.root().join("a.rs");
+        fs::write(&path, "fn a() {}").unwrap();
+        seed_index(&database, &project, "a.rs", "fn a() {}");
+
+        // `UnreachableProvider` panics on `embed`, so reaching zero here proves nothing was spent.
+        let refreshed = refresh_index_for_paths(
+            &UnreachableProvider,
+            &profile_with_embedding(Some("embed-1")),
+            &database,
+            &project,
+            vec![path],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(refreshed, 0);
+    }
+
+    /// The deliberate boundary: a turn that creates a file does not grow the index on Kamui's own
+    /// initiative — the startup staleness hint reports it and the user decides.
+    #[tokio::test]
+    async fn refresh_ignores_a_file_that_was_never_indexed() {
+        let database = Database::open_in_memory_for_tests();
+        let project = temporary_project();
+        let path = project.root().join("new.rs");
+        fs::write(&path, "fn brand_new() {}").unwrap();
+
+        let refreshed = refresh_index_for_paths(
+            &UnreachableProvider,
+            &profile_with_embedding(Some("embed-1")),
+            &database,
+            &project,
+            vec![path],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(refreshed, 0);
+        assert!(database.all_chunks(&project.key()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_drops_the_index_entry_for_a_file_that_disappeared() {
+        let database = Database::open_in_memory_for_tests();
+        let project = temporary_project();
+        seed_index(&database, &project, "gone.rs", "fn gone() {}");
+
+        let refreshed = refresh_index_for_paths(
+            &UnreachableProvider,
+            &profile_with_embedding(Some("embed-1")),
+            &database,
+            &project,
+            vec![project.root().join("gone.rs")],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(refreshed, 1);
+        assert!(database.all_chunks(&project.key()).unwrap().is_empty());
+        assert!(database.indexed_files(&project.key()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_does_nothing_without_an_embedding_model() {
+        let database = Database::open_in_memory_for_tests();
+        let project = temporary_project();
+        let path = project.root().join("a.rs");
+        seed_index(&database, &project, "a.rs", "fn old() {}");
+        fs::write(&path, "fn new() {}").unwrap();
+
+        let refreshed = refresh_index_for_paths(
+            &UnreachableProvider,
+            &profile_with_embedding(None),
+            &database,
+            &project,
+            vec![path],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(refreshed, 0);
     }
 
     #[tokio::test]
@@ -2486,6 +2874,10 @@ mod tests {
         assert_ne!(content_hash("hello"), content_hash("world"));
     }
 
+    fn temporary_project() -> ProjectContext {
+        ProjectContext::from_root(temporary_directory()).unwrap()
+    }
+
     #[tokio::test]
     async fn search_code_rejects_invalid_json_without_calling_the_provider() {
         let database = Database::open_in_memory_for_tests();
@@ -2493,6 +2885,7 @@ mod tests {
             &UnreachableProvider,
             "text-embedding-3-small",
             &database,
+            &temporary_project(),
             "not json",
         )
         .await;
@@ -2506,6 +2899,7 @@ mod tests {
             &UnreachableProvider,
             "text-embedding-3-small",
             &database,
+            &temporary_project(),
             r#"{"query":"   "}"#,
         )
         .await;
@@ -2519,10 +2913,94 @@ mod tests {
             &UnreachableProvider,
             "text-embedding-3-small",
             &database,
+            &temporary_project(),
             r#"{"query":"how does auth work"}"#,
         )
         .await;
         assert!(output.contains("no code index found"), "{output}");
+    }
+
+    /// A project indexed elsewhere must not satisfy `search_code` here — the chunks exist, but not
+    /// for this root, so the tool still reports a missing index rather than answering with another
+    /// project's code.
+    #[tokio::test]
+    async fn search_code_ignores_another_projects_index() {
+        let database = Database::open_in_memory_for_tests();
+        database
+            .insert_chunk("/somewhere/else", "src/main.rs", 1, 5, "other", &[0.1])
+            .unwrap();
+
+        let output = dispatch_search_code(
+            &UnreachableProvider,
+            "text-embedding-3-small",
+            &database,
+            &temporary_project(),
+            r#"{"query":"how does auth work"}"#,
+        )
+        .await;
+
+        assert!(output.contains("no code index found"), "{output}");
+    }
+
+    #[test]
+    fn staleness_is_not_reported_for_an_unindexed_project() {
+        let database = Database::open_in_memory_for_tests();
+        let project = temporary_project();
+        assert_eq!(index_staleness(&database, &project).unwrap(), None);
+    }
+
+    #[test]
+    fn staleness_counts_changed_new_and_removed_files() {
+        let database = Database::open_in_memory_for_tests();
+        let project = temporary_project();
+        let key = project.key();
+        let root = project.root();
+
+        // `indexed.rs` is indexed and untouched, `edited.rs` is indexed then modified, `new.rs`
+        // appeared after indexing, and `gone.rs` was indexed but no longer exists on disk.
+        fs::write(root.join("indexed.rs"), "fn a() {}").unwrap();
+        fs::write(root.join("edited.rs"), "fn b() {}").unwrap();
+        database.set_indexed_file(&key, "indexed.rs", "h1").unwrap();
+        database.set_indexed_file(&key, "edited.rs", "h2").unwrap();
+        database.set_indexed_file(&key, "gone.rs", "h3").unwrap();
+        fs::write(root.join("new.rs"), "fn c() {}").unwrap();
+
+        // Push the mtime forward instead of sleeping, so the test stays fast and deterministic.
+        let edited = fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("edited.rs"))
+            .unwrap();
+        edited
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(120))
+            .unwrap();
+
+        let staleness = index_staleness(&database, &project).unwrap().unwrap();
+
+        assert_eq!(
+            staleness,
+            IndexStaleness {
+                changed: 1,
+                added: 1,
+                removed: 1,
+            }
+        );
+        assert!(!staleness.is_fresh());
+        assert_eq!(staleness.describe(), "1 changed, 1 new, 1 removed");
+    }
+
+    #[test]
+    fn staleness_is_fresh_when_every_indexed_file_is_untouched() {
+        let database = Database::open_in_memory_for_tests();
+        let project = temporary_project();
+        fs::write(project.root().join("a.rs"), "fn a() {}").unwrap();
+        database
+            .set_indexed_file(&project.key(), "a.rs", "h1")
+            .unwrap();
+
+        let staleness = index_staleness(&database, &project).unwrap().unwrap();
+
+        assert!(staleness.is_fresh(), "{staleness:?}");
+        assert_eq!(staleness.describe(), "");
     }
 
     #[tokio::test]
@@ -2530,15 +3008,7 @@ mod tests {
         let root = temporary_directory().canonicalize().unwrap();
         let project = ProjectContext::from_root(root.clone()).unwrap();
         let database = Database::open_in_memory_for_tests();
-        let active = Profile {
-            name: "default".to_string(),
-            model: "gpt-5".to_string(),
-            base_url: "https://api.example.com/v1".to_string(),
-            api_key: "k".to_string(),
-            context_window: None,
-            tools: true,
-            embedding_model: None,
-        };
+        let active = profile_with_embedding(None);
 
         let error = run_index(&UnreachableProvider, &active, &database, &project)
             .await

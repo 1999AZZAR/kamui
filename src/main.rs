@@ -248,7 +248,10 @@ async fn run_status() -> Result<()> {
     println!("Sessions:  {}", database.list_sessions()?.len());
     println!("Memory:    {} fact(s)", database.list_memory()?.len());
     if default.embedding_model.is_some() {
-        println!("Index:     {} chunk(s)", database.chunk_count()?);
+        println!(
+            "Index:     {} chunk(s) for this project",
+            database.chunk_count(&project.key())?
+        );
     }
 
     Ok(())

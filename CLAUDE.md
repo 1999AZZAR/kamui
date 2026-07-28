@@ -160,9 +160,32 @@ effort or operational risk is disproportionate to their immediate value.
   `Provider::embed`, and removes chunks for files no longer present. Requires
   `Profile::embedding_model` to be set; otherwise it fails with a clear message and `search_code` is
   never offered to the model. `search_code` (also intercepted like `ask_user`, since it needs
-  `Provider`/`Database`) embeds the query and ranks every stored chunk by cosine similarity
-  (`chat::cosine_similarity`), a brute-force scan with no vector index — see "Storage Decisions" and
-  README for the v1 scope this accepts.
+  `Provider`/`Database`) embeds the query and ranks that project's stored chunks by cosine
+  similarity (`chat::cosine_similarity`), a brute-force scan with no vector index — see "Storage
+  Decisions" and README for the v1 scope this accepts. The index is scoped per project by
+  `ProjectContext::key` (the canonical root path), so several projects share the one global
+  database without colliding.
+- Files already in the index are kept current automatically: after a turn is persisted,
+  `chat::refresh_index_for_paths` re-embeds every `patch_file` target that the index already knows
+  about (`chat::index_file` is the shared write path, used by `/index` too). A path the turn
+  *created* is deliberately not added — stale text in an indexed file makes `search_code` quote
+  code that no longer exists, while an unindexed file is merely absent from results, so only the
+  correctness problem justifies unasked spend. A target that has since become unreadable has its
+  chunks dropped rather than re-embedded. Interactive chat takes the path set from its revert
+  snapshot; `-p` collects `tools::patch_target` results directly, since it has no snapshot. Both
+  run only after `save_turn`, and a failure is reported without failing the turn.
+- Building the index is never automatic. Cursor-style index-on-open is deliberately not adopted:
+  Kamui is a start-and-exit CLI, not a long-lived editor, so there is no background window to hide
+  the work in, and embedding spends the user's own API key — silent startup spend is the wrong
+  default. Instead,
+  `chat::index_staleness` reports drift: when the project has an existing index, the interactive
+  banner prints how many files changed, appeared, or disappeared and suggests `/index`. It compares
+  each file's mtime against `indexed_files.indexed_at` rather than re-reading and hashing content,
+  so it costs one directory walk, no file reads, no network, and no spend. That makes it a hint (a
+  checkout can bump an mtime without changing content), which is acceptable because `/index` still
+  does the authoritative hash comparison before re-embedding. Nothing is printed when the index is
+  fresh, when the project was never indexed, when no `embedding_model` is configured, or in `-p`
+  mode (that output is script input); a failed check is swallowed rather than blocking startup.
 - `remember`, `update_memory`, and `forget` manage a global memory table (`user_version = 6`),
   intercepted the same way `ask_user` is (they need `Database` directly). Unlike project
   instructions (`KAMUI.md`, a file the user edits) or session history (scoped to one conversation),
@@ -178,10 +201,10 @@ effort or operational risk is disproportionate to their immediate value.
   usable as a pre-flight check without starting a full chat session.
 - `kamui status` (`main::run_status`) prints a config/database summary with no network calls at
   all — profile, model, base URL, all configured profiles, `embedding_model`, MCP server names,
-  the `[permissions]` allowlist, project and database paths, session count, memory count, and
-  indexed-chunk count. Ported from the sibling Kumo project's `kumo status` (read-only summary,
-  distinct from `doctor`'s active checks), adapted from Kumo's single-workspace/single-provider
-  config to Kamui's per-project root and multi-profile config.
+  the `[permissions]` allowlist, project and database paths, session count, memory count, and the
+  active project's indexed-chunk count. Ported from the sibling Kumo project's `kumo status`
+  (read-only summary, distinct from `doctor`'s active checks), adapted from Kumo's
+  single-workspace/single-provider config to Kamui's per-project root and multi-profile config.
 
 ## Repository Context
 
@@ -295,10 +318,15 @@ The terminal runner, mutation tools, per-turn usage accounting, and a durable au
   by copying a live SQLite database.
 - Foreign keys and cascading session deletion must remain enabled.
 - Save an exchange and its usage atomically.
-- `code_chunks`/`indexed_files` (`user_version = 7`) are a known, accepted exception to "one global
-  database": `path` is project-relative, not project-scoped, so indexing two different projects
-  into the same database would collide. Fixing this (e.g. a project-id column) is future work if it
-  becomes a real problem; not worth the complexity for a single-project v1.
+- `code_chunks`/`indexed_files` are project-scoped inside the one global database: every row carries
+  a `project` column holding `ProjectContext::key` (the canonical project root), because `path` is
+  project-relative and would otherwise collide across projects. Every accessor takes the project key
+  as its first argument; there is no unscoped variant, so a new call site cannot forget it. The
+  `user_version = 8` migration recreates both tables (`indexed_files`' primary key becomes
+  `(project, path)`, which SQLite cannot alter in place) and drops any pre-existing rows: they
+  record no project and cannot be attributed to one. That is safe here specifically because the
+  index is a regenerable cache, not user data — do not use it as precedent for dropping rows from
+  `sessions`, `messages`, `usage_records`, or `memory`.
 
 ## Configuration
 

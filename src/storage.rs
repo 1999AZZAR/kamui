@@ -198,6 +198,37 @@ impl Database {
                  PRAGMA user_version = 7;",
             )?;
         }
+        if version < 8 {
+            // Scope the semantic-search store to one project, lifting the v7 limitation above:
+            // `path` is project-relative, so indexing two projects into this one global database
+            // made their identically-named files collide. Existing rows record no project, so they
+            // cannot be attributed to one and are dropped rather than silently mixed — the index is
+            // a regenerable cache, and `/index` rebuilds it. `indexed_files` is recreated rather
+            // than altered because its primary key becomes (project, path), which SQLite cannot
+            // change in place.
+            connection.execute_batch(
+                "DROP TABLE IF EXISTS code_chunks;
+                 DROP TABLE IF EXISTS indexed_files;
+                 CREATE TABLE indexed_files (
+                     project TEXT NOT NULL,
+                     path TEXT NOT NULL,
+                     hash TEXT NOT NULL,
+                     indexed_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                     PRIMARY KEY (project, path)
+                 );
+                 CREATE TABLE code_chunks (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     project TEXT NOT NULL,
+                     path TEXT NOT NULL,
+                     start_line INTEGER NOT NULL,
+                     end_line INTEGER NOT NULL,
+                     content TEXT NOT NULL,
+                     embedding BLOB NOT NULL
+                 );
+                 CREATE INDEX code_chunks_project_path ON code_chunks(project, path);
+                 PRAGMA user_version = 8;",
+            )?;
+        }
         Ok(Self { connection, path })
     }
 
@@ -645,54 +676,68 @@ impl Database {
     }
 
     /// The content hash `/index` stored for a project-relative path last time it was indexed, or
-    /// `None` if the path has never been indexed. Compared against the file's current hash to skip
-    /// re-embedding unchanged files.
-    pub fn indexed_file_hash(&self, path: &str) -> Result<Option<String>> {
+    /// `None` if the path has never been indexed in this project. Compared against the file's
+    /// current hash to skip re-embedding unchanged files.
+    pub fn indexed_file_hash(&self, project: &str, path: &str) -> Result<Option<String>> {
         self.connection
             .query_row(
-                "SELECT hash FROM indexed_files WHERE path = ?1",
-                [path],
+                "SELECT hash FROM indexed_files WHERE project = ?1 AND path = ?2",
+                params![project, path],
                 |row| row.get(0),
             )
             .optional()
             .map_err(Into::into)
     }
 
-    /// Record (or update) the hash `/index` last saw for a path.
-    pub fn set_indexed_file(&self, path: &str, hash: &str) -> Result<()> {
+    /// Record (or update) the hash `/index` last saw for a path in this project.
+    pub fn set_indexed_file(&self, project: &str, path: &str, hash: &str) -> Result<()> {
         self.connection.execute(
-            "INSERT INTO indexed_files (path, hash, indexed_at) VALUES (?1, ?2, unixepoch())
-             ON CONFLICT(path) DO UPDATE SET hash = excluded.hash, indexed_at = excluded.indexed_at",
-            params![path, hash],
+            "INSERT INTO indexed_files (project, path, hash, indexed_at)
+             VALUES (?1, ?2, ?3, unixepoch())
+             ON CONFLICT(project, path)
+                 DO UPDATE SET hash = excluded.hash, indexed_at = excluded.indexed_at",
+            params![project, path, hash],
         )?;
         Ok(())
     }
 
-    /// Every project-relative path currently indexed, so `/index` can tell which ones no longer
-    /// exist on disk and should be removed.
-    pub fn indexed_paths(&self) -> Result<Vec<String>> {
-        let mut statement = self.connection.prepare("SELECT path FROM indexed_files")?;
-        let rows = statement.query_map([], |row| row.get(0))?;
+    /// Every file currently indexed for a project, so `/index` can tell which ones no longer exist
+    /// on disk and the startup staleness check can compare each one against its file's mtime.
+    pub fn indexed_files(&self, project: &str) -> Result<Vec<IndexedFile>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT path, indexed_at FROM indexed_files WHERE project = ?1")?;
+        let rows = statement.query_map([project], |row| {
+            Ok(IndexedFile {
+                path: row.get(0)?,
+                indexed_at: row.get(1)?,
+            })
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    pub fn delete_indexed_file(&self, path: &str) -> Result<()> {
-        self.connection
-            .execute("DELETE FROM indexed_files WHERE path = ?1", [path])?;
+    pub fn delete_indexed_file(&self, project: &str, path: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM indexed_files WHERE project = ?1 AND path = ?2",
+            params![project, path],
+        )?;
         Ok(())
     }
 
     /// Drop every chunk previously indexed for a path, before re-chunking it (or because it no
     /// longer exists).
-    pub fn delete_chunks_for_path(&self, path: &str) -> Result<()> {
-        self.connection
-            .execute("DELETE FROM code_chunks WHERE path = ?1", [path])?;
+    pub fn delete_chunks_for_path(&self, project: &str, path: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM code_chunks WHERE project = ?1 AND path = ?2",
+            params![project, path],
+        )?;
         Ok(())
     }
 
     pub fn insert_chunk(
         &self,
+        project: &str,
         path: &str,
         start_line: usize,
         end_line: usize,
@@ -700,9 +745,10 @@ impl Database {
         embedding: &[f32],
     ) -> Result<()> {
         self.connection.execute(
-            "INSERT INTO code_chunks (path, start_line, end_line, content, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO code_chunks (project, path, start_line, end_line, content, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
+                project,
                 path,
                 start_line as i64,
                 end_line as i64,
@@ -713,22 +759,27 @@ impl Database {
         Ok(())
     }
 
-    /// The number of chunks currently indexed, for a quick `/index`/status summary without
-    /// loading every embedding into memory.
-    pub fn chunk_count(&self) -> Result<i64> {
+    /// The number of chunks currently indexed for a project, for a quick `/index`/status summary
+    /// without loading every embedding into memory.
+    pub fn chunk_count(&self, project: &str) -> Result<i64> {
         self.connection
-            .query_row("SELECT COUNT(*) FROM code_chunks", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM code_chunks WHERE project = ?1",
+                [project],
+                |row| row.get(0),
+            )
             .map_err(Into::into)
     }
 
-    /// Every indexed chunk, for `search_code` to score against a query embedding. Loaded in full
-    /// (no vector index) — a brute-force scan is simple and fast enough at the scale a single
-    /// project's chunks reach; see CLAUDE.md for the tradeoff.
-    pub fn all_chunks(&self) -> Result<Vec<CodeChunk>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT path, start_line, end_line, content, embedding FROM code_chunks")?;
-        let rows = statement.query_map([], |row| {
+    /// Every indexed chunk in a project, for `search_code` to score against a query embedding.
+    /// Loaded in full (no vector index) — a brute-force scan is simple and fast enough at the scale
+    /// a single project's chunks reach; see CLAUDE.md for the tradeoff.
+    pub fn all_chunks(&self, project: &str) -> Result<Vec<CodeChunk>> {
+        let mut statement = self.connection.prepare(
+            "SELECT path, start_line, end_line, content, embedding FROM code_chunks
+             WHERE project = ?1",
+        )?;
+        let rows = statement.query_map([project], |row| {
             let start_line: i64 = row.get(1)?;
             let end_line: i64 = row.get(2)?;
             let embedding: Vec<u8> = row.get(4)?;
@@ -743,6 +794,13 @@ impl Database {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
+}
+
+/// One file `/index` has embedded, with the time it was last indexed so the startup staleness
+/// check can spot files modified since without re-reading and re-hashing them.
+pub struct IndexedFile {
+    pub path: String,
+    pub indexed_at: i64,
 }
 
 /// One chunk of an indexed file, as scored by `search_code`.
@@ -1256,15 +1314,19 @@ mod tests {
         assert_eq!(database.usage_total().unwrap().total_tokens, 0);
     }
 
+    /// Stand-in project keys; the real ones are canonical root paths (`ProjectContext::key`).
+    const PROJECT: &str = "/home/dev/alpha";
+    const OTHER_PROJECT: &str = "/home/dev/beta";
+
     #[test]
     fn embedding_round_trips_through_the_blob_column() {
         let database = database();
         let vector = vec![0.5_f32, -1.25, 0.0, 3.0];
         database
-            .insert_chunk("src/main.rs", 1, 10, "fn main() {}", &vector)
+            .insert_chunk(PROJECT, "src/main.rs", 1, 10, "fn main() {}", &vector)
             .unwrap();
 
-        let chunks = database.all_chunks().unwrap();
+        let chunks = database.all_chunks(PROJECT).unwrap();
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].path, "src/main.rs");
@@ -1277,17 +1339,17 @@ mod tests {
     #[test]
     fn indexed_file_hash_tracks_the_most_recent_hash() {
         let database = database();
-        assert_eq!(database.indexed_file_hash("a.rs").unwrap(), None);
+        assert_eq!(database.indexed_file_hash(PROJECT, "a.rs").unwrap(), None);
 
-        database.set_indexed_file("a.rs", "hash1").unwrap();
+        database.set_indexed_file(PROJECT, "a.rs", "hash1").unwrap();
         assert_eq!(
-            database.indexed_file_hash("a.rs").unwrap(),
+            database.indexed_file_hash(PROJECT, "a.rs").unwrap(),
             Some("hash1".to_string())
         );
 
-        database.set_indexed_file("a.rs", "hash2").unwrap();
+        database.set_indexed_file(PROJECT, "a.rs", "hash2").unwrap();
         assert_eq!(
-            database.indexed_file_hash("a.rs").unwrap(),
+            database.indexed_file_hash(PROJECT, "a.rs").unwrap(),
             Some("hash2".to_string())
         );
     }
@@ -1295,25 +1357,98 @@ mod tests {
     #[test]
     fn deleting_a_path_removes_its_chunks_and_index_entry() {
         let database = database();
-        database.set_indexed_file("a.rs", "hash1").unwrap();
+        database.set_indexed_file(PROJECT, "a.rs", "hash1").unwrap();
         database
-            .insert_chunk("a.rs", 1, 5, "content", &[0.1])
+            .insert_chunk(PROJECT, "a.rs", 1, 5, "content", &[0.1])
             .unwrap();
 
-        database.delete_chunks_for_path("a.rs").unwrap();
-        database.delete_indexed_file("a.rs").unwrap();
+        database.delete_chunks_for_path(PROJECT, "a.rs").unwrap();
+        database.delete_indexed_file(PROJECT, "a.rs").unwrap();
 
-        assert!(database.all_chunks().unwrap().is_empty());
-        assert_eq!(database.indexed_file_hash("a.rs").unwrap(), None);
-        assert!(database.indexed_paths().unwrap().is_empty());
+        assert!(database.all_chunks(PROJECT).unwrap().is_empty());
+        assert_eq!(database.indexed_file_hash(PROJECT, "a.rs").unwrap(), None);
+        assert!(database.indexed_files(PROJECT).unwrap().is_empty());
     }
 
     #[test]
     fn chunk_count_reflects_inserted_chunks() {
         let database = database();
-        assert_eq!(database.chunk_count().unwrap(), 0);
-        database.insert_chunk("a.rs", 1, 5, "x", &[0.1]).unwrap();
-        database.insert_chunk("a.rs", 6, 10, "y", &[0.2]).unwrap();
-        assert_eq!(database.chunk_count().unwrap(), 2);
+        assert_eq!(database.chunk_count(PROJECT).unwrap(), 0);
+        database
+            .insert_chunk(PROJECT, "a.rs", 1, 5, "x", &[0.1])
+            .unwrap();
+        database
+            .insert_chunk(PROJECT, "a.rs", 6, 10, "y", &[0.2])
+            .unwrap();
+        assert_eq!(database.chunk_count(PROJECT).unwrap(), 2);
+    }
+
+    /// The whole point of the `user_version = 8` migration: two projects sharing Kamui's one global
+    /// database must not see each other's chunks, even for an identical project-relative path.
+    #[test]
+    fn the_index_is_isolated_per_project() {
+        let database = database();
+        database
+            .insert_chunk(PROJECT, "src/main.rs", 1, 5, "alpha", &[0.1])
+            .unwrap();
+        database
+            .insert_chunk(OTHER_PROJECT, "src/main.rs", 1, 5, "beta", &[0.2])
+            .unwrap();
+        database
+            .set_indexed_file(PROJECT, "src/main.rs", "hash-alpha")
+            .unwrap();
+        database
+            .set_indexed_file(OTHER_PROJECT, "src/main.rs", "hash-beta")
+            .unwrap();
+
+        let chunks = database.all_chunks(PROJECT).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].content, "alpha");
+        assert_eq!(database.chunk_count(PROJECT).unwrap(), 1);
+        assert_eq!(
+            database.indexed_file_hash(PROJECT, "src/main.rs").unwrap(),
+            Some("hash-alpha".to_string())
+        );
+
+        // Re-indexing one project leaves the other's rows untouched.
+        database
+            .delete_chunks_for_path(PROJECT, "src/main.rs")
+            .unwrap();
+        database
+            .delete_indexed_file(PROJECT, "src/main.rs")
+            .unwrap();
+
+        assert!(database.all_chunks(PROJECT).unwrap().is_empty());
+        assert_eq!(database.all_chunks(OTHER_PROJECT).unwrap().len(), 1);
+        assert_eq!(
+            database
+                .indexed_file_hash(OTHER_PROJECT, "src/main.rs")
+                .unwrap(),
+            Some("hash-beta".to_string())
+        );
+    }
+
+    #[test]
+    fn indexed_files_reports_only_the_requested_project() {
+        let database = database();
+        database.set_indexed_file(PROJECT, "a.rs", "h1").unwrap();
+        database.set_indexed_file(PROJECT, "b.rs", "h2").unwrap();
+        database
+            .set_indexed_file(OTHER_PROJECT, "c.rs", "h3")
+            .unwrap();
+
+        let mut paths: Vec<String> = database
+            .indexed_files(PROJECT)
+            .unwrap()
+            .into_iter()
+            .map(|file| file.path)
+            .collect();
+        paths.sort();
+
+        assert_eq!(paths, vec!["a.rs".to_string(), "b.rs".to_string()]);
+        assert!(
+            database.indexed_files(PROJECT).unwrap()[0].indexed_at > 0,
+            "indexed_at should be populated for the staleness check"
+        );
     }
 }

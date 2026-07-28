@@ -165,17 +165,39 @@ deferred. `Provider` gained an `embed(model, texts) -> Vec<Vec<f32>>` method
 `embedding_model` to enable it. `/index` (`chat::run_index`) walks the project the same
 `.gitignore`-aware way `grep`/`glob` do, splits each file into fixed, non-overlapping 50-line
 chunks (`tools::chunk_text` — no syntax awareness), and skips any file whose content hash
-(`chat::content_hash`) matches what `indexed_files` (`user_version = 7`) recorded last run, so a
-second `/index` after a small edit only re-embeds what changed. Chunks and their embedding vectors
-(little-endian `f32` bytes in a BLOB column) live in `code_chunks`. `search_code` embeds the query
-and ranks every stored chunk by cosine similarity (`chat::cosine_similarity`) — a brute-force scan,
-no vector index — returning the top 8 as `path:start-end` with the chunk text. Without
-`embedding_model` configured, `search_code` is not offered to the model at all.
+(`chat::content_hash`) matches what `indexed_files` recorded last run, so a second `/index` after a
+small edit only re-embeds what changed. Chunks and their embedding vectors (little-endian `f32`
+bytes in a BLOB column) live in `code_chunks`. Both tables are keyed by a `project` column
+(`user_version = 8`, the canonical project root from `ProjectContext::key`), so several projects can
+share the one global database without their identically-named relative paths colliding.
+`search_code` embeds the query and ranks that project's stored chunks by cosine similarity
+(`chat::cosine_similarity`) — a brute-force scan, no vector index — returning the top 8 as
+`path:start-end` with the chunk text. Without `embedding_model` configured, `search_code` is not
+offered to the model at all.
 
-Two accepted v1 limitations, worth revisiting only if they become real problems: chunk boundaries
-are fixed-size, not syntax- or semantically-aware, and `code_chunks`/`indexed_files` store a
-project-relative `path` with no project-id column, so indexing two different projects into the
-same global database would collide.
+Maintaining the index is automatic; building it is not. After a persisted turn,
+`chat::refresh_index_for_paths` re-embeds every `patch_file` target already present in the index
+(sharing `chat::index_file` with `/index`), so `search_code` cannot quote code that no longer
+exists at the lines it reports. Files the turn *created* are deliberately left out: stale content
+is misleading, a missing file is only incomplete, and only the former is worth spending the user's
+embedding budget without being asked.
+
+Building the index stays manual by design. Cursor-style automatic indexing on open does not fit
+Kamui: it is a start-and-exit CLI rather than a long-lived editor, so background work has nowhere
+to hide, and embedding runs against the user's own API key — silent spend at startup is the wrong
+default. What
+ships instead is a staleness hint (`chat::index_staleness`): when a project has been indexed before,
+the startup banner reports how many files changed, appeared, or disappeared, and leaves the decision
+to run `/index` to the user. It compares mtimes against `indexed_files.indexed_at` rather than
+re-hashing content, so it costs one directory walk and no network calls; that makes it advisory,
+which is acceptable because `/index` still does the authoritative hash comparison. Interactive chat
+only — `-p` output is script input.
+
+One accepted v1 limitation remains, worth revisiting only if it becomes a real problem: chunk
+boundaries are fixed-size, not syntax- or semantically-aware. (The project-collision limitation was
+the other; `user_version = 8` fixed it. That migration drops any pre-existing index, since old rows
+record no project and cannot be attributed to one — the index is a regenerable cache, so `/index`
+rebuilds it.)
 
 ## Phase 5: Providers and Models
 

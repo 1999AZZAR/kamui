@@ -140,6 +140,37 @@ cosine similarity, returned as `path:start-end` with the chunk text — read the
 context. Without an `embedding_model` configured, `search_code` is not offered to the model at all
 rather than erroring.
 
+The index is per project. Kamui keeps one database for everything, but each indexed chunk records
+which project root it came from, so indexing several projects is safe and `search_code` only ever
+sees the one you launched in.
+
+Once a file is in the index, Kamui keeps it current: after a turn that edited files with
+`patch_file`, any of them already in the index is re-embedded before the next prompt.
+
+```text
+(refreshed 2 file(s) in the code index)
+```
+
+That is a refresh, not a growth — a file the turn *created* is not added on Kamui's initiative.
+Stale text in an indexed file is worse than a missing one: `search_code` would confidently quote
+code that no longer exists at those lines, while an unindexed file is merely absent from results.
+So the correctness problem gets fixed automatically, and widening what's indexed stays your call.
+
+Building the index in the first place never happens on its own — it costs embedding calls against
+your own API key, so Kamui will not spend that budget without being asked. What it does instead is
+tell you when the index has drifted. If the project has been indexed before, the startup banner
+reports what changed:
+
+```text
+Index: 3 changed, 1 new since last /index — run /index to refresh.
+```
+
+That check compares file modification times against when each file was indexed. It reads no files
+and makes no network calls, so it costs nothing at startup — which also makes it a hint rather than
+a verdict (a fresh checkout can bump mtimes without changing content). `/index` still compares
+content hashes before re-embedding anything, so acting on a false alarm is cheap. Nothing is printed
+when the index is up to date, when the project has never been indexed, or in `-p` mode.
+
 This is a v1 baseline: chunking is fixed-size line windows with no syntax awareness, and matching
 is a brute-force scan (no vector index) — both simple choices that hold up fine at a single
 project's scale. Project indexing at a larger scale, and richer chunking, are open future work.
@@ -265,7 +296,8 @@ kamui status
 
 `status` reads the config file and local database directly and prints a summary — active profile
 and model, configured profiles, `embedding_model`, MCP servers, the command allowlist, project
-path, database path, session count, remembered-fact count, and indexed-chunk count. Unlike
+path, database path, session count, remembered-fact count, and this project's indexed-chunk count.
+Unlike
 `doctor`, it never contacts the provider or an MCP server, so it works even when those would fail.
 
 ### Session commands
