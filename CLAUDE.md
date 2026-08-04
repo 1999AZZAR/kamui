@@ -154,8 +154,9 @@ effort or operational risk is disproportionate to their immediate value.
   blocks the parent turn; concurrent sub-agents are not supported, since the interactive approval
   prompt and stdin channel are single-consumer.
 - `/index` rebuilds the semantic-search index (`chat::run_index`): walks the project the same
-  `.gitignore`-aware way `grep`/`glob` do, splits each file into fixed 50-line chunks
-  (`tools::chunk_text`), skips any file whose content hash (`chat::content_hash`, a non-cryptographic
+  `.gitignore`-aware way `grep`/`glob` do, splits each file into roughly 50-line chunks
+  (`tools::chunk_text`, preferring blank lines and common declaration starts near the target),
+  skips any file whose content hash (`chat::content_hash`, a non-cryptographic
   change-detection hash) matches what was stored last run, embeds the rest via the active profile's
   `Provider::embed`, and removes chunks for files no longer present. Requires
   `Profile::embedding_model` to be set; otherwise it fails with a clear message and `search_code` is
@@ -215,7 +216,8 @@ The process working directory is the project root.
   offers tools. At startup, Kamui loads `KAMUI.md` if present, otherwise `AGENTS.md`, and appends
   that content to the system prompt.
 - `CLAUDE.md` is an agent development guide and is intentionally not loaded by Kamui at runtime.
-- A prompt can attach UTF-8 text with a relative reference such as `@src/main.rs`.
+- A prompt can attach UTF-8 text with a relative reference such as `@src/main.rs`; paths containing
+  spaces use quoted references such as `@"docs/My Notes.md"` or `@'docs/My Notes.md'`.
 - Referencing a directory (`@src`) attaches the text files inside it, walked with the `ignore` crate
   so `.gitignore`, global excludes, and hidden files are honoured (`require_git(false)`, so rules
   apply outside a repository too). Attachment stops at the shared context budget or 50 files;
@@ -265,7 +267,7 @@ Important modules:
   the confirmation-gated `run_command` and `patch_file` tools. `run_command`'s background-job
   registry (`JobRegistry`, `JobEntry`, `run_background_job`) also lives here, as does
   `ToolRegistry::read_only` (the restricted registry `spawn_agent`'s sub-loop runs against) and
-  `chunk_text`/`search_code_definition` (the fixed-size chunker and conditionally-offered
+  `chunk_text`/`search_code_definition` (the boundary-aware chunker and conditionally-offered
   `search_code` definition that `chat::run_index`/`chat::dispatch_search_code` use).
 - `src/provider/mod.rs`: provider-independent request, response, message, usage, and streaming types.
 - `src/provider/openai.rs`: OpenAI-compatible Chat Completions HTTP and SSE implementation.
@@ -442,8 +444,8 @@ The source of truth is `ROADMAP.md`. Current priority order is:
    shared credentials, OpenAI-compatible docs, per-model stats). An agentic system prompt
    (`src/prompt.rs`) now ships on every request.
 4. Phase 4 context management: image input, directory context, and context compaction are done.
-   Semantic search (`/index`/`search_code`) shipped as a deliberately simple v1 — fixed-size line
-   chunking, brute-force cosine similarity, no vector index — rather than the larger effort
+   Semantic search (`/index`/`search_code`) shipped as a deliberately simple v1 — lightweight
+   boundary-aware chunking, brute-force cosine similarity, no vector index — rather than the larger effort
    originally deferred; project indexing *at a larger scale* (richer chunking, a real vector index)
    remains open future work if the v1 approach stops scaling. Excel/PDF input are handled via MCP;
    Anthropic/Gemini native providers are not planned.
@@ -514,7 +516,6 @@ cross-platform path behavior.
 
 - The current provider uses the Chat Completions API, not a native Responses API or native tool-call
   loop.
-- Paths containing spaces cannot currently be represented by the whitespace-based `@file` parser.
 - Project instructions are loaded only from the launch directory, not recursively from ancestors or
   nested directories.
 - `@diff` excludes untracked files and `@diff`/`@staged` require Git on `PATH`.

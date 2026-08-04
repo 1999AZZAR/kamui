@@ -163,8 +163,9 @@ Semantic search shipped as a deliberately simple v1 rather than the larger effor
 deferred. `Provider` gained an `embed(model, texts) -> Vec<Vec<f32>>` method
 (`src/provider/openai.rs`, via the OpenAI-compatible `/embeddings` endpoint), and a profile can set
 `embedding_model` to enable it. `/index` (`chat::run_index`) walks the project the same
-`.gitignore`-aware way `grep`/`glob` do, splits each file into fixed, non-overlapping 50-line
-chunks (`tools::chunk_text` — no syntax awareness), and skips any file whose content hash
+`.gitignore`-aware way `grep`/`glob` do, splits each file into roughly 50-line chunks with
+lightweight boundary heuristics (`tools::chunk_text` prefers blank lines and common declaration
+starts near the target), and skips any file whose content hash
 (`chat::content_hash`) matches what `indexed_files` recorded last run, so a second `/index` after a
 small edit only re-embeds what changed. Chunks and their embedding vectors (little-endian `f32`
 bytes in a BLOB column) live in `code_chunks`. Both tables are keyed by a `project` column
@@ -193,11 +194,11 @@ re-hashing content, so it costs one directory walk and no network calls; that ma
 which is acceptable because `/index` still does the authoritative hash comparison. Interactive chat
 only — `-p` output is script input.
 
-One accepted v1 limitation remains, worth revisiting only if it becomes a real problem: chunk
-boundaries are fixed-size, not syntax- or semantically-aware. (The project-collision limitation was
-the other; `user_version = 8` fixed it. That migration drops any pre-existing index, since old rows
-record no project and cannot be attributed to one — the index is a regenerable cache, so `/index`
-rebuilds it.)
+One accepted limitation remains, worth revisiting only if it becomes a real problem: chunk
+boundaries are heuristic rather than parser-backed or vector-index optimized. (The project-collision
+limitation was the other; `user_version = 8` fixed it. That migration drops any pre-existing index,
+since old rows record no project and cannot be attributed to one — the index is a regenerable cache,
+so `/index` rebuilds it.)
 
 ## Phase 5: Providers and Models
 

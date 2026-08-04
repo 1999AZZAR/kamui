@@ -5,7 +5,7 @@ use crate::context::ProjectContext;
 use crate::markdown;
 use crate::mcp::ConnectionStatus;
 use crate::prompt;
-use crate::provider::{ChatRequest, Message, Provider, StreamEvent, Usage};
+use crate::provider::{ChatRequest, Message, Provider, StreamEvent, ToolCall, Usage};
 use crate::storage;
 use crate::storage::{Database, Session};
 use crate::tools;
@@ -459,11 +459,7 @@ where
                     println!("  \u{2192} plan");
                     println!("{rendered}");
                 } else {
-                    println!(
-                        "  \u{2192} {}({})",
-                        call.name,
-                        truncate(call.arguments.trim(), 120)
-                    );
+                    println!("  \u{2192} {}", render_tool_call(call));
                 }
                 let output = if call.name == tools::ASK_USER_TOOL {
                     tokio::select! {
@@ -770,11 +766,7 @@ where
                 println!("  \u{2192} plan");
                 println!("{rendered}");
             } else {
-                println!(
-                    "  \u{2192} {}({})",
-                    call.name,
-                    truncate(call.arguments.trim(), 120)
-                );
+                println!("  \u{2192} {}", render_tool_call(call));
             }
             let output = if call.name == tools::ASK_USER_TOOL {
                 println!("    skipped: ask_user is not available in non-interactive mode");
@@ -1978,6 +1970,68 @@ fn truncate(text: &str, max: usize) -> String {
     result
 }
 
+fn render_tool_call(call: &ToolCall) -> String {
+    let arguments = call.arguments.trim();
+    if arguments.is_empty() {
+        return format!("{}()", call.name);
+    }
+
+    let Ok(serde_json::Value::Object(object)) =
+        serde_json::from_str::<serde_json::Value>(arguments)
+    else {
+        return format!("{}({})", call.name, truncate(arguments, 120));
+    };
+
+    let mut keys: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !matches!(*key, "old_text" | "new_text" | "content"))
+        .collect();
+    keys.sort_unstable_by_key(|key| tool_argument_priority(key));
+
+    let parts = keys
+        .into_iter()
+        .take(4)
+        .filter_map(|key| {
+            object
+                .get(key)
+                .map(|value| format!("{key}={}", render_tool_argument(value)))
+        })
+        .collect::<Vec<_>>();
+
+    if parts.is_empty() {
+        format!("{}({})", call.name, truncate(arguments, 120))
+    } else {
+        format!("{}({})", call.name, parts.join(", "))
+    }
+}
+
+fn tool_argument_priority(key: &str) -> (usize, &str) {
+    let priority = match key {
+        "path" => 0,
+        "command" => 1,
+        "query" | "pattern" | "glob" => 2,
+        "background" | "case_insensitive" => 3,
+        "job_id" => 4,
+        "question" | "task" => 5,
+        "fact" | "matching" | "replacement" => 6,
+        _ => 10,
+    };
+    (priority, key)
+}
+
+fn render_tool_argument(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => {
+            format!("{:?}", truncate(&text.replace('\n', "\\n"), 60))
+        }
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::Null => "null".to_string(),
+        value => truncate(&value.to_string(), 60),
+    }
+}
+
 /// Build a single-line preview of `content` centered on the first match of `query`.
 fn make_snippet(content: &str, query: &str) -> String {
     const WINDOW: usize = 80;
@@ -2258,6 +2312,31 @@ mod tests {
     fn truncate_appends_ellipsis_only_when_needed() {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world", 5), "hello…");
+    }
+
+    #[test]
+    fn render_tool_call_shows_useful_arguments() {
+        let call = ToolCall {
+            id: "c1".to_string(),
+            name: "run_command".to_string(),
+            arguments: r#"{"command":"cargo test","background":true}"#.to_string(),
+        };
+
+        assert_eq!(
+            render_tool_call(&call),
+            r#"run_command(command="cargo test", background=true)"#
+        );
+    }
+
+    #[test]
+    fn render_tool_call_hides_patch_payloads() {
+        let call = ToolCall {
+            id: "c1".to_string(),
+            name: "patch_file".to_string(),
+            arguments: r#"{"path":"src/main.rs","old_text":"old","new_text":"new"}"#.to_string(),
+        };
+
+        assert_eq!(render_tool_call(&call), r#"patch_file(path="src/main.rs")"#);
     }
 
     #[test]

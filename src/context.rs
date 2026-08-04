@@ -168,16 +168,83 @@ impl ProjectContext {
 
 fn file_references(input: &str) -> Vec<String> {
     let mut seen = HashSet::new();
-    input
-        .split_whitespace()
-        .filter_map(|word| {
-            let reference = word.strip_prefix('@')?.trim_matches(|character: char| {
-                matches!(character, ',' | ';' | ':' | ')' | ']' | '}')
-            });
-            (!reference.is_empty() && seen.insert(reference.to_string()))
-                .then(|| reference.to_string())
-        })
-        .collect()
+    let mut references = Vec::new();
+    let mut index = 0;
+
+    while index < input.len() {
+        let Some(character) = input[index..].chars().next() else {
+            break;
+        };
+        if character != '@' || !is_reference_boundary(input, index) {
+            index += character.len_utf8();
+            continue;
+        }
+
+        let after_at = index + character.len_utf8();
+        let Some(next) = input[after_at..].chars().next() else {
+            break;
+        };
+
+        let (reference, next_index) = if matches!(next, '"' | '\'') {
+            quoted_reference(input, after_at, next)
+        } else {
+            unquoted_reference(input, after_at)
+        };
+
+        if !reference.is_empty() && seen.insert(reference.clone()) {
+            references.push(reference);
+        }
+        index = next_index;
+    }
+
+    references
+}
+
+fn is_reference_boundary(input: &str, index: usize) -> bool {
+    index == 0
+        || input[..index]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace)
+}
+
+fn quoted_reference(input: &str, quote_index: usize, quote: char) -> (String, usize) {
+    let start = quote_index + quote.len_utf8();
+    let mut cursor = start;
+    while cursor < input.len() {
+        let character = input[cursor..]
+            .chars()
+            .next()
+            .expect("cursor is on a character boundary");
+        if character == quote {
+            return (
+                input[start..cursor].to_string(),
+                cursor + character.len_utf8(),
+            );
+        }
+        cursor += character.len_utf8();
+    }
+
+    // Leave malformed quoted references to the normal filesystem error path.
+    unquoted_reference(input, quote_index)
+}
+
+fn unquoted_reference(input: &str, start: usize) -> (String, usize) {
+    let mut end = start;
+    while end < input.len() {
+        let character = input[end..]
+            .chars()
+            .next()
+            .expect("end is on a character boundary");
+        if character.is_whitespace() {
+            break;
+        }
+        end += character.len_utf8();
+    }
+
+    let reference = input[start..end]
+        .trim_matches(|character: char| matches!(character, ',' | ';' | ':' | ')' | ']' | '}'));
+    (reference.to_string(), end)
 }
 
 /// Resolve a project-relative reference to a real path inside the project root, rejecting absolute
@@ -483,6 +550,26 @@ mod tests {
     }
 
     #[test]
+    fn expands_quoted_file_references_with_spaces() {
+        let root = project();
+        fs::create_dir(root.join("docs")).unwrap();
+        fs::write(root.join("docs/My Notes.md"), "remember this").unwrap();
+        let context = ProjectContext::from_root(root.clone()).unwrap();
+
+        let prompt = context
+            .expand_file_references(r#"Explain @"docs/My Notes.md""#)
+            .unwrap();
+
+        assert!(
+            prompt
+                .text
+                .contains("<context source=\"docs/My Notes.md\">")
+        );
+        assert!(prompt.text.contains("remember this"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn expands_staged_git_diff() {
         let root = project();
         fs::write(root.join("file.txt"), "hello\n").unwrap();
@@ -679,6 +766,24 @@ mod tests {
     fn file_references_strip_punctuation_and_deduplicate() {
         let refs = file_references("see @a.rs, and @b.rs; also @a.rs and a bare @");
         assert_eq!(refs, vec!["a.rs".to_string(), "b.rs".to_string()]);
+    }
+
+    #[test]
+    fn file_references_support_quoted_paths_with_spaces() {
+        let refs = file_references(r#"see @"docs/My Notes.md" and @'src/other file.rs'."#);
+        assert_eq!(
+            refs,
+            vec![
+                "docs/My Notes.md".to_string(),
+                "src/other file.rs".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn file_references_ignore_mid_word_at_signs() {
+        let refs = file_references("email a@b.test then read @src/main.rs");
+        assert_eq!(refs, vec!["src/main.rs".to_string()]);
     }
 
     #[test]

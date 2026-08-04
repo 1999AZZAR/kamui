@@ -429,26 +429,106 @@ pub(crate) fn walk(scope: &Path) -> impl Iterator<Item = PathBuf> {
         .map(|entry| entry.into_path())
 }
 
-/// Line-window size `/index` splits a file into. Fixed and non-overlapping — simplest possible v1
-/// chunking (no per-language/syntax awareness); see CLAUDE.md for the tradeoff.
+/// Target line-window size `/index` aims for when it splits a file. Natural boundaries may move a
+/// chunk edge a little earlier or later, but files with no useful boundary keep this exact window.
 pub(crate) const CHUNK_LINES: usize = 50;
+const CHUNK_MIN_LINES: usize = 20;
+const CHUNK_MAX_LINES: usize = 80;
 
-/// Split file content into fixed-size, 1-indexed line-number windows for `/index` to embed. Empty
-/// content yields no chunks. `pub(crate)` so `chat::run_index` can use it.
+/// Split file content into 1-indexed line-number windows for `/index` to embed. It prefers blank
+/// lines and common declaration starts near the target size so search results tend to return whole
+/// symbols instead of cutting through them. Empty content yields no chunks. `pub(crate)` so
+/// `chat::run_index` can use it.
 pub(crate) fn chunk_text(content: &str) -> Vec<(usize, usize, String)> {
     let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() {
         return Vec::new();
     }
-    lines
-        .chunks(CHUNK_LINES)
-        .enumerate()
-        .map(|(index, window)| {
-            let start = index * CHUNK_LINES + 1;
-            let end = start + window.len() - 1;
-            (start, end, window.join("\n"))
-        })
-        .collect()
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < lines.len() {
+        let remaining = lines.len() - start;
+        let length = if remaining <= CHUNK_LINES {
+            remaining
+        } else {
+            preferred_chunk_length(&lines, start).unwrap_or(CHUNK_LINES)
+        };
+        let end = start + length;
+        chunks.push((start + 1, end, lines[start..end].join("\n")));
+        start = end;
+    }
+    chunks
+}
+
+fn preferred_chunk_length(lines: &[&str], start: usize) -> Option<usize> {
+    let min = start + CHUNK_MIN_LINES;
+    let target = (start + CHUNK_LINES).min(lines.len());
+    let max = (start + CHUNK_MAX_LINES).min(lines.len());
+
+    find_blank_boundary(lines, min, target, max)
+        .or_else(|| find_declaration_boundary(lines, min, target, max))
+        .map(|end| end - start)
+}
+
+fn find_blank_boundary(lines: &[&str], min: usize, target: usize, max: usize) -> Option<usize> {
+    find_boundary_end(min, target, max, |end| lines[end - 1].trim().is_empty())
+}
+
+fn find_declaration_boundary(
+    lines: &[&str],
+    min: usize,
+    target: usize,
+    max: usize,
+) -> Option<usize> {
+    find_boundary_end(min, target, max, |end| {
+        looks_like_declaration_start(lines[end].trim_start())
+    })
+}
+
+fn find_boundary_end(
+    min: usize,
+    target: usize,
+    max: usize,
+    matches: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    (target..max)
+        .find(|&end| matches(end))
+        .or_else(|| (min..target).rev().find(|&end| matches(end)))
+}
+
+fn looks_like_declaration_start(line: &str) -> bool {
+    const PREFIXES: [&str; 28] = [
+        "async fn ",
+        "class ",
+        "const ",
+        "def ",
+        "enum ",
+        "export class ",
+        "export const ",
+        "export default function ",
+        "export enum ",
+        "export function ",
+        "export interface ",
+        "export type ",
+        "fn ",
+        "function ",
+        "impl ",
+        "interface ",
+        "mod ",
+        "pub async fn ",
+        "pub const ",
+        "pub enum ",
+        "pub fn ",
+        "pub mod ",
+        "pub struct ",
+        "pub trait ",
+        "struct ",
+        "trait ",
+        "type ",
+        "use ",
+    ];
+    PREFIXES.iter().any(|prefix| line.starts_with(prefix))
 }
 
 /// Name of the pseudo-tool that answers a natural-language query against `/index`'s embedding
@@ -1616,6 +1696,39 @@ mod tests {
         assert_eq!(chunks[1].1, 100);
         // The final, partial chunk ends exactly at the last line, not padded to CHUNK_LINES.
         assert_eq!(chunks[2], (101, 120, chunks[2].2.clone()));
+    }
+
+    #[test]
+    fn chunk_text_prefers_blank_line_boundaries() {
+        let mut lines = (1..=35)
+            .map(|line| format!("first block line {line}"))
+            .collect::<Vec<_>>();
+        lines.push(String::new());
+        lines.extend((1..=60).map(|line| format!("second block line {line}")));
+
+        let chunks = chunk_text(&lines.join("\n"));
+
+        assert_eq!(chunks[0].0, 1);
+        assert_eq!(chunks[0].1, 36);
+        assert!(chunks[0].2.ends_with('\n'));
+        assert_eq!(chunks[1].0, 37);
+    }
+
+    #[test]
+    fn chunk_text_starts_declarations_in_the_next_chunk() {
+        let mut lines = (1..=40)
+            .map(|line| format!("first function line {line}"))
+            .collect::<Vec<_>>();
+        lines.push("fn second() {}".to_string());
+        lines.extend((1..=60).map(|line| format!("second function line {line}")));
+
+        let chunks = chunk_text(&lines.join("\n"));
+
+        assert_eq!(chunks[0].0, 1);
+        assert_eq!(chunks[0].1, 40);
+        assert!(!chunks[0].2.contains("fn second"));
+        assert_eq!(chunks[1].0, 41);
+        assert!(chunks[1].2.starts_with("fn second"));
     }
 
     #[test]

@@ -133,7 +133,8 @@ Indexed 42 file(s) (118 new chunks), skipped 0 unchanged, removed 0 deleted. 118
 ```
 
 How it works: `/index` walks the project the same `.gitignore`-aware way `grep`/`glob` do, splits
-each file into fixed 50-line chunks, and embeds any chunk from a file whose content changed since
+each file into roughly 50-line chunks, preferring blank lines and common declaration starts near the
+target so chunks stay more coherent, and embeds any chunk from a file whose content changed since
 the last run (tracked by a content hash, so re-running `/index` after a small edit only re-embeds
 the files that actually changed). `search_code` embeds your query and ranks every stored chunk by
 cosine similarity, returned as `path:start-end` with the chunk text — read the file for full
@@ -171,9 +172,9 @@ a verdict (a fresh checkout can bump mtimes without changing content). `/index` 
 content hashes before re-embedding anything, so acting on a false alarm is cheap. Nothing is printed
 when the index is up to date, when the project has never been indexed, or in `-p` mode.
 
-This is a v1 baseline: chunking is fixed-size line windows with no syntax awareness, and matching
-is a brute-force scan (no vector index) — both simple choices that hold up fine at a single
-project's scale. Project indexing at a larger scale, and richer chunking, are open future work.
+This is still a deliberately simple local index: chunking uses lightweight text heuristics rather
+than a parser, and matching is a brute-force scan (no vector index) — both simple choices that hold
+up fine at a single project's scale. Project indexing at a larger scale remains open future work.
 
 ### Skipping approval
 
@@ -396,6 +397,7 @@ Reference a UTF-8 text file relative to the project root with `@path`:
 
 ```text
 > Explain the error handling in @src/main.rs
+> Summarize @"docs/My Notes.md"
 ```
 
 Reference a directory to attach everything inside it:
@@ -410,7 +412,8 @@ as omitted instead of failing the prompt.
 
 Referenced files are attached only to that request and are not copied into session history. Each
 file is limited to 64 KiB and all attached files together are limited to 128 KiB. Absolute paths,
-binary files, and paths or symlinks outside the project are rejected.
+binary files, and paths or symlinks outside the project are rejected. Quote references that contain
+spaces with `@"path with spaces.md"` or `@'path with spaces.md'`.
 
 Use `@diff` for unstaged tracked changes or `@staged` for changes in the Git index:
 
