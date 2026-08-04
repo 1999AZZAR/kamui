@@ -10,10 +10,9 @@ the user interrupt with `Ctrl+C`. Long sessions compact themselves into a rollin
 configured through `kamui.toml`, `/model` switches between named provider profiles at runtime, and
 MCP servers can contribute their own tools.
 
-What remains is deliberately deferred: project indexing and semantic search (large, separate
-efforts), the Phase 6 terminal experience (markdown rendering, syntax highlighting, richer UI), and
-the extensibility items below. Several roadmap entries are marked "not planned" where a simpler
-answer already exists.
+The repository-aware runtime, scalable local search, benchmark runner, line-oriented terminal UI,
+concurrent read-only sub-agents, and persistent scheduled command queue have shipped. Remaining
+items are deliberately limited to the explicitly deferred work below.
 
 ## Phase 1: Chat Foundation
 
@@ -159,8 +158,8 @@ triggers it manually. The full history stays in storage; only the per-request me
 compressed, and the summary is in-memory (regenerated after a resume). Excel/PDF input are handled
 through MCP.
 
-Semantic search shipped as a deliberately simple v1 rather than the larger effort originally
-deferred. `Provider` gained an `embed(model, texts) -> Vec<Vec<f32>>` method
+Semantic search started as a deliberately simple v1 and now includes a scalable local retrieval
+layer. `Provider` exposes an `embed(model, texts) -> Vec<Vec<f32>>` method
 (`src/provider/openai.rs`, via the OpenAI-compatible `/embeddings` endpoint), and a profile can set
 `embedding_model` to enable it. `/index` (`chat::run_index`) walks the project the same
 `.gitignore`-aware way `grep`/`glob` do, splits each file into roughly 50-line chunks with
@@ -171,10 +170,10 @@ small edit only re-embeds what changed. Chunks and their embedding vectors (litt
 bytes in a BLOB column) live in `code_chunks`. Both tables are keyed by a `project` column
 (`user_version = 8`, the canonical project root from `ProjectContext::key`), so several projects can
 share the one global database without their identically-named relative paths colliding.
-`search_code` embeds the query and ranks that project's stored chunks by cosine similarity
-(`chat::cosine_similarity`) — a brute-force scan, no vector index — returning the top 8 as
-`path:start-end` with the chunk text. Without `embedding_model` configured, `search_code` is not
-offered to the model at all.
+Schema v10 adds an FTS5 mirror and an LSH bucket per embedding. `search_code` embeds the query,
+unions lexical/path and nearby-vector candidates, and exact-cosine reranks that bounded shortlist,
+returning the top 8 as `path:start-end` with the chunk text. Projects with at most 2,000 chunks keep
+exhaustive ranking. Without `embedding_model` configured, `search_code` is not offered to the model.
 
 Maintaining the index is automatic; building it is not. After a persisted turn,
 `chat::refresh_index_for_paths` re-embeds every `patch_file` target already present in the index
@@ -194,11 +193,11 @@ re-hashing content, so it costs one directory walk and no network calls; that ma
 which is acceptable because `/index` still does the authoritative hash comparison. Interactive chat
 only — `-p` output is script input.
 
-One accepted limitation remains, worth revisiting only if it becomes a real problem: chunk
-boundaries are heuristic rather than parser-backed or vector-index optimized. (The project-collision
-limitation was the other; `user_version = 8` fixed it. That migration drops any pre-existing index,
-since old rows record no project and cannot be attributed to one — the index is a regenerable cache,
-so `/index` rebuilds it.)
+Search now scales beyond the v1 full scan. Schema v10 adds SQLite FTS5 rows and LSH buckets;
+`search_code` unions lexical and nearby embedding candidates before exact cosine reranking, while
+small indexes still use exhaustive ranking. The index records the embedding model, so changing it
+forces a rebuild even when source hashes are unchanged. File replacement is transactional and
+embedding calls are batched. Chunk boundaries remain heuristic rather than parser-backed.
 
 ## Phase 5: Providers and Models
 
@@ -242,12 +241,11 @@ animates until the first token, and `Ctrl+C` mid-turn returns to the prompt inst
 - [x] Markdown rendering (`src/markdown.rs`)
 - [ ] Syntax highlighting (not planned for now — see below)
 - [x] Thinking indicator (braille spinner until the first token)
-- [ ] Rich terminal UI
+- [x] Rich terminal UI (line-oriented event feed)
 - [ ] Session pinning (not planned — see below)
 - [x] Prompt templates and system prompt profiles (one feature: user-defined `/commands`)
 - [x] Daily and monthly usage reports (`/usage`)
-- [ ] Optional cost tracking
-- [ ] Benchmark mode
+- [x] Benchmark mode
 
 Markdown rendering (`src/markdown.rs`) styles streamed output a line at a time: deltas accumulate
 in a buffer and a line is rendered only once its newline arrives, which keeps streaming visibly
@@ -281,6 +279,15 @@ while `/usage` aggregates every session by day and by month over the `usage_reco
 being written (no migration needed). Both count requests as `kind = 'chat'` only while summing
 tokens across all kinds, so title generation shows up in spend but not in request counts.
 
+The rich terminal increment deliberately stays line-oriented rather than taking over the alternate
+screen: tool calls report lifecycle state, duration, and output size; the spinner only runs for a
+real interactive terminal; piped and `-p` output stays plain and deterministic. `NO_COLOR` disables
+colour without removing the structured event feed.
+
+`kamui benchmark <suite.json>` runs repeatable prompt cases against a chosen profile, supports
+multiple runs, checks optional case-insensitive expected substrings, reports latency and token
+totals, and exits non-zero on failed expectations.
+
 Session pinning was considered and dropped. Kamui sessions are task-scoped — opened for a job,
 finished, rarely revisited — so the case for pinning is weak, and `/search` already covers the
 real need (finding an old session by what was discussed, which is what you actually remember).
@@ -290,9 +297,8 @@ Revisit only if a concrete "I return to these exact sessions daily" case appears
 
 - [x] MCP client
 - [ ] Plugin API and manager (not planned — see "Plugin decision" below)
-- [ ] Background jobs and job queue (a narrower form — `run_command(background: true)` — shipped in
-  Phase 3; this item is the broader, general-purpose async job queue, still open)
-- [ ] Scheduled tasks
+- [x] Background jobs and persistent command queue
+- [x] Scheduled tasks
 - [ ] Worker nodes and remote execution
 - [ ] Kamui Dispatch: remote prompt dispatch from a phone (planned architecture, not started —
   see below; distinct from "Worker nodes," which is about distributing compute, not remote control)
@@ -305,15 +311,14 @@ as a Kamui `Tool` with a `<server>__<tool>` name, so MCP tools flow through the 
 permission policy, and agent loop as the built-ins. Every MCP call asks for approval unless the
 server is marked `trusted`. Project files may not declare servers, because launching one is arbitrary
 code execution. A server that fails to start is reported and skipped rather than blocking startup.
-Only stdio transport and the tools capability are supported; HTTP transport, resources, and prompts
-are not.
+Only stdio transport and the tools capability are supported by design.
 
 **Plugin decision**: a dedicated plugin runtime was considered and rejected. Kamui is already an
 MCP *client*, so "write a plugin" already means "write (or reuse) an MCP server" — the gap is
 packaging/discovery (no `kamui plugin install <name>`), not the extension mechanism. A realistic
 native plugin API would mean either unsafe/version-fragile dylib loading, or a WASM sandbox that
-converges back on "an MCP server, in our own protocol." Closing MCP's actual gaps (HTTP transport,
-resources, prompts) is a better use of effort than a bespoke plugin system.
+converges back on "an MCP server, in our own protocol." A separate plugin runtime remains out of
+scope.
 
 `spawn_agent` (`src/tools.rs`/`chat::run_spawned_agent`) is Kamui's first multi-agent primitive: it
 delegates a self-contained task to an isolated sub-agent — fresh system prompt, no shared history
@@ -321,9 +326,15 @@ with the parent — and returns only the sub-agent's final answer, so its own to
 enters the parent's context. Deliberately narrow for v1: the sub-agent runs against
 `ToolRegistry::read_only` (`read_file`/`list_directory`/`grep`/`glob` only, no `run_command`,
 `patch_file`, memory tools, or recursive `spawn_agent`), so none of its calls ever need
-confirmation and there is no approval flow to reproduce. It also runs sequentially, blocking the
-parent turn — concurrent sub-agents are future work, gated on rethinking how approval prompts and
-the single-consumer stdin channel would interleave across multiple agents running at once.
+confirmation and there is no approval flow to reproduce. Several independent `spawn_agent` calls
+in one model response run concurrently in batches of at most four; results are fed back in original
+tool-call order. The read-only boundary is what makes concurrency safe without parallel approvals.
+
+Persistent scheduled commands live in `scheduled_jobs` (schema v9). `kamui jobs add` creates
+one-shot or interval jobs, `list`/`cancel`/`pause`/`resume` manage them, and `kamui jobs worker`
+claims due work atomically. Queue state, capped output, and exit status survive restarts. The worker
+is intentionally foreground; OS service installation is not hidden inside Kamui, and missed
+intervals coalesce into one future run rather than backfilling a burst.
 
 **Kamui Dispatch (planned architecture, not started)**: lets a phone trigger Kamui running on a
 host machine — "prompt your coding agent from your pocket." Two shapes were weighed: a VPN-mesh

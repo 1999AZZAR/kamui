@@ -1,14 +1,17 @@
+mod benchmark;
 mod chat;
 mod commands;
 mod compaction;
 mod config;
 mod context;
+mod jobs;
 mod markdown;
 mod mcp;
 mod onboarding;
 mod prompt;
 mod provider;
 mod storage;
+mod terminal;
 mod tools;
 
 use anyhow::{Context, Result};
@@ -34,6 +37,9 @@ async fn main() -> Result<()> {
         }
         Command::Status => {
             return run_status().await;
+        }
+        Command::Jobs(command) => {
+            return jobs::run(command).await;
         }
         command => command,
     };
@@ -104,7 +110,14 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        Command::Help | Command::Version | Command::Doctor | Command::Status => {
+        Command::Benchmark {
+            suite,
+            profile,
+            runs,
+        } => {
+            benchmark::run(&config, &suite, profile.as_deref(), runs, build_provider).await?;
+        }
+        Command::Help | Command::Version | Command::Doctor | Command::Status | Command::Jobs(_) => {
             unreachable!("handled above")
         }
     }
@@ -123,6 +136,12 @@ enum Command {
     },
     Doctor,
     Status,
+    Benchmark {
+        suite: std::path::PathBuf,
+        profile: Option<String>,
+        runs: usize,
+    },
+    Jobs(jobs::Command),
     Help,
     Version,
 }
@@ -159,6 +178,8 @@ fn parse_command_from(arguments: impl Iterator<Item = String>) -> Result<Command
         }
         Some("doctor") => Ok(Command::Doctor),
         Some("status") => Ok(Command::Status),
+        Some("benchmark") => parse_benchmark_command(&tokens[1..]),
+        Some("jobs") => Ok(Command::Jobs(jobs::parse(&tokens[1..])?)),
         Some("-h" | "--help") => Ok(Command::Help),
         Some("-V" | "--version") => Ok(Command::Version),
         Some(_) => {
@@ -181,6 +202,38 @@ fn parse_command_from(arguments: impl Iterator<Item = String>) -> Result<Command
             })
         }
     }
+}
+
+fn parse_benchmark_command(tokens: &[String]) -> Result<Command> {
+    const USAGE: &str = "usage: kamui benchmark <suite.json> [--profile <name>] [--runs <count>]";
+    let suite = tokens.first().context(USAGE)?;
+    if suite.starts_with('-') {
+        anyhow::bail!(USAGE);
+    }
+    let mut profile = None;
+    let mut runs = 1usize;
+    let mut rest = tokens[1..].iter();
+    while let Some(token) = rest.next() {
+        match token.as_str() {
+            "--profile" => profile = Some(rest.next().context(USAGE)?.clone()),
+            "--runs" => {
+                runs = rest
+                    .next()
+                    .context(USAGE)?
+                    .parse()
+                    .context("--runs must be a positive integer")?;
+                if runs == 0 {
+                    anyhow::bail!("--runs must be greater than zero");
+                }
+            }
+            _ => anyhow::bail!(USAGE),
+        }
+    }
+    Ok(Command::Benchmark {
+        suite: suite.into(),
+        profile,
+        runs,
+    })
 }
 
 /// `kamui status`: read configuration and the local database directly and print a summary,
@@ -308,6 +361,32 @@ async fn run_doctor() -> Result<()> {
             }
         }
 
+        if let Some(embedding_model) = &profile.embedding_model {
+            match provider
+                .embed(embedding_model, vec!["health check".to_string()])
+                .await
+            {
+                Ok(vectors) if vectors.len() == 1 && !vectors[0].is_empty() => check_ok(&format!(
+                    "Embedding model '{embedding_model}' responds ({} dimensions)",
+                    vectors[0].len()
+                )),
+                Ok(_) => {
+                    check_fail(&format!(
+                        "Embedding model '{embedding_model}' returned an empty or malformed vector"
+                    ));
+                    failures += 1;
+                }
+                Err(error) => {
+                    check_fail(&format!(
+                        "Embedding model '{embedding_model}' failed: {error:#}"
+                    ));
+                    failures += 1;
+                }
+            }
+        } else {
+            check_ok("No embedding model configured (semantic search is disabled)");
+        }
+
         if config.mcp_servers.is_empty() {
             check_ok("No MCP servers configured (nothing to check)");
         } else {
@@ -328,10 +407,52 @@ async fn run_doctor() -> Result<()> {
     }
 
     match Database::open() {
-        Ok(_) => check_ok("Database opens successfully"),
+        Ok(database) => match database.integrity_check() {
+            Ok(result) if result == "ok" => check_ok(&format!(
+                "Database opens and passes integrity check (schema v{})",
+                database.schema_version().unwrap_or_default()
+            )),
+            Ok(result) => {
+                check_fail(&format!("Database integrity check reported: {result}"));
+                failures += 1;
+            }
+            Err(error) => {
+                check_fail(&format!("Database integrity check failed: {error:#}"));
+                failures += 1;
+            }
+        },
         Err(error) => {
             check_fail(&format!("Database could not be opened: {error:#}"));
             failures += 1;
+        }
+    }
+
+    match ProjectContext::discover() {
+        Ok(project) => {
+            check_ok(&format!(
+                "Project root resolves to {}",
+                chat::display_path(project.root())
+            ));
+            if let Some(name) = project.instruction_name() {
+                check_ok(&format!("Project instructions loaded from {name}"));
+            }
+        }
+        Err(error) => {
+            check_fail(&format!("Project could not be discovered: {error:#}"));
+            failures += 1;
+        }
+    }
+
+    match std::process::Command::new("rtk").arg("--version").output() {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout);
+            check_ok(&format!(
+                "RTK available ({})",
+                version.lines().next().unwrap_or("version unknown").trim()
+            ));
+        }
+        Ok(_) | Err(_) => {
+            check_ok("RTK not installed (optional; direct commands remain available)")
         }
     }
 
@@ -361,6 +482,8 @@ fn print_help() {
     println!("      --auto-approve  Approve tool calls without prompting (with -p, or standalone)");
     println!("  doctor              Check configuration, provider, and MCP servers");
     println!("  status              Print a config/database summary (no network calls)");
+    println!("  benchmark <FILE>    Run a repeatable JSON benchmark suite");
+    println!("  jobs <COMMAND>      Manage persistent scheduled command jobs");
     println!("  -h, --help          Print help");
     println!("  -V, --version       Print version");
 }
@@ -505,5 +628,28 @@ mod tests {
             parse_command_from(args(&["status"])).unwrap(),
             Command::Status
         ));
+    }
+
+    #[test]
+    fn benchmark_arguments_are_parsed() {
+        let command = parse_command_from(args(&[
+            "benchmark",
+            "suite.json",
+            "--profile",
+            "fast",
+            "--runs",
+            "3",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            command,
+            Command::Benchmark { suite, profile: Some(profile), runs: 3 }
+                if suite == std::path::PathBuf::from("suite.json") && profile == "fast"
+        ));
+    }
+
+    #[test]
+    fn benchmark_rejects_zero_runs() {
+        assert!(parse_command_from(args(&["benchmark", "suite.json", "--runs", "0"])).is_err());
     }
 }

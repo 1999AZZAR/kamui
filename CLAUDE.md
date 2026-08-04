@@ -36,9 +36,9 @@ effort or operational risk is disproportionate to their immediate value.
   with kind `title`, while the request count shown to users counts only primary chat requests.
 - Each chat usage row records the model that produced it (`user_version = 5`). `/stats` shows the
   session totals and, when a session used more than one model, a per-model token breakdown.
-- Streaming deltas are printed immediately. Usage and finish reason are shown after completion. A
-  braille spinner animates from when each request is sent until the first token arrives, then erases
-  itself so the response starts on a clean line.
+- Streaming deltas are printed immediately. Usage and finish reason are shown after completion. On
+  a real interactive TTY, a braille spinner runs until the first token and tool outcomes report
+  status, duration, and output size. Pipes and `-p` remain plain and free of cursor-control output.
 - `Ctrl+C` while a turn is in flight (waiting for the model, streaming, at an approval prompt, or
   running a command) interrupts that turn and returns to the prompt; the partial turn is discarded
   and not saved, and an interrupted command is killed via `kill_on_drop`. `Ctrl+C` at the idle
@@ -150,9 +150,10 @@ effort or operational risk is disproportionate to their immediate value.
   and `ProjectContext` directly. The sub-agent gets a fresh system prompt, no shared history with
   the parent, and runs against `ToolRegistry::read_only` (`read_file`/`list_directory`/`grep`/
   `glob` only — no `run_command`, `patch_file`, memory tools, or recursive `spawn_agent`), so none
-  of its tool calls ever need confirmation and it cannot mutate anything. It runs sequentially and
-  blocks the parent turn; concurrent sub-agents are not supported, since the interactive approval
-  prompt and stdin channel are single-consumer.
+  of its tool calls ever need confirmation and it cannot mutate anything. Independent calls emitted
+  in one response run concurrently through `chat::dispatch_spawn_agents` in batches capped at four;
+  outputs return in original tool-call order. The parent waits for the batch, and no parallel
+  approval flow is needed because every sub-agent tool is read-only.
 - `/index` rebuilds the semantic-search index (`chat::run_index`): walks the project the same
   `.gitignore`-aware way `grep`/`glob` do, splits each file into roughly 50-line chunks
   (`tools::chunk_text`, preferring blank lines and common declaration starts near the target),
@@ -161,9 +162,9 @@ effort or operational risk is disproportionate to their immediate value.
   `Provider::embed`, and removes chunks for files no longer present. Requires
   `Profile::embedding_model` to be set; otherwise it fails with a clear message and `search_code` is
   never offered to the model. `search_code` (also intercepted like `ask_user`, since it needs
-  `Provider`/`Database`) embeds the query and ranks that project's stored chunks by cosine
-  similarity (`chat::cosine_similarity`), a brute-force scan with no vector index — see "Storage
-  Decisions" and README for the v1 scope this accepts. The index is scoped per project by
+  `Provider`/`Database`) embeds the query, probes SQLite FTS5 and nearby LSH embedding buckets, then
+  exact-cosine reranks the bounded candidate union. Projects up to 2,000 chunks use exhaustive
+  ranking for maximum recall. The index is scoped per project by
   `ProjectContext::key` (the canonical root path), so several projects share the one global
   database without colliding.
 - Files already in the index are kept current automatically: after a turn is persisted,
@@ -197,9 +198,15 @@ effort or operational risk is disproportionate to their immediate value.
   guidance on zero or multiple matches rather than guessing. Total stored memory is capped at 4
   KiB; `/memory` lists what is remembered and `/forget <text>` (or `/forget all`) removes it
   directly, without going through the model.
-- `kamui doctor` checks configuration, provider connectivity (a real test request), and MCP
-  server connections one at a time with pass/fail output, exiting non-zero if anything failed —
-  usable as a pre-flight check without starting a full chat session.
+- `kamui doctor` checks configuration, chat and embedding endpoints, MCP server connections, project
+  discovery/instructions, SQLite integrity/schema, and optional RTK availability one at a time. It
+  exits non-zero if any required check fails, so it is usable as a pre-flight script.
+- `kamui benchmark <suite.json> [--profile <name>] [--runs <n>]` runs repeatable prompt cases,
+  validates optional case-insensitive expected substrings, reports latency/token totals, and exits
+  non-zero when a case fails.
+- `kamui jobs` manages a SQLite-backed scheduled command queue (`src/jobs.rs`, schema v9). One-shot
+  and interval jobs persist across restarts; a foreground worker atomically claims due work, stores
+  capped output/exit status, coalesces missed intervals, and can run once under an OS scheduler.
 - `kamui status` (`main::run_status`) prints a config/database summary with no network calls at
   all — profile, model, base URL, all configured profiles, `embedding_model`, MCP server names,
   the `[permissions]` allowlist, project and database paths, session count, memory count, and the
@@ -252,8 +259,13 @@ Important modules:
   owns, reused by `commands` for the global command folder beside `kamui.toml`.
 - `src/commands.rs`: user-defined slash commands loaded from markdown files, global and
   project-local, with built-in names reserved.
+- `src/benchmark.rs`: repeatable JSON benchmark suites, expected-text validation, and aggregate
+  latency/token reporting.
+- `src/jobs.rs`: persistent one-shot/interval command queue CLI and foreground worker.
 - `src/markdown.rs`: line-buffered markdown-to-ANSI rendering for streamed output, disabled when
   stdout is not a terminal.
+- `src/terminal.rs`: shared terminal capability detection and tool lifecycle formatting; protects
+  piped/non-interactive output from ANSI and spinner control sequences.
 - `src/prompt.rs`: the agentic system prompt, combined with project instructions per request.
 - `src/compaction.rs`: rolling-summary context compaction (threshold, message selection, summary
   request); the chat loop drives it automatically and via `/compact`.
@@ -271,8 +283,8 @@ Important modules:
   `search_code` definition that `chat::run_index`/`chat::dispatch_search_code` use).
 - `src/provider/mod.rs`: provider-independent request, response, message, usage, and streaming types.
 - `src/provider/openai.rs`: OpenAI-compatible Chat Completions HTTP and SSE implementation.
-- `src/storage.rs`: SQLite schema, migration, sessions, messages, usage, persistence tests, and the
-  `/index` semantic-search store (`code_chunks`/`indexed_files`, `CodeChunk`).
+- `src/storage.rs`: SQLite schema/migrations, sessions, messages, usage, scheduled jobs, and the
+  hybrid `/index` store (`code_chunks`, FTS5, LSH buckets, and `indexed_files`).
 - `.github/workflows/release.yml`: tag-triggered multi-platform release builds.
 - `install.ps1` and `install.sh`: release-binary installers with SHA-256 verification.
 
@@ -329,6 +341,12 @@ The terminal runner, mutation tools, per-turn usage accounting, and a durable au
   record no project and cannot be attributed to one. That is safe here specifically because the
   index is a regenerable cache, not user data — do not use it as precedent for dropping rows from
   `sessions`, `messages`, `usage_records`, or `memory`.
+- `user_version = 9` adds `scheduled_jobs`; queue rows are durable user state and must never be
+  dropped during migration. Atomic `UPDATE ... RETURNING` claims prevent duplicate execution by two
+  workers. Running jobs left by a crashed worker become `interrupted`, never silently retried.
+- `user_version = 10` adds `indexed_files.embedding_model`, `code_chunks.lsh_bucket`, and the FTS5
+  mirror. `replace_file_index` swaps a fully prepared file index transactionally. Search uses full
+  cosine scoring below 2,000 chunks and bounded FTS/LSH candidate scoring above it.
 
 ## Configuration
 
@@ -421,8 +439,8 @@ Kamui responsibilities that RTK does not replace:
 - Audit trail and recovery behavior.
 - Direct-command fallback.
 
-Do not require RTK for normal chat or repository context. Detect it at runtime. A later `kamui doctor`
-command may report its availability and version, and installers may offer it as an optional install.
+Do not require RTK for normal chat or repository context. Detect it at runtime; `kamui doctor`
+reports its availability and direct command execution remains the fallback.
 
 ## Priorities
 
@@ -436,27 +454,25 @@ The source of truth is `ROADMAP.md`. Current priority order is:
    `[permissions]` allowlist, `--auto-approve`, and `background: true` jobs with
    `command_status`/`stop_command`/`/jobs`), the confirmation-gated `patch_file` editor with a
    turn-scoped snapshot/auto-revert safety net and `/undo`, `update_plan` for a live checklist,
-   `spawn_agent` for a narrow (sequential, read-only) sub-agent, whole-turn persistence including
-   tool messages, per-turn usage accounting, and interrupt-and-continue cancellation. Multi-file
+   `spawn_agent` for concurrent batches of up to four read-only sub-agents, whole-turn persistence
+   including tool messages, per-turn usage accounting, and interrupt-and-continue cancellation. Multi-file
    editing is repeated `patch_file` calls within a turn; Git works through `run_command` plus
    `@diff`/`@staged`; the audit trail is the persisted tool messages.
 3. Phase 5 is complete for its planned scope (config, runtime `/model` switching with profiles and
    shared credentials, OpenAI-compatible docs, per-model stats). An agentic system prompt
    (`src/prompt.rs`) now ships on every request.
 4. Phase 4 context management: image input, directory context, and context compaction are done.
-   Semantic search (`/index`/`search_code`) shipped as a deliberately simple v1 — lightweight
-   boundary-aware chunking, brute-force cosine similarity, no vector index — rather than the larger effort
-   originally deferred; project indexing *at a larger scale* (richer chunking, a real vector index)
-   remains open future work if the v1 approach stops scaling. Excel/PDF input are handled via MCP;
-   Anthropic/Gemini native providers are not planned.
+   Semantic search (`/index`/`search_code`) now uses boundary-aware chunking, batched transactional
+   indexing, embedding-model tracking, and hybrid FTS5/LSH candidate retrieval with exact cosine
+   reranking. Excel/PDF input are handled via MCP; Anthropic/Gemini native providers are not planned.
+5. Phase 6 has a line-oriented rich terminal feed and repeatable JSON benchmark mode. Persistent
+   one-shot/interval command scheduling ships through `kamui jobs` and its foreground worker.
 
 Avoid starting these early because their true scope is large:
 
-- Project indexing at scale (a real vector index, syntax-aware chunking) beyond the v1 semantic
-  search already shipped.
 - Further context compression beyond the rolling-summary compaction already shipped.
-- Plugin systems, remote workers, or a general-purpose background job queue (`run_command`'s own
-  background jobs and `spawn_agent`'s narrow sequential sub-agent are already done — see above).
+- Plugin systems or remote workers. Persistent local scheduling and concurrent read-only sub-agents
+  are already done; remote execution remains a separate trust and transport problem.
 - GUI, mobile, and voice clients. This includes Kamui Dispatch (a phone-to-host remote-control
   system, see ROADMAP.md's "Later" section for the planned architecture) — it is a separate
   project (a Flutter app, a small relay backend, and a host-side dispatch agent binary), not a

@@ -1,0 +1,191 @@
+use crate::config::{Config, Profile};
+use crate::provider::{ChatRequest, Message, Provider};
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::fs;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Suite {
+    cases: Vec<Case>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Case {
+    name: String,
+    prompt: String,
+    #[serde(default)]
+    expect_contains: Vec<String>,
+}
+
+#[derive(Default)]
+struct Totals {
+    passed: usize,
+    runs: usize,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    latency: Duration,
+}
+
+pub async fn run<F>(
+    config: &Config,
+    suite_path: &Path,
+    profile_name: Option<&str>,
+    runs: usize,
+    build_provider: F,
+) -> Result<()>
+where
+    F: Fn(&Profile) -> Box<dyn Provider>,
+{
+    let profile = match profile_name {
+        Some(name) => config
+            .find(name)
+            .with_context(|| format!("unknown profile '{name}'"))?,
+        None => config.default(),
+    };
+    let suite = load_suite(suite_path)?;
+    let provider = build_provider(profile);
+    let mut totals = Totals::default();
+
+    println!(
+        "Benchmark: {} case(s) x {runs} run(s) on {} ({})",
+        suite.cases.len(),
+        profile.model,
+        profile.name
+    );
+    println!();
+
+    for case in &suite.cases {
+        for run in 1..=runs {
+            let started = Instant::now();
+            let response = provider
+                .chat(ChatRequest {
+                    model: profile.model.clone(),
+                    messages: vec![Message::user(&case.prompt)],
+                    tools: Vec::new(),
+                })
+                .await
+                .with_context(|| format!("benchmark case '{}' failed", case.name))?;
+            let elapsed = started.elapsed();
+            let missing = missing_expectations(&response.content, &case.expect_contains);
+            let passed = missing.is_empty();
+
+            totals.runs += 1;
+            totals.passed += usize::from(passed);
+            totals.latency += elapsed;
+            totals.input_tokens += response.usage.prompt_tokens;
+            totals.output_tokens += response.usage.completion_tokens;
+            totals.total_tokens += response.usage.total_tokens;
+
+            let mark = if passed { "PASS" } else { "FAIL" };
+            println!(
+                "  {mark:<4} {:<28} run {:>2}  {:>7.2}s  {:>7} tokens",
+                case.name,
+                run,
+                elapsed.as_secs_f64(),
+                response.usage.total_tokens
+            );
+            if !missing.is_empty() {
+                println!("       missing: {}", missing.join(", "));
+            }
+        }
+    }
+
+    let average = totals.latency.as_secs_f64() / totals.runs as f64;
+    println!();
+    println!(
+        "Result: {}/{} passed ({:.1}%), {:.2}s average, {} tokens total ({} in / {} out)",
+        totals.passed,
+        totals.runs,
+        totals.passed as f64 * 100.0 / totals.runs as f64,
+        average,
+        totals.total_tokens,
+        totals.input_tokens,
+        totals.output_tokens
+    );
+
+    if totals.passed == totals.runs {
+        Ok(())
+    } else {
+        anyhow::bail!("{} benchmark run(s) failed", totals.runs - totals.passed)
+    }
+}
+
+fn load_suite(path: &Path) -> Result<Suite> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read benchmark suite {}", path.display()))?;
+    let suite: Suite = serde_json::from_str(&content)
+        .with_context(|| format!("invalid benchmark suite {}", path.display()))?;
+    validate_suite(&suite)?;
+    Ok(suite)
+}
+
+fn validate_suite(suite: &Suite) -> Result<()> {
+    if suite.cases.is_empty() {
+        anyhow::bail!("benchmark suite must contain at least one case");
+    }
+    for case in &suite.cases {
+        if case.name.trim().is_empty() {
+            anyhow::bail!("benchmark case name cannot be empty");
+        }
+        if case.prompt.trim().is_empty() {
+            anyhow::bail!("benchmark case '{}' has an empty prompt", case.name);
+        }
+        if case
+            .expect_contains
+            .iter()
+            .any(|expected| expected.trim().is_empty())
+        {
+            anyhow::bail!(
+                "benchmark case '{}' has an empty expect_contains value",
+                case.name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn missing_expectations<'a>(content: &str, expected: &'a [String]) -> Vec<&'a str> {
+    let content = content.to_lowercase();
+    expected
+        .iter()
+        .filter(|needle| !content.contains(&needle.to_lowercase()))
+        .map(String::as_str)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expectations_are_case_insensitive() {
+        let expected = vec!["Rust".to_string(), "ownership".to_string()];
+        assert!(missing_expectations("RUST has Ownership", &expected).is_empty());
+    }
+
+    #[test]
+    fn reports_every_missing_expectation() {
+        let expected = vec!["alpha".to_string(), "beta".to_string()];
+        assert_eq!(missing_expectations("alpha", &expected), vec!["beta"]);
+    }
+
+    #[test]
+    fn rejects_empty_suites_and_prompts() {
+        assert!(validate_suite(&Suite { cases: Vec::new() }).is_err());
+        assert!(
+            validate_suite(&Suite {
+                cases: vec![Case {
+                    name: "empty".to_string(),
+                    prompt: "  ".to_string(),
+                    expect_contains: Vec::new(),
+                }],
+            })
+            .is_err()
+        );
+    }
+}

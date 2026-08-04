@@ -227,7 +227,9 @@ fn spawn_agent_definition() -> ToolDefinition {
                       only read the repository (read_file, list_directory, grep, glob) — it \
                       cannot run commands, edit files, or spawn another sub-agent. Good for a \
                       well-scoped question like \"find every place X is used and summarize how\" \
-                      or \"explain what module Y does\"; not a substitute for tools you can call \
+                      or \"explain what module Y does\". For independent tasks, issue up to four \
+                      spawn_agent calls in the same response and Kamui runs them concurrently; \
+                      keep dependent tasks serial. This is not a substitute for tools you can call \
                       directly."
             .to_string(),
         parameters: json!({

@@ -2,6 +2,7 @@ use crate::provider::{Message, Usage};
 use anyhow::{Context, Result};
 use directories::BaseDirs;
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -66,6 +67,37 @@ pub struct UsagePeriod {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
+}
+
+#[derive(Debug)]
+pub struct ScheduledJob {
+    pub id: String,
+    pub command: String,
+    pub cwd: String,
+    pub interval_secs: Option<i64>,
+    pub next_run_at: Option<i64>,
+    pub enabled: bool,
+    pub status: String,
+    pub last_exit_code: Option<i64>,
+    pub stdout: String,
+    pub stderr: String,
+    pub worker_id: Option<String>,
+}
+
+fn scheduled_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledJob> {
+    Ok(ScheduledJob {
+        id: row.get(0)?,
+        command: row.get(1)?,
+        cwd: row.get(2)?,
+        interval_secs: row.get(3)?,
+        next_run_at: row.get(4)?,
+        enabled: row.get(5)?,
+        status: row.get(6)?,
+        last_exit_code: row.get(7)?,
+        stdout: row.get(8)?,
+        stderr: row.get(9)?,
+        worker_id: row.get(10)?,
+    })
 }
 
 impl Database {
@@ -229,6 +261,47 @@ impl Database {
                  PRAGMA user_version = 8;",
             )?;
         }
+        if version < 9 {
+            connection.execute_batch(
+                "CREATE TABLE scheduled_jobs (
+                     id TEXT PRIMARY KEY,
+                     command TEXT NOT NULL,
+                     cwd TEXT NOT NULL,
+                     interval_secs INTEGER,
+                     next_run_at INTEGER,
+                     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+                     status TEXT NOT NULL DEFAULT 'scheduled' CHECK (
+                         status IN ('scheduled', 'paused', 'running', 'succeeded', 'failed', 'cancelled', 'interrupted')
+                     ),
+                     last_started_at INTEGER,
+                     last_finished_at INTEGER,
+                     last_exit_code INTEGER,
+                     stdout TEXT NOT NULL DEFAULT '',
+                     stderr TEXT NOT NULL DEFAULT '',
+                     worker_id TEXT,
+                     lease_expires_at INTEGER,
+                     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                     updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                     CHECK (interval_secs IS NULL OR interval_secs >= 60)
+                 );
+                 CREATE INDEX scheduled_jobs_due
+                     ON scheduled_jobs(enabled, status, next_run_at);
+                 PRAGMA user_version = 9;",
+            )?;
+        }
+        if version < 10 {
+            connection.execute_batch(
+                "ALTER TABLE indexed_files ADD COLUMN embedding_model TEXT;
+                 ALTER TABLE code_chunks ADD COLUMN lsh_bucket INTEGER;
+                 CREATE INDEX code_chunks_project_lsh ON code_chunks(project, lsh_bucket);
+                 CREATE VIRTUAL TABLE code_chunks_fts USING fts5(
+                     project UNINDEXED, path, content
+                 );
+                 INSERT INTO code_chunks_fts(rowid, project, path, content)
+                     SELECT id, project, path, content FROM code_chunks;
+                 PRAGMA user_version = 10;",
+            )?;
+        }
         Ok(Self { connection, path })
     }
 
@@ -243,6 +316,183 @@ impl Database {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Run SQLite's fast integrity check for `kamui doctor` and return its diagnostic text.
+    pub fn integrity_check(&self) -> Result<String> {
+        self.connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
+    pub fn schema_version(&self) -> Result<i64> {
+        self.connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
+    pub fn create_scheduled_job(
+        &self,
+        command: &str,
+        cwd: &str,
+        next_run_at: i64,
+        interval_secs: Option<i64>,
+    ) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        self.connection.execute(
+            "INSERT INTO scheduled_jobs
+                 (id, command, cwd, interval_secs, next_run_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, command, cwd, interval_secs, next_run_at],
+        )?;
+        Ok(id)
+    }
+
+    pub fn list_scheduled_jobs(&self) -> Result<Vec<ScheduledJob>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, command, cwd, interval_secs, next_run_at, enabled, status,
+                    last_exit_code, stdout, stderr, worker_id
+             FROM scheduled_jobs
+             ORDER BY COALESCE(next_run_at, 9223372036854775807), created_at",
+        )?;
+        let rows = statement.query_map([], scheduled_job_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Atomically claim one due job. SQLite's `UPDATE ... RETURNING` keeps two worker processes
+    /// from receiving the same command.
+    pub fn claim_due_job(
+        &self,
+        now: i64,
+        worker_id: &str,
+        lease_expires_at: i64,
+    ) -> Result<Option<ScheduledJob>> {
+        self.connection
+            .query_row(
+                "UPDATE scheduled_jobs
+                 SET status = 'running', last_started_at = ?1, updated_at = ?1,
+                     worker_id = ?2, lease_expires_at = ?3
+                 WHERE id = (
+                     SELECT id FROM scheduled_jobs
+                     WHERE enabled = 1 AND status = 'scheduled' AND next_run_at <= ?1
+                     ORDER BY next_run_at, created_at LIMIT 1
+                 )
+                 RETURNING id, command, cwd, interval_secs, next_run_at, enabled, status,
+                           last_exit_code, stdout, stderr, worker_id",
+                params![now, worker_id, lease_expires_at],
+                scheduled_job_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn finish_scheduled_job(
+        &self,
+        job: &ScheduledJob,
+        exit_code: i32,
+        stdout: &str,
+        stderr: &str,
+        finished_at: i64,
+    ) -> Result<()> {
+        let (enabled, status, next_run_at) = match job.interval_secs {
+            Some(interval) => {
+                let mut next = job.next_run_at.unwrap_or(finished_at) + interval;
+                while next <= finished_at {
+                    next += interval;
+                }
+                (1, "scheduled", Some(next))
+            }
+            None => (
+                0,
+                if exit_code == 0 {
+                    "succeeded"
+                } else {
+                    "failed"
+                },
+                None,
+            ),
+        };
+        let updated = self.connection.execute(
+            "UPDATE scheduled_jobs
+             SET enabled = ?2, status = ?3, next_run_at = ?4, last_finished_at = ?5,
+                 last_exit_code = ?6, stdout = ?7, stderr = ?8, updated_at = ?5,
+                 worker_id = NULL, lease_expires_at = NULL
+             WHERE id = ?1 AND worker_id = ?9",
+            params![
+                job.id,
+                enabled,
+                status,
+                next_run_at,
+                finished_at,
+                exit_code,
+                stdout,
+                stderr,
+                job.worker_id
+            ],
+        )?;
+        if updated == 0 {
+            anyhow::bail!(
+                "scheduled job '{}' is no longer owned by this worker",
+                job.id
+            );
+        }
+        Ok(())
+    }
+
+    pub fn interrupt_scheduled_job(&self, id: &str, stderr: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE scheduled_jobs
+             SET enabled = 0, status = 'interrupted', stderr = ?2,
+                 last_finished_at = unixepoch(), updated_at = unixepoch(),
+                 worker_id = NULL, lease_expires_at = NULL
+             WHERE id = ?1 AND status = 'running'",
+            params![id, stderr],
+        )?;
+        Ok(())
+    }
+
+    pub fn recover_expired_jobs(&self, now: i64) -> Result<usize> {
+        self.connection
+            .execute(
+                "UPDATE scheduled_jobs
+                 SET enabled = 0, status = 'interrupted',
+                     stderr = CASE WHEN stderr = '' THEN 'worker stopped before completion' ELSE stderr END,
+                     last_finished_at = unixepoch(), updated_at = unixepoch(),
+                     worker_id = NULL, lease_expires_at = NULL
+                 WHERE status = 'running' AND lease_expires_at <= ?1",
+                [now],
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn cancel_scheduled_job(&self, id: &str) -> Result<bool> {
+        Ok(self.connection.execute(
+            "UPDATE scheduled_jobs
+             SET enabled = 0, status = 'cancelled', updated_at = unixepoch()
+             WHERE id = ?1 AND status != 'running'",
+            [id],
+        )? > 0)
+    }
+
+    pub fn pause_scheduled_job(&self, id: &str) -> Result<bool> {
+        Ok(self.connection.execute(
+            "UPDATE scheduled_jobs
+             SET enabled = 0, status = 'paused', updated_at = unixepoch()
+             WHERE id = ?1 AND status = 'scheduled'",
+            [id],
+        )? > 0)
+    }
+
+    pub fn resume_scheduled_job(&self, id: &str, now: i64) -> Result<bool> {
+        Ok(self.connection.execute(
+            "UPDATE scheduled_jobs
+             SET enabled = 1, status = 'scheduled',
+                 next_run_at = CASE WHEN next_run_at < ?2 THEN ?2 ELSE next_run_at END,
+                 updated_at = unixepoch()
+             WHERE id = ?1 AND status = 'paused'",
+            params![id, now],
+        )? > 0)
     }
 
     /// Every stored memory entry, oldest first (the order they were learned in).
@@ -689,7 +939,27 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn indexed_file_is_current(
+        &self,
+        project: &str,
+        path: &str,
+        hash: &str,
+        embedding_model: &str,
+    ) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT hash = ?3 AND embedding_model = ?4
+                 FROM indexed_files WHERE project = ?1 AND path = ?2",
+                params![project, path, hash, embedding_model],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|matched| matched.unwrap_or(false))
+            .map_err(Into::into)
+    }
+
     /// Record (or update) the hash `/index` last saw for a path in this project.
+    #[cfg(test)]
     pub fn set_indexed_file(&self, project: &str, path: &str, hash: &str) -> Result<()> {
         self.connection.execute(
             "INSERT INTO indexed_files (project, path, hash, indexed_at)
@@ -729,12 +999,19 @@ impl Database {
     /// longer exists).
     pub fn delete_chunks_for_path(&self, project: &str, path: &str) -> Result<()> {
         self.connection.execute(
+            "DELETE FROM code_chunks_fts WHERE rowid IN (
+                 SELECT id FROM code_chunks WHERE project = ?1 AND path = ?2
+             )",
+            params![project, path],
+        )?;
+        self.connection.execute(
             "DELETE FROM code_chunks WHERE project = ?1 AND path = ?2",
             params![project, path],
         )?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn insert_chunk(
         &self,
         project: &str,
@@ -745,17 +1022,81 @@ impl Database {
         embedding: &[f32],
     ) -> Result<()> {
         self.connection.execute(
-            "INSERT INTO code_chunks (project, path, start_line, end_line, content, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO code_chunks
+                 (project, path, start_line, end_line, content, embedding, lsh_bucket)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 project,
                 path,
                 start_line as i64,
                 end_line as i64,
                 content,
-                encode_embedding(embedding)
+                encode_embedding(embedding),
+                embedding_signature(embedding)
             ],
         )?;
+        let id = self.connection.last_insert_rowid();
+        self.connection.execute(
+            "INSERT INTO code_chunks_fts(rowid, project, path, content)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, project, path, content],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically replace one file's complete index after all embeddings have been prepared.
+    /// A provider failure therefore leaves the old searchable rows untouched.
+    pub fn replace_file_index(
+        &self,
+        project: &str,
+        path: &str,
+        hash: &str,
+        embedding_model: &str,
+        chunks: &[NewCodeChunk],
+    ) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM code_chunks_fts WHERE rowid IN (
+                 SELECT id FROM code_chunks WHERE project = ?1 AND path = ?2
+             )",
+            params![project, path],
+        )?;
+        transaction.execute(
+            "DELETE FROM code_chunks WHERE project = ?1 AND path = ?2",
+            params![project, path],
+        )?;
+        for chunk in chunks {
+            transaction.execute(
+                "INSERT INTO code_chunks
+                     (project, path, start_line, end_line, content, embedding, lsh_bucket)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    project,
+                    path,
+                    chunk.start_line as i64,
+                    chunk.end_line as i64,
+                    chunk.content,
+                    encode_embedding(&chunk.embedding),
+                    embedding_signature(&chunk.embedding)
+                ],
+            )?;
+            let id = transaction.last_insert_rowid();
+            transaction.execute(
+                "INSERT INTO code_chunks_fts(rowid, project, path, content)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id, project, path, chunk.content],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO indexed_files (project, path, hash, indexed_at, embedding_model)
+             VALUES (?1, ?2, ?3, unixepoch(), ?4)
+             ON CONFLICT(project, path) DO UPDATE SET
+                 hash = excluded.hash,
+                 indexed_at = excluded.indexed_at,
+                 embedding_model = excluded.embedding_model",
+            params![project, path, hash, embedding_model],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -794,6 +1135,107 @@ impl Database {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
+
+    /// Candidate retrieval for large indexes: lexical FTS and nearby LSH buckets are unioned,
+    /// then the caller performs exact cosine scoring only over this bounded set. Small projects
+    /// retain exhaustive scoring for maximum recall.
+    pub fn candidate_chunks(
+        &self,
+        project: &str,
+        query: &str,
+        lsh_buckets: &[i64],
+    ) -> Result<Vec<CodeChunk>> {
+        const EXHAUSTIVE_LIMIT: i64 = 2_000;
+        const CANDIDATE_LIMIT: usize = 1_024;
+        if self.chunk_count(project)? <= EXHAUSTIVE_LIMIT {
+            return self.all_chunks(project);
+        }
+
+        let mut candidates: HashMap<i64, CodeChunk> = HashMap::new();
+        if let Some(fts_query) = fts_query(query) {
+            let mut statement = self.connection.prepare(
+                "SELECT c.id, c.path, c.start_line, c.end_line, c.content, c.embedding
+                 FROM code_chunks_fts f
+                 JOIN code_chunks c ON c.id = f.rowid
+                 WHERE f.project = ?1 AND code_chunks_fts MATCH ?2
+                 ORDER BY bm25(code_chunks_fts)
+                 LIMIT 256",
+            )?;
+            let rows = statement.query_map(params![project, fts_query], code_chunk_with_id)?;
+            for row in rows {
+                let (id, chunk) = row?;
+                candidates.insert(id, chunk);
+            }
+        }
+
+        if !lsh_buckets.is_empty() && candidates.len() < CANDIDATE_LIMIT {
+            let placeholders = (0..lsh_buckets.len())
+                .map(|index| format!("?{}", index + 2))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT id, path, start_line, end_line, content, embedding
+                 FROM code_chunks
+                 WHERE project = ?1 AND lsh_bucket IN ({placeholders})
+                 LIMIT {CANDIDATE_LIMIT}"
+            );
+            let mut values = Vec::<rusqlite::types::Value>::with_capacity(lsh_buckets.len() + 1);
+            values.push(project.to_string().into());
+            values.extend(lsh_buckets.iter().copied().map(Into::into));
+            let mut statement = self.connection.prepare(&sql)?;
+            let rows =
+                statement.query_map(rusqlite::params_from_iter(values), code_chunk_with_id)?;
+            for row in rows {
+                let (id, chunk) = row?;
+                if candidates.len() >= CANDIDATE_LIMIT {
+                    break;
+                }
+                candidates.insert(id, chunk);
+            }
+        }
+
+        if candidates.is_empty()
+            && let Some(signature) = lsh_buckets.first()
+        {
+            let mut statement = self.connection.prepare(
+                "SELECT DISTINCT lsh_bucket FROM code_chunks
+                 WHERE project = ?1 AND lsh_bucket IS NOT NULL",
+            )?;
+            let rows = statement.query_map([project], |row| row.get::<_, i64>(0))?;
+            let mut nearest = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            nearest.sort_unstable_by_key(|bucket| (bucket ^ signature).count_ones());
+            nearest.truncate(8);
+            if !nearest.is_empty() {
+                let placeholders = (0..nearest.len())
+                    .map(|index| format!("?{}", index + 2))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT id, path, start_line, end_line, content, embedding
+                     FROM code_chunks
+                     WHERE project = ?1 AND lsh_bucket IN ({placeholders})
+                     LIMIT {CANDIDATE_LIMIT}"
+                );
+                let mut values = Vec::<rusqlite::types::Value>::with_capacity(nearest.len() + 1);
+                values.push(project.to_string().into());
+                values.extend(nearest.into_iter().map(Into::into));
+                let mut statement = self.connection.prepare(&sql)?;
+                let rows =
+                    statement.query_map(rusqlite::params_from_iter(values), code_chunk_with_id)?;
+                for row in rows {
+                    let (id, chunk) = row?;
+                    candidates.insert(id, chunk);
+                }
+            }
+        }
+
+        // Legacy rows from before schema v10 have no LSH bucket. They remain searchable until
+        // `/index` upgrades them, even though that one transitional query is exhaustive.
+        if candidates.is_empty() {
+            return self.all_chunks(project);
+        }
+        Ok(candidates.into_values().collect())
+    }
 }
 
 /// One file `/index` has embedded, with the time it was last indexed so the startup staleness
@@ -810,6 +1252,78 @@ pub struct CodeChunk {
     pub end_line: usize,
     pub content: String,
     pub embedding: Vec<f32>,
+}
+
+pub struct NewCodeChunk {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub content: String,
+    pub embedding: Vec<f32>,
+}
+
+fn code_chunk_with_id(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, CodeChunk)> {
+    let embedding: Vec<u8> = row.get(5)?;
+    Ok((
+        row.get(0)?,
+        CodeChunk {
+            path: row.get(1)?,
+            start_line: row.get::<_, i64>(2)? as usize,
+            end_line: row.get::<_, i64>(3)? as usize,
+            content: row.get(4)?,
+            embedding: decode_embedding(&embedding),
+        },
+    ))
+}
+
+const LSH_BITS: usize = 12;
+
+pub fn embedding_signature(vector: &[f32]) -> i64 {
+    let mut signature = 0i64;
+    for bit in 0..LSH_BITS {
+        let projection: f32 = vector
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let mixed = (index as u64)
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    .rotate_left(bit as u32 + 1)
+                    ^ (bit as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                if mixed.count_ones().is_multiple_of(2) {
+                    *value
+                } else {
+                    -*value
+                }
+            })
+            .sum();
+        if projection >= 0.0 {
+            signature |= 1 << bit;
+        }
+    }
+    signature
+}
+
+pub fn lsh_probe_buckets(signature: i64) -> Vec<i64> {
+    let mut buckets = Vec::with_capacity(1 + LSH_BITS + (LSH_BITS * (LSH_BITS - 1) / 2));
+    buckets.push(signature);
+    for first in 0..LSH_BITS {
+        buckets.push(signature ^ (1 << first));
+    }
+    for first in 0..LSH_BITS {
+        for second in first + 1..LSH_BITS {
+            buckets.push(signature ^ (1 << first) ^ (1 << second));
+        }
+    }
+    buckets
+}
+
+fn fts_query(query: &str) -> Option<String> {
+    let tokens = query
+        .split(|character: char| !(character.is_alphanumeric() || character == '_'))
+        .filter(|token| token.len() >= 2)
+        .take(12)
+        .map(|token| format!("\"{}\"*", token.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    (!tokens.is_empty()).then(|| tokens.join(" OR "))
 }
 
 /// Encode an embedding vector as little-endian `f32` bytes for the `code_chunks.embedding` BLOB
@@ -1152,6 +1666,66 @@ mod tests {
     }
 
     #[test]
+    fn integrity_check_reports_ok_and_current_schema() {
+        let database = database();
+        assert_eq!(database.integrity_check().unwrap(), "ok");
+        assert!(database.schema_version().unwrap() >= 9);
+    }
+
+    #[test]
+    fn scheduled_jobs_are_claimed_once_and_persist_results() {
+        let database = database();
+        let id = database
+            .create_scheduled_job("cargo test", "/tmp", 100, None)
+            .unwrap();
+
+        assert!(database.claim_due_job(99, "w1", 200).unwrap().is_none());
+        let job = database.claim_due_job(100, "w1", 200).unwrap().unwrap();
+        assert_eq!(job.id, id);
+        assert!(database.claim_due_job(100, "w2", 200).unwrap().is_none());
+
+        database
+            .finish_scheduled_job(&job, 0, "ok", "", 101)
+            .unwrap();
+        let jobs = database.list_scheduled_jobs().unwrap();
+        assert_eq!(jobs[0].status, "succeeded");
+        assert_eq!(jobs[0].last_exit_code, Some(0));
+        assert_eq!(jobs[0].stdout, "ok");
+        assert!(!jobs[0].enabled);
+    }
+
+    #[test]
+    fn recurring_jobs_advance_without_backfilling_missed_runs() {
+        let database = database();
+        database
+            .create_scheduled_job("echo hi", "/tmp", 100, Some(60))
+            .unwrap();
+        let job = database.claim_due_job(400, "w1", 500).unwrap().unwrap();
+        database.finish_scheduled_job(&job, 0, "", "", 400).unwrap();
+
+        let jobs = database.list_scheduled_jobs().unwrap();
+        assert_eq!(jobs[0].next_run_at, Some(460));
+        assert_eq!(jobs[0].status, "scheduled");
+        assert!(jobs[0].enabled);
+    }
+
+    #[test]
+    fn only_expired_worker_leases_are_recovered() {
+        let database = database();
+        database
+            .create_scheduled_job("echo hi", "/tmp", 100, None)
+            .unwrap();
+        database.claim_due_job(100, "worker", 150).unwrap().unwrap();
+
+        assert_eq!(database.recover_expired_jobs(149).unwrap(), 0);
+        assert_eq!(database.recover_expired_jobs(150).unwrap(), 1);
+        assert_eq!(
+            database.list_scheduled_jobs().unwrap()[0].status,
+            "interrupted"
+        );
+    }
+
+    #[test]
     fn session_list_hides_empty_sessions() {
         let database = database();
         database.create_session("test", "model").unwrap();
@@ -1449,6 +2023,83 @@ mod tests {
         assert!(
             database.indexed_files(PROJECT).unwrap()[0].indexed_at > 0,
             "indexed_at should be populated for the staleness check"
+        );
+    }
+
+    #[test]
+    fn replacing_a_file_index_tracks_the_embedding_model() {
+        let database = database();
+        let chunks = [NewCodeChunk {
+            start_line: 1,
+            end_line: 2,
+            content: "fn alpha() {}".to_string(),
+            embedding: vec![1.0, 0.0],
+        }];
+        database
+            .replace_file_index(PROJECT, "a.rs", "hash", "embed-v1", &chunks)
+            .unwrap();
+
+        assert!(
+            database
+                .indexed_file_is_current(PROJECT, "a.rs", "hash", "embed-v1")
+                .unwrap()
+        );
+        assert!(
+            !database
+                .indexed_file_is_current(PROJECT, "a.rs", "hash", "embed-v2")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn lsh_probes_include_nearby_signatures_without_duplicates() {
+        let signature = embedding_signature(&[1.0, -0.5, 0.25]);
+        let probes = lsh_probe_buckets(signature);
+        let unique: std::collections::HashSet<i64> = probes.iter().copied().collect();
+        assert_eq!(probes.len(), 79);
+        assert_eq!(unique.len(), probes.len());
+        assert_eq!(probes[0], signature);
+    }
+
+    #[test]
+    fn fts_query_keeps_code_identifiers_and_escapes_syntax() {
+        assert_eq!(
+            fts_query("find read_project_file()"),
+            Some("\"find\"* OR \"read_project_file\"*".to_string())
+        );
+        assert_eq!(fts_query("!"), None);
+    }
+
+    #[test]
+    fn large_index_candidate_search_is_bounded_and_keeps_lexical_hits() {
+        let database = database();
+        for index in 0..2_001 {
+            let content = if index == 1_900 {
+                "fn special_identifier() {}".to_string()
+            } else {
+                format!("fn routine_{index}() {{}}")
+            };
+            database
+                .insert_chunk(
+                    PROJECT,
+                    "src/lib.rs",
+                    index + 1,
+                    index + 1,
+                    &content,
+                    &[1.0],
+                )
+                .unwrap();
+        }
+        let signature = embedding_signature(&[1.0]);
+        let chunks = database
+            .candidate_chunks(PROJECT, "special_identifier", &lsh_probe_buckets(signature))
+            .unwrap();
+
+        assert!(chunks.len() <= 1_024);
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.content.contains("special_identifier"))
         );
     }
 }

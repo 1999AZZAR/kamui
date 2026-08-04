@@ -1098,6 +1098,7 @@ dependencies = [
  "chrono",
  "dialoguer",
  "directories",
+ "futures-util",
  "globset",
  "ignore",
  "png 0.17.16",

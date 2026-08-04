@@ -8,10 +8,12 @@ use crate::prompt;
 use crate::provider::{ChatRequest, Message, Provider, StreamEvent, ToolCall, Usage};
 use crate::storage;
 use crate::storage::{Database, Session};
+use crate::terminal::Ui;
 use crate::tools;
 use crate::tools::ToolRegistry;
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
+use futures_util::future::join_all;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -25,6 +27,8 @@ const RESUME_PREVIEW_MESSAGES: usize = 6;
 /// Upper bound on model/tool round-trips within a single user turn, to stop runaway tool loops.
 /// Generous enough for multi-file edits while still bounding a stuck loop.
 const MAX_TOOL_ROUNDS: usize = 25;
+const MAX_CONCURRENT_SUB_AGENTS: usize = 4;
+const EMBEDDING_BATCH_SIZE: usize = 64;
 /// Settings key for the persisted active provider profile.
 const ACTIVE_PROFILE_KEY: &str = "active_profile";
 
@@ -105,6 +109,7 @@ where
         }
     };
     let mut input_rx = input_channel();
+    let ui = Ui::stdio();
 
     // Rolling context compaction: `summary` folds in messages before `summarized_upto`; the rest of
     // `messages` is sent verbatim. Both reset whenever a command replaces the loaded history.
@@ -217,7 +222,11 @@ where
                 continue;
             }
             if command == "/jobs" {
-                println!("{}\n", tools::describe_jobs(&job_registry));
+                println!("Session jobs:\n{}", tools::describe_jobs(&job_registry));
+                println!(
+                    "\nScheduled jobs:\n{}\n",
+                    crate::jobs::format_jobs(&database.list_scheduled_jobs()?)
+                );
                 continue;
             }
             if command == "/index" {
@@ -357,7 +366,7 @@ where
             println!();
             // Animate a spinner from the moment the request is sent until the first token (or a
             // terminal event) arrives, so the wait for the model does not look frozen.
-            let mut spinner = Some(start_spinner("Thinking..."));
+            let mut spinner = start_spinner("Thinking...", ui);
             let mut stream = tokio::select! {
                 response = request => match response {
                     Ok(stream) => stream,
@@ -452,7 +461,31 @@ where
             let request_message = Message::tool_request(content, tool_calls.clone());
             turn_messages.push(request_message.clone());
             tool_trail.push(request_message);
+            let spawn_calls: Vec<&ToolCall> = tool_calls
+                .iter()
+                .filter(|call| call.name == tools::SPAWN_AGENT_TOOL)
+                .collect();
+            let spawned_outputs = if spawn_calls.is_empty() {
+                HashMap::new()
+            } else {
+                println!(
+                    "  \u{2192} running {} sub-agent(s), up to {MAX_CONCURRENT_SUB_AGENTS} concurrently",
+                    spawn_calls.len()
+                );
+                tokio::select! {
+                    output = dispatch_spawn_agents(
+                        provider.as_ref(), &active.model, project, &spawn_calls,
+                    ) => output,
+                    signal = tokio::signal::ctrl_c() => {
+                        signal.context("failed to listen for Ctrl+C")?;
+                        revert_on_cancel(&turn_snapshot);
+                        println!("\n(interrupted — back to prompt)\n");
+                        continue 'chat;
+                    }
+                }
+            };
             for call in &tool_calls {
+                let tool_started = Instant::now();
                 if call.name == tools::UPDATE_PLAN_TOOL
                     && let Some(rendered) = tools::render_plan(&call.arguments)
                 {
@@ -472,20 +505,10 @@ where
                         }
                     }
                 } else if call.name == tools::SPAWN_AGENT_TOOL {
-                    tokio::select! {
-                        output = dispatch_spawn_agent(
-                            provider.as_ref(),
-                            &active.model,
-                            project,
-                            &call.arguments,
-                        ) => output,
-                        signal = tokio::signal::ctrl_c() => {
-                            signal.context("failed to listen for Ctrl+C")?;
-                            revert_on_cancel(&turn_snapshot);
-                            println!("\n(interrupted — back to prompt)\n");
-                            continue 'chat;
-                        }
-                    }
+                    spawned_outputs
+                        .get(&call.id)
+                        .map(|(output, _)| output.clone())
+                        .unwrap_or_else(|| "Error: sub-agent result was missing".to_string())
                 } else if call.name == tools::SEARCH_CODE_TOOL {
                     match active.embedding_model.as_deref() {
                         Some(embedding_model) => {
@@ -578,10 +601,11 @@ where
                         }
                     }
                 };
-                match output.strip_prefix("Error: ") {
-                    Some(error) => println!("    ! {error}"),
-                    None => println!("    ok ({} chars)", output.chars().count()),
-                }
+                let elapsed = spawned_outputs
+                    .get(&call.id)
+                    .map(|(_, elapsed)| *elapsed)
+                    .unwrap_or_else(|| tool_started.elapsed());
+                println!("{}", ui.tool_outcome(&output, elapsed));
                 let result_message = Message::tool_result(&call.id, output);
                 turn_messages.push(result_message.clone());
                 tool_trail.push(result_message);
@@ -689,6 +713,7 @@ pub async fn run_once<F>(
 where
     F: Fn(&Profile) -> Box<dyn Provider>,
 {
+    let ui = Ui::stdio();
     let active_name = database
         .get_setting(ACTIVE_PROFILE_KEY)?
         .filter(|name| config.find(name).is_some())
@@ -759,7 +784,15 @@ where
         let request_message = Message::tool_request(response.content, response.tool_calls.clone());
         turn_messages.push(request_message.clone());
         tool_trail.push(request_message);
+        let spawn_calls: Vec<&ToolCall> = response
+            .tool_calls
+            .iter()
+            .filter(|call| call.name == tools::SPAWN_AGENT_TOOL)
+            .collect();
+        let spawned_outputs =
+            dispatch_spawn_agents(provider.as_ref(), &active.model, project, &spawn_calls).await;
         for call in &response.tool_calls {
+            let tool_started = Instant::now();
             if call.name == tools::UPDATE_PLAN_TOOL
                 && let Some(rendered) = tools::render_plan(&call.arguments)
             {
@@ -774,8 +807,10 @@ where
                  judgment, or state your assumption in the final answer."
                     .to_string()
             } else if call.name == tools::SPAWN_AGENT_TOOL {
-                dispatch_spawn_agent(provider.as_ref(), &active.model, project, &call.arguments)
-                    .await
+                spawned_outputs
+                    .get(&call.id)
+                    .map(|(output, _)| output.clone())
+                    .unwrap_or_else(|| "Error: sub-agent result was missing".to_string())
             } else if call.name == tools::SEARCH_CODE_TOOL {
                 match active.embedding_model.as_deref() {
                     Some(embedding_model) => {
@@ -807,10 +842,11 @@ where
                 }
                 tools.dispatch(call).await
             };
-            match output.strip_prefix("Error: ") {
-                Some(error) => println!("    ! {error}"),
-                None => println!("    ok ({} chars)", output.chars().count()),
-            }
+            let elapsed = spawned_outputs
+                .get(&call.id)
+                .map(|(_, elapsed)| *elapsed)
+                .unwrap_or_else(|| tool_started.elapsed());
+            println!("{}", ui.tool_outcome(&output, elapsed));
             let result_message = Message::tool_result(&call.id, output);
             turn_messages.push(result_message.clone());
             tool_trail.push(result_message);
@@ -892,7 +928,10 @@ struct Spinner {
     width: usize,
 }
 
-fn start_spinner(label: &'static str) -> Spinner {
+fn start_spinner(label: &'static str, ui: Ui) -> Option<Spinner> {
+    if !ui.interactive() {
+        return None;
+    }
     const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let stop = Arc::new(Notify::new());
     let stop_task = stop.clone();
@@ -910,11 +949,11 @@ fn start_spinner(label: &'static str) -> Spinner {
             }
         }
     });
-    Spinner {
+    Some(Spinner {
         stop,
         handle,
         width: label.chars().count() + 2,
-    }
+    })
 }
 
 impl Spinner {
@@ -1461,6 +1500,31 @@ async fn dispatch_spawn_agent(
     }
 }
 
+/// Run independent `spawn_agent` calls concurrently while preserving the original tool-call order
+/// in the map consumed by the parent loop. Batching caps provider fan-out and rate-limit pressure.
+async fn dispatch_spawn_agents(
+    provider: &dyn Provider,
+    model: &str,
+    project: &ProjectContext,
+    calls: &[&ToolCall],
+) -> HashMap<String, (String, Duration)> {
+    let mut outputs = HashMap::with_capacity(calls.len());
+    for batch in calls.chunks(MAX_CONCURRENT_SUB_AGENTS) {
+        let futures = batch.iter().map(|call| async move {
+            let started = Instant::now();
+            (
+                call.id.clone(),
+                (
+                    dispatch_spawn_agent(provider, model, project, &call.arguments).await,
+                    started.elapsed(),
+                ),
+            )
+        });
+        outputs.extend(join_all(futures).await);
+    }
+    outputs
+}
+
 /// Run an isolated sub-agent to completion and return just its final answer: a fresh system
 /// prompt and no shared history with the parent conversation, so the parent's context is not
 /// polluted by the sub-agent's own exploration trace. Scoped to `ToolRegistry::read_only` — none
@@ -1545,7 +1609,7 @@ async fn run_index(
             continue;
         };
         let hash = content_hash(&content);
-        if database.indexed_file_hash(&key, &relative)?.as_deref() == Some(hash.as_str()) {
+        if database.indexed_file_is_current(&key, &relative, &hash, embedding_model)? {
             skipped += 1;
             continue;
         }
@@ -1595,20 +1659,31 @@ async fn index_file(
     hash: &str,
 ) -> Result<usize> {
     let chunks = tools::chunk_text(content);
-    database.delete_chunks_for_path(project_key, relative)?;
-    let mut written = 0;
-    if !chunks.is_empty() {
-        let texts: Vec<String> = chunks.iter().map(|(_, _, text)| text.clone()).collect();
+    let mut prepared = Vec::new();
+    for batch in chunks.chunks(EMBEDDING_BATCH_SIZE) {
+        let texts: Vec<String> = batch.iter().map(|(_, _, text)| text.clone()).collect();
         let embeddings = provider
             .embed(embedding_model, texts)
             .await
             .with_context(|| format!("failed to embed {relative}"))?;
-        for ((start, end, text), embedding) in chunks.into_iter().zip(embeddings) {
-            database.insert_chunk(project_key, relative, start, end, &text, &embedding)?;
-            written += 1;
+        if embeddings.len() != batch.len() {
+            anyhow::bail!(
+                "embedding provider returned {} vector(s) for {} chunk(s) in {relative}",
+                embeddings.len(),
+                batch.len()
+            );
+        }
+        for ((start, end, text), embedding) in batch.iter().cloned().zip(embeddings) {
+            prepared.push(storage::NewCodeChunk {
+                start_line: start,
+                end_line: end,
+                content: text,
+                embedding,
+            });
         }
     }
-    database.set_indexed_file(project_key, relative, hash)?;
+    let written = prepared.len();
+    database.replace_file_index(project_key, relative, hash, embedding_model, &prepared)?;
     Ok(written)
 }
 
@@ -1653,7 +1728,9 @@ async fn refresh_index_for_paths(
         // A turn can edit a file and end up back at the indexed content — patched then reverted,
         // or an edit that cancels out. Nothing to re-embed then.
         let hash = content_hash(&content);
-        if hash == stored_hash {
+        if hash == stored_hash
+            && database.indexed_file_is_current(&key, &relative, &hash, embedding_model)?
+        {
             continue;
         }
         index_file(
@@ -1806,9 +1883,7 @@ async fn run_search_code(
     if arguments.query.trim().is_empty() {
         anyhow::bail!("search_code requires a non-empty 'query' argument");
     }
-
-    let chunks = database.all_chunks(&project.key())?;
-    if chunks.is_empty() {
+    if database.chunk_count(&project.key())? == 0 {
         anyhow::bail!("no code index found for this project; run /index first");
     }
 
@@ -1819,6 +1894,11 @@ async fn run_search_code(
     let query_vector = query_embedding
         .pop()
         .context("provider returned no embedding for the query")?;
+    let buckets = storage::lsh_probe_buckets(storage::embedding_signature(&query_vector));
+    let chunks = database.candidate_chunks(&project.key(), &arguments.query, &buckets)?;
+    if chunks.is_empty() {
+        anyhow::bail!("no code index found for this project; run /index first");
+    }
 
     let mut scored: Vec<(f32, storage::CodeChunk)> = chunks
         .into_iter()
@@ -2083,7 +2163,7 @@ fn print_help() {
     println!("/search <text>    Search saved messages");
     println!("/compact          Summarize older messages to free up context");
     println!("/undo             Revert the files patched by the last turn");
-    println!("/jobs             List background jobs started with run_command");
+    println!("/jobs             List session and persistent scheduled jobs");
     println!("/index            Rebuild the semantic-search index (needs embedding_model)");
     println!("/commands         List your own prompt commands");
     println!("/delete <id>      Delete a session");
@@ -2777,11 +2857,82 @@ mod tests {
     fn seed_index(database: &Database, project: &ProjectContext, relative: &str, content: &str) {
         let key = project.key();
         database
-            .set_indexed_file(&key, relative, &content_hash(content))
+            .replace_file_index(
+                &key,
+                relative,
+                &content_hash(content),
+                "embed-1",
+                &[storage::NewCodeChunk {
+                    start_line: 1,
+                    end_line: 1,
+                    content: content.to_string(),
+                    embedding: vec![1.0],
+                }],
+            )
             .unwrap();
-        database
-            .insert_chunk(&key, relative, 1, 1, content, &[1.0])
-            .unwrap();
+    }
+
+    struct ConcurrentProvider {
+        active: std::sync::atomic::AtomicUsize,
+        maximum: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ConcurrentProvider {
+        fn name(&self) -> &'static str {
+            "concurrent"
+        }
+
+        async fn chat(&self, request: ChatRequest) -> Result<crate::provider::ChatResponse> {
+            use std::sync::atomic::Ordering;
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(crate::provider::ChatResponse {
+                content: request.messages.last().unwrap().content.clone(),
+                tool_calls: Vec::new(),
+                usage: Usage::default(),
+                finish_reason: "stop".to_string(),
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<mpsc::UnboundedReceiver<Result<crate::provider::StreamEvent>>> {
+            panic!("the concurrent sub-agent test uses non-streaming chat");
+        }
+
+        async fn embed(&self, _model: &str, _input: Vec<String>) -> Result<Vec<Vec<f32>>> {
+            panic!("the concurrent sub-agent test does not embed");
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_agents_run_concurrently_with_a_four_agent_cap() {
+        use std::sync::atomic::Ordering;
+        let provider = ConcurrentProvider {
+            active: std::sync::atomic::AtomicUsize::new(0),
+            maximum: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let project = temporary_project();
+        let calls = (0..6)
+            .map(|index| ToolCall {
+                id: format!("c{index}"),
+                name: tools::SPAWN_AGENT_TOOL.to_string(),
+                arguments: format!(r#"{{"prompt":"task {index}"}}"#),
+            })
+            .collect::<Vec<_>>();
+        let references = calls.iter().collect::<Vec<_>>();
+
+        let outputs = dispatch_spawn_agents(&provider, "model", &project, &references).await;
+
+        assert_eq!(outputs.len(), 6);
+        assert_eq!(outputs["c0"].0, "task 0");
+        assert_eq!(outputs["c5"].0, "task 5");
+        assert_eq!(provider.maximum.load(Ordering::SeqCst), 4);
+        fs::remove_dir_all(project.root()).unwrap();
     }
 
     #[tokio::test]

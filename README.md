@@ -136,10 +136,12 @@ How it works: `/index` walks the project the same `.gitignore`-aware way `grep`/
 each file into roughly 50-line chunks, preferring blank lines and common declaration starts near the
 target so chunks stay more coherent, and embeds any chunk from a file whose content changed since
 the last run (tracked by a content hash, so re-running `/index` after a small edit only re-embeds
-the files that actually changed). `search_code` embeds your query and ranks every stored chunk by
-cosine similarity, returned as `path:start-end` with the chunk text — read the file for full
-context. Without an `embedding_model` configured, `search_code` is not offered to the model at all
-rather than erroring.
+the files that actually changed). Embeddings are sent in bounded batches, and a file's old index is
+replaced transactionally only after every new embedding succeeds. `search_code` combines SQLite
+FTS5 identifier/path candidates with locality-sensitive embedding buckets, then runs exact cosine
+ranking over that shortlist. Small indexes still use exhaustive ranking for maximum recall. Results
+are returned as `path:start-end` with the chunk text. Without an `embedding_model` configured,
+`search_code` is not offered to the model at all rather than erroring.
 
 The index is per project. Kamui keeps one database for everything, but each indexed chunk records
 which project root it came from, so indexing several projects is safe and `search_code` only ever
@@ -172,9 +174,10 @@ a verdict (a fresh checkout can bump mtimes without changing content). `/index` 
 content hashes before re-embedding anything, so acting on a false alarm is cheap. Nothing is printed
 when the index is up to date, when the project has never been indexed, or in `-p` mode.
 
-This is still a deliberately simple local index: chunking uses lightweight text heuristics rather
-than a parser, and matching is a brute-force scan (no vector index) — both simple choices that hold
-up fine at a single project's scale. Project indexing at a larger scale remains open future work.
+The index records its embedding model, so switching models automatically re-embeds unchanged files
+instead of comparing incompatible vectors. Chunk boundaries still use lightweight language-neutral
+heuristics rather than a full parser, while FTS5 plus LSH avoids loading every vector for larger
+projects.
 
 ### Skipping approval
 
@@ -284,10 +287,9 @@ Check that everything is configured and reachable without starting a chat sessio
 kamui doctor
 ```
 
-It parses the config, sends a real test request to the default provider profile, connects to
-every configured MCP server, and opens the database — printing a ✓ or ✗ line for each with an
-actionable message on failure, and exiting with a non-zero status if anything failed. Useful as a
-pre-flight check in a script, or just to check on things without leaving the terminal.
+It parses the config, tests chat and embedding endpoints, connects to every configured MCP server,
+checks the project root, runs SQLite's integrity check, and reports the optional RTK binary. It
+prints a pass/fail line for each check and exits non-zero if a required check failed.
 
 For a quicker look with no network calls at all:
 
@@ -301,6 +303,49 @@ path, database path, session count, remembered-fact count, and this project's in
 Unlike
 `doctor`, it never contacts the provider or an MCP server, so it works even when those would fail.
 
+### Benchmark mode
+
+Create a JSON suite and run it repeatedly against the default or a named profile:
+
+```json
+{
+  "cases": [
+    {
+      "name": "rust-basics",
+      "prompt": "Name Rust's ownership rules in one paragraph.",
+      "expect_contains": ["ownership", "borrow"]
+    }
+  ]
+}
+```
+
+```sh
+kamui benchmark suite.json --profile sol --runs 3
+```
+
+Each run reports pass/fail, latency, and tokens; the command exits non-zero when an expectation is
+missing, making the same suite usable locally and in CI. Expectations are optional and matched
+case-insensitively.
+
+### Scheduled jobs
+
+Kamui has a persistent SQLite-backed command queue. Jobs remain scheduled across restarts and run
+when a local worker is active:
+
+```sh
+kamui jobs add --now -- cargo test
+kamui jobs add --at 2026-08-05T09:00:00+07:00 -- cargo test --release
+kamui jobs add --every 6h -- git fetch --all
+kamui jobs list
+kamui jobs worker
+```
+
+Use `kamui jobs worker --once` to drain commands that are due and exit, which is convenient from an
+OS scheduler. `cancel`, `pause`, and `resume` accept a job id. Jobs execute in the directory where
+they were created, have a 30-minute safety timeout, retain capped stdout/stderr and exit status,
+and missed recurring runs are coalesced rather than replayed in a burst. This queue is separate from
+the temporary `run_command(background: true)` jobs owned by an active chat process.
+
 ### Session commands
 
 | Command | Description |
@@ -313,7 +358,7 @@ Unlike
 | `/search <text>` | Search saved messages across all sessions |
 | `/compact` | Summarize older messages to free up context |
 | `/undo` | Revert the files patched by the last turn |
-| `/jobs` | List background jobs started with run_command |
+| `/jobs` | List temporary session jobs and persistent scheduled jobs |
 | `/index` | Rebuild the semantic-search index (needs `embedding_model`) |
 | `/commands` | List your own prompt commands |
 | `/delete <id>` | Delete a session |
@@ -334,12 +379,13 @@ case-insensitively (literal `%` and `_` are not treated as wildcards) and prints
 session ID, timestamp, title, and a snippet centered on the match.
 
 After each streamed response, Kamui reports time-to-first-token (`TTFT`) and total response time
-(`Time`) alongside token usage and the finish reason. Responses are rendered with light markdown
-styling — headings and `**bold**` in bold, `` `code` `` and fenced blocks coloured. Styling is
-skipped automatically when output is piped or redirected, and when `NO_COLOR` is set.
+(`Time`) alongside token usage and the finish reason. The line-oriented terminal feed shows compact
+tool arguments followed by completion/failure state, elapsed time, and output size. Responses use
+light markdown styling. Styling and the thinking spinner are disabled when input/output is not a
+terminal; `NO_COLOR` disables colour while retaining the structured feed.
 
 `/stats` covers the current session; `/usage` zooms out to every session, reporting tokens per day
-and per month so you can see what a week of work actually cost.
+and per month.
 
 Long conversations are compacted automatically: once the recent history grows large, Kamui folds the
 older messages into a running summary so the session can continue without overflowing the model's
@@ -562,9 +608,9 @@ exploration in the main conversation itself. The sub-agent:
 - Starts fresh with no memory of the conversation, so its prompt must be self-contained.
 - Can only `read_file`, `list_directory`, `grep`, and `glob` — it cannot run commands, edit files,
   touch memory, or spawn another sub-agent, so it never needs your approval for anything it does.
-- Runs sequentially (it blocks the turn until it returns), not concurrently with the main
-  conversation — a deliberate v1 scope, since concurrent sub-agents would need their own approval
-  prompts interleaved with the main one.
+- Runs concurrently when the model issues several independent `spawn_agent` calls in one response.
+  Kamui caps each batch at four and returns results in the original tool-call order. The parent turn
+  still waits for the batch; read-only isolation means no approval prompts can interleave.
 
 This is a good fit for a well-scoped question like "find every place X is used and summarize how"
 or "explain what module Y does," not a substitute for tools the model can already call directly.
