@@ -46,8 +46,8 @@ effort or operational risk is disproportionate to their immediate value.
   runtime does not block on terminal input.
 - Supported chat commands are `/help`, `/new`, `/sessions`, `/resume <id>`, `/model [name]`,
   `/rename <id> <title>`, `/search <text>`, `/compact`, `/undo`, `/jobs`, `/index`, `/commands`,
-  `/delete <id>`, `/stats`, `/usage`, `/memory`, `/forget <text>` (or `/forget all`), and `/exit`.
-  Plain `exit` also quits.
+  `/delete <id>`, `/stats`, `/usage`, `/status`, `/memory`, `/forget <text>` (or `/forget all`),
+  and `/exit`. Plain `exit` also quits.
 - Users define their own slash commands as markdown files (`src/commands.rs`): global ones in
   `<config dir>/kamui/commands/*.md`, project ones in `<project>/.kamui/commands/*.md`, with a
   project command shadowing a global one of the same name — the same precedence `kamui.toml`
@@ -121,7 +121,11 @@ effort or operational risk is disproportionate to their immediate value.
   and the end of `run_once`) so nothing outlives the process.
 - When the external `rtk` binary is available (detected once per process), simple approved commands
   are prefixed with `rtk` to compress their output. Commands with shell operators, commands already
-  prefixed with `rtk`, and all commands on systems without RTK run directly. The first result line
+  prefixed with `rtk`, and all commands on systems without RTK run directly. So does anything whose
+  first word the shell would not resolve to a program — a `cmd`/`sh` builtin (`tools::CMD_BUILTINS`
+  and `tools::SH_BUILTINS`, kept per-shell because `echo` is a `cmd` builtin but a real `/bin/echo`
+  on Unix) or a `VAR=value` assignment prefix — since `rtk` can only prefix a program and would
+  otherwise turn a working `cd ..` into `Binary 'cd' not found on PATH`. The first result line
   records the exact command line executed.
 - MCP servers declared as `[mcp.<name>]` in the global config are launched at startup over stdio;
   each advertised tool joins the registry as `<server>__<tool>` and requires approval per call unless
@@ -424,7 +428,8 @@ Native Anthropic and Gemini support would require dedicated adapters and is not 
 
 [RTK](https://github.com/rtk-ai/rtk) is an optional external execution backend, now wired into
 `run_command`: it is detected once per process and simple commands are prefixed with `rtk`, while
-anything with shell operators, an existing `rtk` prefix, or a system without RTK runs directly.
+anything with shell operators, an existing `rtk` prefix, a shell builtin or `VAR=value` prefix as
+its first word, or a system without RTK runs directly.
 It is a Rust application, but it currently exposes a binary target rather than a stable public Rust
 library API. Do not add it as a Cargo dependency or copy its source into Kamui.
 

@@ -1079,9 +1079,33 @@ fn rtk_available() -> bool {
     })
 }
 
+/// Names the shell runs itself instead of executing a program of that name. `run_command` hands the
+/// whole string to `cmd /C` or `sh -c`, so its first word is not necessarily a program — but `rtk`
+/// can only prefix a program, so routing one of these turns a working command into
+/// `rtk: Binary 'cd' not found on PATH`.
+///
+/// Which names these are is the shell's decision, not the platform's, which is why the lists are
+/// per-shell and only the one actually invoked is consulted: `echo` is a `cmd` builtin on Windows
+/// but a real `/bin/echo` on Unix. `echo` is also why the Windows list must not be narrowed to
+/// "names with no binary anywhere" — an unrelated `echo.exe` on `PATH` (MSYS, or a stray one from
+/// some bundled toolchain) makes `rtk echo "hi"` succeed while silently printing something `cmd`'s
+/// own `echo` would not, so the shell's builtin has to win regardless of what is installed.
+const CMD_BUILTINS: &[&str] = &[
+    "assoc", "break", "call", "cd", "chdir", "cls", "color", "copy", "date", "del", "dir", "echo",
+    "endlocal", "erase", "exit", "for", "ftype", "goto", "if", "md", "mkdir", "mklink", "move",
+    "path", "pause", "popd", "prompt", "pushd", "rd", "rem", "ren", "rename", "rmdir", "set",
+    "setlocal", "shift", "start", "time", "title", "type", "ver", "verify", "vol",
+];
+const SH_BUILTINS: &[&str] = &[
+    ".", ":", "alias", "bg", "break", "cd", "command", "continue", "eval", "exec", "exit",
+    "export", "fg", "getopts", "hash", "jobs", "local", "read", "readonly", "return", "set",
+    "shift", "source", "times", "trap", "type", "ulimit", "umask", "unalias", "unset", "wait",
+];
+
 /// Decide whether to route a command through `rtk`. Only simple commands are routed: with shell
 /// operators the prefix would apply to the first segment only, so those run directly. Commands the
-/// model already prefixed with `rtk` are left untouched.
+/// model already prefixed with `rtk` are left untouched, and so is anything whose first word the
+/// shell would not resolve to a program — a builtin, or a `VAR=value` assignment prefix.
 fn route_through_rtk(command: &str, rtk_is_available: bool) -> bool {
     if !rtk_is_available {
         return false;
@@ -1091,7 +1115,27 @@ fn route_through_rtk(command: &str, rtk_is_available: bool) -> bool {
         return false;
     }
     const SHELL_OPERATORS: [char; 9] = ['&', '|', ';', '>', '<', '`', '$', '(', '\n'];
-    !trimmed.contains(SHELL_OPERATORS)
+    if trimmed.contains(SHELL_OPERATORS) {
+        return false;
+    }
+    let Some(program) = trimmed.split_whitespace().next() else {
+        return false;
+    };
+    // `RUST_LOG=debug cargo test` opens with an assignment the shell consumes, not a program name,
+    // so there is nothing for `rtk` to prefix. A builtin list cannot catch this — the name is
+    // arbitrary. Declining is deliberate rather than inserting `rtk` after the assignments: that
+    // would rewrite the middle of the user's approved command for a marginal gain, and `cmd` has no
+    // inline-assignment syntax at all, so on Windows the string is not a runnable command either way.
+    if program.contains('=') {
+        return false;
+    }
+    let (builtins, program) = if cfg!(windows) {
+        // `cmd` matches its builtins case-insensitively; `sh` does not.
+        (CMD_BUILTINS, program.to_ascii_lowercase())
+    } else {
+        (SH_BUILTINS, program.to_owned())
+    };
+    !builtins.contains(&program.as_str())
 }
 
 #[async_trait]
@@ -2437,6 +2481,28 @@ mod tests {
         assert!(preview.contains("--- src/a.rs"));
         assert!(preview.contains("- let a = 1;"));
         assert!(preview.contains("+ let a = 2;"));
+    }
+
+    /// Regression: `run_command` hands every command to `cmd /C` or `sh -c`, so the first word can
+    /// be something the shell runs itself. Routing those used to rewrite a working `cd ..` into
+    /// `rtk cd ..`, which fails with `rtk: Binary 'cd' not found on PATH`.
+    #[test]
+    fn never_routes_a_command_the_shell_runs_itself() {
+        // Builtins of both shells, so these hold on every platform.
+        assert!(!route_through_rtk("cd ..", true));
+        assert!(!route_through_rtk("set", true));
+        // An inline environment assignment is not a program name, and no builtin list can hold
+        // every name a user might assign.
+        assert!(!route_through_rtk("RUST_LOG=debug cargo test", true));
+        // Which names are builtins follows the shell, not the platform: `cmd` runs `echo` and
+        // `type` itself, while Unix has a real program for each.
+        assert_eq!(route_through_rtk("echo hello", true), !cfg!(windows));
+        assert_eq!(route_through_rtk("type notes.txt", true), !cfg!(windows));
+        // `cmd` matches its builtins case-insensitively; `sh` does not, and Unix has no `DIR`
+        // program either, so routing it there costs nothing.
+        assert_eq!(route_through_rtk("DIR", true), !cfg!(windows));
+        // A real program is still routed on both.
+        assert!(route_through_rtk("cargo test", true));
     }
 
     #[test]

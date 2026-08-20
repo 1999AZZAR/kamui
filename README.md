@@ -417,6 +417,7 @@ the temporary `run_command(background: true)` jobs owned by an active chat proce
 | `/delete <id>` | Delete a session |
 | `/stats` | Show current session usage |
 | `/usage` | Show token usage by day and month, across all sessions |
+| `/status` | Show project and connection status |
 | `/memory` | List facts Kamui remembers across sessions and projects |
 | `/forget <text>` | Forget one remembered fact, or `/forget all` |
 | `/help` | List available commands |
@@ -632,8 +633,9 @@ reverts the same way for a turn that *did* complete — one level, most recent t
 
 If the [RTK](https://github.com/rtk-ai/rtk) binary is installed, simple approved commands are
 automatically prefixed with `rtk` so their output is compressed before it reaches the model. RTK is
-optional: commands with shell operators and systems without RTK always run directly, and the first
-line of every result shows the exact command that ran.
+optional: commands with shell operators, commands whose first word the shell runs itself (`cd`,
+`set`, and other builtins, or a `VAR=value` prefix), and systems without RTK always run directly,
+and the first line of every result shows the exact command that ran.
 
 The whole turn is saved to session history, including the tool calls and their results, so a resumed
 session replays the tool interactions the model relied on.

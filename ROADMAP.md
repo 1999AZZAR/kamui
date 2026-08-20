@@ -101,8 +101,11 @@ on shutdown so nothing outlives the Kamui process.
 
 RTK routing is in place: the `rtk` binary is detected once per process, and simple commands are
 prefixed with `rtk` so compressed output reaches model context. Commands containing shell operators,
-commands already prefixed with `rtk`, and every command on systems without RTK run directly. The
-first line of each result records the exact command line that was executed.
+commands already prefixed with `rtk`, and every command on systems without RTK run directly — as
+does a command whose first word the shell handles itself rather than executing, since `rtk` can only
+prefix a program. That covers `cmd`/`sh` builtins (listed per shell, because `echo` is a `cmd`
+builtin on Windows but a real `/bin/echo` on Unix) and a leading `VAR=value` assignment. The first
+line of each result records the exact command line that was executed.
 
 The `patch_file` tool edits one file per call by exact-match replacement: `old_text` must match the
 file exactly once, or the patch is rejected with guidance so the model re-reads and retries; an
