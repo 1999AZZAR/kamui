@@ -645,7 +645,7 @@ mod tests {
         assert!(matches!(
             command,
             Command::Benchmark { suite, profile: Some(profile), runs: 3 }
-                if suite == std::path::PathBuf::from("suite.json") && profile == "fast"
+                if suite == std::path::Path::new("suite.json") && profile == "fast"
         ));
     }
 
