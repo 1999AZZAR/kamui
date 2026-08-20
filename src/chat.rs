@@ -4,6 +4,7 @@ use crate::config::{Config, Profile};
 use crate::context::ProjectContext;
 use crate::markdown;
 use crate::mcp::ConnectionStatus;
+use crate::pricing::Prices;
 use crate::prompt;
 use crate::provider::{ChatRequest, Message, Provider, StreamEvent, ToolCall, Usage};
 use crate::storage;
@@ -131,21 +132,27 @@ where
             input = input_rx.recv() => match input {
                 Some(input) => input,
                 None => {
-                    shutdown(database, session.as_ref(), context_window, &job_registry)?;
+                    shutdown(database, session.as_ref(), context_window, &job_registry, &config.prices)?;
                     break;
                 }
             },
             signal = tokio::signal::ctrl_c() => {
                 signal.context("failed to listen for Ctrl+C")?;
                 println!();
-                shutdown(database, session.as_ref(), context_window, &job_registry)?;
+                shutdown(database, session.as_ref(), context_window, &job_registry, &config.prices)?;
                 break;
             }
         };
         let input = input.trim();
 
         if input.eq_ignore_ascii_case("exit") || input == "/exit" {
-            shutdown(database, session.as_ref(), context_window, &job_registry)?;
+            shutdown(
+                database,
+                session.as_ref(),
+                context_window,
+                &job_registry,
+                &config.prices,
+            )?;
             break;
         }
         if input.is_empty() {
@@ -254,6 +261,7 @@ where
                 &mut messages,
                 &mut always_allowed,
                 &mut last_turn_snapshot,
+                &config.prices,
             ) {
                 eprintln!("Command failed: {error:#}\n");
             }
@@ -671,7 +679,7 @@ where
                 signal = tokio::signal::ctrl_c() => {
                     signal.context("failed to listen for Ctrl+C")?;
                     println!();
-                    shutdown(database, session.as_ref(), context_window, &job_registry)?;
+                    shutdown(database, session.as_ref(), context_window, &job_registry, &config.prices)?;
                     break;
                 }
             };
@@ -998,6 +1006,7 @@ fn handle_command(
     messages: &mut Vec<Message>,
     always_allowed: &mut HashSet<String>,
     last_turn_snapshot: &mut Option<HashMap<PathBuf, Option<String>>>,
+    prices: &Prices,
 ) -> Result<()> {
     let (command, argument) = input.split_once(' ').unwrap_or((input, ""));
     let argument = argument.trim();
@@ -1109,10 +1118,10 @@ fn handle_command(
             }
         }
         "/stats" => match session.as_ref() {
-            Some(session) => print_stats(database, session, context_window)?,
+            Some(session) => print_stats(database, session, context_window, prices)?,
             None => println!("This chat has no saved messages yet.\n"),
         },
-        "/usage" => print_usage_report(database)?,
+        "/usage" => print_usage_report(database, prices)?,
         "/memory" => {
             let entries = database.list_memory()?;
             if entries.is_empty() {
@@ -1156,13 +1165,25 @@ fn resolve_session(database: &Database, id_prefix: &str) -> Result<Session> {
         .with_context(|| format!("session '{id_prefix}' was not found or is ambiguous"))
 }
 
-fn print_stats(database: &Database, session: &Session, context_window: Option<u64>) -> Result<()> {
+fn print_stats(
+    database: &Database,
+    session: &Session,
+    context_window: Option<u64>,
+    prices: &Prices,
+) -> Result<()> {
     let stats = database.session_stats(&session.id)?;
     println!("\nSession:       {}", session.title);
     println!("Requests:      {}", stats.request_count);
     println!("Input tokens:  {}", stats.input_tokens);
     println!("Output tokens: {}", stats.output_tokens);
     println!("Total tokens:  {}", stats.total_tokens);
+    // Cost is opt-in end to end: with no `[pricing]` configured there is no line, no zero, and not
+    // even an extra query — the report stays exactly what it has always been.
+    let mut unpriced = false;
+    if let Some((cost, has_unpriced)) = session_cost(database, &session.id, prices)? {
+        unpriced |= has_unpriced;
+        println!("Cost:          {cost}");
+    }
     if let (Some(last_input), Some(window)) = (stats.last_input_tokens, context_window) {
         let percent = last_input as f64 / window as f64 * 100.0;
         println!("Last context:  {last_input}/{window} ({percent:.1}%)");
@@ -1171,14 +1192,105 @@ fn print_stats(database: &Database, session: &Session, context_window: Option<u6
     if by_model.len() > 1 {
         println!("\n--- Per model ---");
         for m in &by_model {
+            // Priced from this row's own (chat-only) tokens, so each line is honest about exactly
+            // the numbers standing beside it.
+            let cell = cost_cell(
+                prices,
+                [(Some(m.model.as_str()), m.input_tokens, m.output_tokens)],
+            );
+            if let Some((_, has_unpriced)) = &cell {
+                unpriced |= has_unpriced;
+            }
             println!(
-                "  {:<24} {:>3} req  {:>8} in  {:>8} out  {:>8} total",
-                m.model, m.request_count, m.input_tokens, m.output_tokens, m.total_tokens
+                "{}",
+                model_row(m, cell.as_ref().map(|(cost, _)| cost.as_str()))
             );
         }
     }
+    if unpriced {
+        println!("\n{UNPRICED_NOTE}");
+    }
     println!();
     Ok(())
+}
+
+/// Explains a `+` or `unpriced` cell, printed only under a report that produced one.
+const UNPRICED_NOTE: &str =
+    "Some usage came from a model with no price in [pricing.models]; it is excluded, not free.";
+
+/// This session's total cost, or `None` when no prices are configured. Sums every usage kind, not
+/// just `kind = 'chat'`: the token totals it sits under include title generation, and so does the
+/// bill. The query itself is skipped when there is nothing to price.
+fn session_cost(
+    database: &Database,
+    session_id: &str,
+    prices: &Prices,
+) -> Result<Option<(String, bool)>> {
+    if prices.is_empty() {
+        return Ok(None);
+    }
+    let tokens = database.session_model_tokens(session_id)?;
+    Ok(cost_cell(prices, model_token_rows(&tokens)))
+}
+
+/// The cost cell for one report row, plus whether any of that row's tokens could not be priced.
+/// `None` when the user configured no prices at all — which is how the column stays absent
+/// entirely, rather than showing a blank or a zero that would read as free.
+fn cost_cell<'a>(
+    prices: &Prices,
+    rows: impl IntoIterator<Item = (Option<&'a str>, i64, i64)>,
+) -> Option<(String, bool)> {
+    if prices.is_empty() {
+        return None;
+    }
+    let tally = prices.tally(rows);
+    Some((prices.format(&tally), tally.has_unpriced()))
+}
+
+/// Adapt stored per-model token sums to what `cost_cell` takes.
+fn model_token_rows(
+    tokens: &[storage::ModelTokens],
+) -> impl Iterator<Item = (Option<&str>, i64, i64)> {
+    tokens
+        .iter()
+        .map(|row| (row.model.as_deref(), row.input_tokens, row.output_tokens))
+}
+
+/// The per-model token rows recorded for one period, or nothing when that period has none.
+fn tokens_for<'a>(
+    models: &'a HashMap<String, Vec<storage::ModelTokens>>,
+    period: &str,
+) -> &'a [storage::ModelTokens] {
+    models.get(period).map_or(&[][..], Vec::as_slice)
+}
+
+/// One `/stats` per-model line. The cost cell is appended only when prices are configured, so the
+/// line is unchanged for a user who configured none.
+fn model_row(stat: &storage::ModelStat, cost: Option<&str>) -> String {
+    let mut line = format!(
+        "  {:<24} {:>3} req  {:>8} in  {:>8} out  {:>8} total",
+        stat.model, stat.request_count, stat.input_tokens, stat.output_tokens, stat.total_tokens
+    );
+    if let Some(cost) = cost {
+        line.push_str(&format!("  {cost:>12}"));
+    }
+    line
+}
+
+/// One `/usage` line, with the same opt-in cost cell as `model_row`.
+fn usage_row(period: &storage::UsagePeriod, cost: Option<&str>) -> String {
+    let mut line = format!(
+        "  {:<10} {:>4} req  {:>10} in  {:>10} out  {:>10} total",
+        period.period,
+        period.request_count,
+        period.input_tokens,
+        period.output_tokens,
+        period.total_tokens
+    );
+    if let Some(cost) = cost {
+        line.push_str(&format!("  {cost:>12}"));
+    }
+    line
 }
 
 /// Fold the older, un-summarized messages into a fresh running summary via a non-streaming request.
@@ -1254,12 +1366,13 @@ fn shutdown(
     session: Option<&Session>,
     context_window: Option<u64>,
     jobs: &tools::JobRegistry,
+    prices: &Prices,
 ) -> Result<()> {
     // Nothing should outlive the process: a still-running background job has no way to be
     // checked on or stopped once Kamui exits.
     tools::kill_all_jobs(jobs);
     if let Some(session) = session {
-        print_stats(database, session, context_window)?;
+        print_stats(database, session, context_window, prices)?;
         println!("To resume this session: kamui -r {}", short_id(&session.id));
     }
     println!("Goodbye");
@@ -2181,41 +2294,65 @@ const USAGE_REPORT_MONTHS: usize = 6;
 
 /// Token usage across every session, by day and by month. Unlike `/stats`, which is scoped to the
 /// active session, this answers "how much have I spent lately" over the whole database.
-fn print_usage_report(database: &Database) -> Result<()> {
+fn print_usage_report(database: &Database, prices: &Prices) -> Result<()> {
     let daily = database.usage_by_day(USAGE_REPORT_DAYS)?;
     if daily.is_empty() {
         println!("No usage recorded yet.\n");
         return Ok(());
     }
 
-    let row = |period: &storage::UsagePeriod| {
+    // Per-model sums exist only to be priced, so they are not even queried without prices; the
+    // report then runs exactly the queries, and prints exactly the columns, that it always has.
+    let priced = !prices.is_empty();
+    let daily_models = if priced {
+        database.usage_model_tokens_by_day()?
+    } else {
+        HashMap::new()
+    };
+    let monthly_models = if priced {
+        database.usage_model_tokens_by_month()?
+    } else {
+        HashMap::new()
+    };
+
+    let mut unpriced = false;
+    let mut row = |period: &storage::UsagePeriod, tokens: &[storage::ModelTokens]| {
+        let cell = cost_cell(prices, model_token_rows(tokens));
+        if let Some((_, has_unpriced)) = &cell {
+            unpriced |= has_unpriced;
+        }
         println!(
-            "  {:<10} {:>4} req  {:>10} in  {:>10} out  {:>10} total",
-            period.period,
-            period.request_count,
-            period.input_tokens,
-            period.output_tokens,
-            period.total_tokens
+            "{}",
+            usage_row(period, cell.as_ref().map(|(cost, _)| cost.as_str()))
         );
     };
 
     println!("\nLast {USAGE_REPORT_DAYS} days");
     for period in &daily {
-        row(period);
+        row(period, tokens_for(&daily_models, &period.period));
     }
 
     let monthly = database.usage_by_month(USAGE_REPORT_MONTHS)?;
     if monthly.len() > 1 {
         println!("\nBy month");
         for period in &monthly {
-            row(period);
+            row(period, tokens_for(&monthly_models, &period.period));
         }
     }
 
     let total = database.usage_total()?;
+    let total_models = if priced {
+        database.usage_model_tokens()?
+    } else {
+        Vec::new()
+    };
     println!("\nAll time");
-    row(&total);
-    println!("\nRequests count chat turns only; tokens include title generation.\n");
+    row(&total, &total_models);
+    println!("\nRequests count chat turns only; tokens include title generation.");
+    if unpriced {
+        println!("{UNPRICED_NOTE}");
+    }
+    println!();
     Ok(())
 }
 
@@ -2336,6 +2473,7 @@ fn git_status(root: &Path) -> Option<GitStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pricing::ModelPrice;
     use std::fs;
     use uuid::Uuid;
 
@@ -2343,6 +2481,153 @@ mod tests {
         let path = std::env::temp_dir().join(format!("kamui-status-{}", Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
         path
+    }
+
+    /// The point of "optional": with no `[pricing]` in `kamui.toml`, `/stats` and `/usage` print
+    /// exactly the lines they printed before cost tracking existed — no cost column, no zeroes —
+    /// and never even reach the database for per-model sums.
+    #[test]
+    fn reports_are_unchanged_when_no_prices_are_configured() {
+        let prices = Prices::default();
+        let period = storage::UsagePeriod {
+            period: "2026-08-20".to_string(),
+            request_count: 3,
+            input_tokens: 10,
+            output_tokens: 4,
+            total_tokens: 14,
+        };
+        let stat = storage::ModelStat {
+            model: "gpt-5".to_string(),
+            request_count: 3,
+            input_tokens: 10,
+            output_tokens: 4,
+            total_tokens: 14,
+        };
+
+        assert!(cost_cell(&prices, [(Some("gpt-5"), 10, 4)]).is_none());
+        assert_eq!(
+            usage_row(&period, None),
+            "  2026-08-20    3 req          10 in           4 out          14 total"
+        );
+        assert_eq!(
+            model_row(&stat, None),
+            "  gpt-5                      3 req        10 in         4 out        14 total"
+        );
+
+        // `UnreachableProvider`'s counterpart for storage: the session has usage, but with no
+        // prices there is nothing to report and nothing to query.
+        let database = Database::open_in_memory_for_tests();
+        let session = database.create_session("test", "gpt-5").unwrap();
+        database
+            .save_turn(
+                &session.id,
+                &[Message::user("hi")],
+                &Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 4,
+                    total_tokens: 14,
+                },
+                "gpt-5",
+                "stop",
+            )
+            .unwrap();
+
+        assert!(
+            session_cost(&database, &session.id, &prices)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_configured_price_adds_a_cost_cell_to_a_report_row() {
+        let prices = Prices::new(
+            None,
+            [(
+                "gpt-5".to_string(),
+                ModelPrice {
+                    input_per_million: 1.0,
+                    output_per_million: 2.0,
+                },
+            )],
+        )
+        .unwrap();
+        let period = storage::UsagePeriod {
+            period: "2026-08-20".to_string(),
+            request_count: 1,
+            input_tokens: 1_000_000,
+            output_tokens: 500_000,
+            total_tokens: 1_500_000,
+        };
+
+        let (cost, unpriced) = cost_cell(&prices, [(Some("gpt-5"), 1_000_000, 500_000)]).unwrap();
+
+        assert_eq!(cost, "$2.0000");
+        assert!(!unpriced);
+        assert!(usage_row(&period, Some(&cost)).ends_with("total       $2.0000"));
+    }
+
+    #[test]
+    fn a_model_with_usage_but_no_price_is_never_reported_as_free() {
+        let prices = Prices::new(
+            None,
+            [(
+                "gpt-5".to_string(),
+                ModelPrice {
+                    input_per_million: 1.0,
+                    output_per_million: 1.0,
+                },
+            )],
+        )
+        .unwrap();
+
+        let (cost, unpriced) = cost_cell(&prices, [(Some("codeqwen:latest"), 500, 500)]).unwrap();
+
+        assert_eq!(cost, "unpriced");
+        assert!(unpriced);
+    }
+
+    /// A session's cost covers every usage kind, so a title generated by a second, unpriced model
+    /// marks the total rather than quietly vanishing from it.
+    #[test]
+    fn session_cost_covers_title_generation_and_marks_an_unpriced_model() {
+        let database = Database::open_in_memory_for_tests();
+        let session = database.create_session("test", "gpt-5").unwrap();
+        let million = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            total_tokens: 1_000_000,
+        };
+        database
+            .save_turn(
+                &session.id,
+                &[Message::user("hi")],
+                &million,
+                "gpt-5",
+                "stop",
+            )
+            .unwrap();
+        database
+            .save_generated_title(&session.id, "A title", &million, "cheap-titler", "stop")
+            .unwrap();
+        let prices = Prices::new(
+            None,
+            [(
+                "gpt-5".to_string(),
+                ModelPrice {
+                    input_per_million: 1.0,
+                    output_per_million: 1.0,
+                },
+            )],
+        )
+        .unwrap();
+
+        let (cost, unpriced) = session_cost(&database, &session.id, &prices)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(cost, "$1.0000+");
+        assert!(unpriced);
     }
 
     #[test]
@@ -2757,6 +3042,7 @@ mod tests {
             &mut messages,
             &mut always_allowed,
             &mut last_turn_snapshot,
+            &Prices::default(),
         )
         .unwrap();
 
@@ -2785,6 +3071,7 @@ mod tests {
             &mut messages,
             &mut always_allowed,
             &mut last_turn_snapshot,
+            &Prices::default(),
         )
         .unwrap();
 

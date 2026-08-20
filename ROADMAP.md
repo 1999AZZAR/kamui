@@ -245,6 +245,7 @@ animates until the first token, and `Ctrl+C` mid-turn returns to the prompt inst
 - [ ] Session pinning (not planned — see below)
 - [x] Prompt templates and system prompt profiles (one feature: user-defined `/commands`)
 - [x] Daily and monthly usage reports (`/usage`)
+- [x] Optional cost tracking (`[pricing]` in `kamui.toml`)
 - [x] Benchmark mode
 
 Markdown rendering (`src/markdown.rs`) styles streamed output a line at a time: deltas accumulate
@@ -288,6 +289,27 @@ colour without removing the structured event feed.
 multiple runs, checks optional case-insensitive expected substrings, reports latency and token
 totals, and exits non-zero on failed expectations.
 
+Cost tracking needed no migration either, and no new writes: `usage_records` has carried
+`input_tokens`, `output_tokens`, and the `model` that produced them since `user_version = 5`. The
+only missing ingredient was prices, which only the user can supply. A `[pricing.models."<model>"]`
+entry in `kamui.toml` (`src/pricing.rs`) takes `input_per_million` and `output_per_million` — two
+rates, never one, because every provider charges more for output and a blended rate would misreport
+every session, and per *million* tokens because that is the unit the provider's own pricing page
+uses, so the number is copied across rather than converted. Kamui does not know or convert exchange
+rates: amounts are in whatever currency the prices were typed in, and `[pricing].currency` only
+changes the symbol printed beside them. Prices are not secret and grant no capability, so — unlike
+`[permissions]` — a project `kamui.toml` may set them, merged into the global table per model.
+
+Optional means optional. With no `[pricing]` section, `/stats` and `/usage` print exactly what they
+printed before, down to the column widths: no cost column, no zero rows, and not even the extra
+per-model query. When prices *are* configured, the case worth getting right is a model that has
+usage but no price: it reads `unpriced` rather than a number, and any total that includes such
+usage carries a trailing `+` and a note underneath, because an amount that silently omits part of
+the spend is a lie about money. The accepted limitation is that a price applies to the exact model
+id it names (matched case-insensitively, but with no wildcards and no per-provider defaults). That
+also means Kamui ships no built-in price list to go stale — a model the user has not priced simply
+reports as unpriced until they do.
+
 Session pinning was considered and dropped. Kamui sessions are task-scoped — opened for a job,
 finished, rarely revisited — so the case for pinning is weak, and `/search` already covers the
 real need (finding an old session by what was discussed, which is what you actually remember).
@@ -302,7 +324,9 @@ Revisit only if a concrete "I return to these exact sessions daily" case appears
 - [ ] Worker nodes and remote execution
 - [ ] Kamui Dispatch: remote prompt dispatch from a phone (planned architecture, not started —
   see below; distinct from "Worker nodes," which is about distributing compute, not remote control)
-- [ ] Local memory and RAG
+- [x] Local memory (`remember`/`update_memory`/`forget`, `/memory`, `/forget`)
+- [ ] RAG beyond the shipped semantic search (a user-supplied corpus, and retrieval the model does
+  not have to ask for — see below)
 - [x] Multi-agent workflows (a first, deliberately narrow form: `spawn_agent`)
 
 The MCP client is built (`src/mcp.rs`, via the `rmcp` SDK). Servers declared as `[mcp.<name>]` in the
@@ -319,6 +343,22 @@ packaging/discovery (no `kamui plugin install <name>`), not the extension mechan
 native plugin API would mean either unsafe/version-fragile dylib loading, or a WASM sandbox that
 converges back on "an MCP server, in our own protocol." A separate plugin runtime remains out of
 scope.
+
+Local memory shipped (`user_version = 6`). `remember`, `update_memory`, and `forget` let the model
+keep a small set of facts; `/memory` and `/forget <text>` manage the same store directly, without
+going through the model. It is global and permanent on purpose: unlike `KAMUI.md` (a file, per
+project) or session history (one conversation), a remembered fact follows the user into every
+project afterward, so the whole store — capped at 4 KiB — is read fresh from SQLite into every
+turn's system prompt.
+
+The RAG half of that entry is only partly answered, so it stays open, split out above. Phase 4's
+`/index`/`search_code` is retrieval-augmented generation in substance: chunks are embedded, stored
+locally in the same SQLite database, and the closest matches are fed back into the turn. Two things
+it is not. Retrieval is over the project's own source files, walked the same `.gitignore`-aware way
+`grep` is — not over a corpus of documents the user brings. And nothing is retrieved unless the
+model decides to call `search_code`; there is no automatic retrieval step on every turn, for the
+same reason indexing is not automatic (it would spend the user's embedding budget unasked, on turns
+that never needed it).
 
 `spawn_agent` (`src/tools.rs`/`chat::run_spawned_agent`) is Kamui's first multi-agent primitive: it
 delegates a self-contained task to an isolated sub-agent — fresh system prompt, no shared history

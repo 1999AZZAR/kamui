@@ -1,3 +1,4 @@
+use crate::pricing::{ModelPrice, Prices};
 use anyhow::{Context, Result};
 use directories::BaseDirs;
 use serde::Deserialize;
@@ -96,6 +97,20 @@ api_key = \"\"
 # leave semantic search unavailable.
 # [provider]
 # embedding_model = \"text-embedding-3-small\"
+
+# Optional: what each model costs, so /stats and /usage can report spend as well as
+# tokens. Prices are per MILLION tokens, the unit provider pricing pages use, and input
+# and output are separate rates. Kamui does not know or convert currencies: the numbers
+# are in whatever currency you typed, and `currency` is only the symbol printed with
+# them. Models you do not price are reported as \"unpriced\", never as free. Prices are
+# not secret, so a project kamui.toml may set them too.
+#
+# [pricing]
+# currency = \"$\"
+#
+# [pricing.models.\"gpt-4o\"]
+# input_per_million = 2.50
+# output_per_million = 10.00
 ";
 
 /// One provider+model configuration the user can run under.
@@ -139,6 +154,9 @@ pub struct Config {
     pub command_timeout_secs: u64,
     /// Safety cap on a `background: true` job's total lifetime.
     pub background_max_secs: u64,
+    /// Per-model prices for optional cost reporting in `/stats` and `/usage`. Empty unless the
+    /// user configured `[pricing.models]`, and cost is left out of both reports entirely when it is.
+    pub prices: Prices,
 }
 
 impl Config {
@@ -183,6 +201,20 @@ struct ConfigFile {
     /// `run_command` timeout policy. Not security-relevant, so a project file may override it.
     #[serde(default)]
     commands: CommandsSection,
+    /// Optional per-model prices. Like `[commands]`, and unlike `[permissions]`, a project file may
+    /// set these: a price is not a secret and grants nothing — it only changes a displayed number.
+    #[serde(default)]
+    pricing: PricingSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PricingSection {
+    /// Display label for the amounts. Kamui never converts currencies.
+    currency: Option<String>,
+    /// Model identifier -> price. Nested under `models` rather than sitting directly in
+    /// `[pricing]` so `currency` cannot collide with a model that happens to be named after it.
+    #[serde(default)]
+    models: HashMap<String, ModelPrice>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -314,7 +346,7 @@ pub fn ensure_onboarding_supported(path: &Path) -> Result<()> {
 
 /// Merge a global file with an optional project file into a resolved `Config`. Kept separate from
 /// disk access so the precedence and safety rules can be tested directly.
-fn resolve(mut global: ConfigFile, project: Option<ConfigFile>) -> Result<Config> {
+fn resolve(mut global: ConfigFile, mut project: Option<ConfigFile>) -> Result<Config> {
     if let Some(project) = &project {
         if declares_key(project) {
             anyhow::bail!(
@@ -348,6 +380,13 @@ fn resolve(mut global: ConfigFile, project: Option<ConfigFile>) -> Result<Config
         .or(global.commands.background_max_secs)
         .unwrap_or(DEFAULT_BACKGROUND_MAX_SECS);
 
+    let prices = resolve_prices(
+        std::mem::take(&mut global.pricing),
+        project
+            .as_mut()
+            .map(|file| std::mem::take(&mut file.pricing)),
+    )?;
+
     let mcp_servers = resolve_mcp_servers(std::mem::take(&mut global.mcp))?;
     let allow_commands = std::mem::take(&mut global.permissions).allow_commands;
     let mut config = if global.profiles.is_empty() {
@@ -359,7 +398,23 @@ fn resolve(mut global: ConfigFile, project: Option<ConfigFile>) -> Result<Config
     config.allow_commands = allow_commands;
     config.command_timeout_secs = command_timeout_secs;
     config.background_max_secs = background_max_secs;
+    config.prices = prices;
     Ok(config)
+}
+
+/// Merge the global and project `[pricing]` sections into one price table. Merging is per model,
+/// not whole-section: a project file can price a model the global file never mentioned without
+/// having to restate the rest. A project file may set prices at all — unlike `[permissions]` or
+/// `api_key` — because a price grants no capability and reveals no secret; the worst a wrong one
+/// can do is print a wrong number in a report.
+fn resolve_prices(global: PricingSection, project: Option<PricingSection>) -> Result<Prices> {
+    let mut currency = global.currency;
+    let mut models = global.models;
+    if let Some(project) = project {
+        currency = project.currency.or(currency);
+        models.extend(project.models);
+    }
+    Prices::new(currency, models)
 }
 
 /// Turn `[mcp.<name>]` blocks into launchable server definitions, ordered by name.
@@ -440,6 +495,8 @@ fn resolve_flat(global: ConfigFile, project: Option<ConfigFile>) -> Result<Confi
         allow_commands: Vec::new(),
         command_timeout_secs: DEFAULT_COMMAND_TIMEOUT_SECS,
         background_max_secs: DEFAULT_BACKGROUND_MAX_SECS,
+        // Overwritten by `resolve`, which is the only place that sees both files.
+        prices: Prices::default(),
     })
 }
 
@@ -513,6 +570,8 @@ fn resolve_profiles(global: ConfigFile, project: Option<ConfigFile>) -> Result<C
         allow_commands: Vec::new(),
         command_timeout_secs: DEFAULT_COMMAND_TIMEOUT_SECS,
         background_max_secs: DEFAULT_BACKGROUND_MAX_SECS,
+        // Overwritten by `resolve`, which is the only place that sees both files.
+        prices: Prices::default(),
     })
 }
 
@@ -622,6 +681,66 @@ mod tests {
         std::fs::remove_file(path).unwrap();
 
         assert!(error.to_string().contains("advanced profiles"));
+    }
+
+    #[test]
+    fn pricing_is_absent_unless_it_is_configured() {
+        let config = resolve(
+            file("model = \"gpt-5\"\n[provider]\napi_key = \"sk-1\""),
+            None,
+        )
+        .unwrap();
+
+        assert!(config.prices.is_empty());
+    }
+
+    #[test]
+    fn a_project_file_may_price_models_and_override_one_globally_priced() {
+        let global = file(
+            "model = \"gpt-5\"\n[provider]\napi_key = \"sk-1\"\n\
+             [pricing]\ncurrency = \"$\"\n\
+             [pricing.models.\"gpt-5\"]\ninput_per_million = 1.0\noutput_per_million = 2.0",
+        );
+        let project = file(
+            "[pricing.models.\"gpt-5\"]\ninput_per_million = 3.0\noutput_per_million = 4.0\n\
+             [pricing.models.\"codeqwen:latest\"]\ninput_per_million = 0.0\noutput_per_million = 0.0",
+        );
+
+        let prices = resolve(global, Some(project)).unwrap().prices;
+
+        // The project file wins for the model it restates, and adds one the global file never named.
+        assert_eq!(
+            prices.format(&prices.tally([(Some("gpt-5"), 1_000_000, 0)])),
+            "$3.0000"
+        );
+        assert_eq!(
+            prices.format(&prices.tally([(Some("codeqwen:latest"), 1_000_000, 0)])),
+            "$0.0000"
+        );
+    }
+
+    #[test]
+    fn an_impossible_price_is_rejected_rather_than_reported() {
+        let error = resolve(
+            file(
+                "model = \"gpt-5\"\n[provider]\napi_key = \"sk-1\"\n\
+                 [pricing.models.\"gpt-5\"]\ninput_per_million = -1.0\noutput_per_million = 1.0",
+            ),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("non-negative"));
+    }
+
+    /// Input and output are billed at different rates, so half a price is not a price.
+    #[test]
+    fn a_price_must_state_both_directions() {
+        let error =
+            toml::from_str::<ConfigFile>("[pricing.models.\"gpt-5\"]\ninput_per_million = 1.0")
+                .unwrap_err();
+
+        assert!(error.to_string().contains("output_per_million"));
     }
 
     #[test]

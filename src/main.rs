@@ -8,6 +8,7 @@ mod jobs;
 mod markdown;
 mod mcp;
 mod onboarding;
+mod pricing;
 mod prompt;
 mod provider;
 mod storage;

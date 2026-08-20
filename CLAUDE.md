@@ -71,6 +71,14 @@ effort or operational risk is disproportionate to their immediate value.
   (`storage::usage_by_day`/`usage_by_month`/`usage_total`). Both follow the same convention: the
   request count covers only `kind = 'chat'` rows while token sums include every kind, so title
   generation is counted in spend but not in request totals.
+- Cost reporting is opt-in and needs no migration: `usage_records` already carries the tokens and
+  the `model`, so only prices are missing, and only the user can supply them (`[pricing]` in
+  `kamui.toml`, `src/pricing.rs`). With no prices configured both reports are unchanged — no cost
+  column, no zeroes, and no per-model query is even run. With prices configured `/stats` gains a
+  `Cost:` line (over every usage kind, title generation included) and a cost cell per model row,
+  and `/usage` gains a cost column per period. A model with usage but no configured price is never
+  reported as free: its cell reads `unpriced`, and a total that mixes priced and unpriced usage
+  carries a trailing `+` plus an explanatory note.
 - Long sessions are compacted automatically: when the un-summarized recent history exceeds a byte
   threshold (about half the profile's `context_window`, or a default), older messages are folded
   into a rolling summary and the request sends the summary plus recent messages. `/compact` forces
@@ -266,6 +274,8 @@ Important modules:
   stdout is not a terminal.
 - `src/terminal.rs`: shared terminal capability detection and tool lifecycle formatting; protects
   piped/non-interactive output from ANSI and spinner control sequences.
+- `src/pricing.rs`: the optional `[pricing]` table, cost tallying, and the `unpriced`/`+` rendering
+  rules that keep an unpriced model from reading as a free one.
 - `src/prompt.rs`: the agentic system prompt, combined with project instructions per request.
 - `src/compaction.rs`: rolling-summary context compaction (threshold, message selection, summary
   request); the chat loop drives it automatically and via `/compact`.
@@ -385,6 +395,13 @@ Fields:
 - `[commands].timeout_secs` / `[commands].background_max_secs`: `run_command`'s foreground timeout
   (default 30) and the safety cap on a `background: true` job's lifetime (default 1800). Not
   security-relevant, so unlike `[permissions]` a project file may override either.
+- `[pricing]`: optional cost reporting. `[pricing.models."<model>"]` takes `input_per_million` and
+  `output_per_million` (two separate rates; both are required, since half a price is not a price),
+  quoted per million tokens because that is the unit provider pricing pages use. `[pricing].currency`
+  is a display symbol only — Kamui never converts currencies. Model ids are matched exactly, ignoring
+  case and surrounding space, with no wildcards. Not security-relevant, so (like `[commands]`) a
+  project file may set prices; they merge into the global table per model. Absent `[pricing]`,
+  `Config::prices` is empty and cost never appears anywhere.
 - `[provider].embedding_model` / `[profiles.*].embedding_model`: an embedding-capable model on the
   same provider, enabling `/index` and `search_code`. Inherits from a shared `[providers.*]` block
   the same way `base_url`/`api_key`/`tools` do. `None` (the default) leaves semantic search
@@ -536,8 +553,11 @@ cross-platform path behavior.
   nested directories.
 - `@diff` excludes untracked files and `@diff`/`@staged` require Git on `PATH`.
 - Context limits are byte-based rather than tokenizer-aware.
-- Cost analytics are intentionally deferred because pricing metadata and multi-provider semantics are
-  not yet defined.
+- Cost reporting knows only the prices the user configured, matched against the exact model id
+  recorded on each usage row. Kamui bundles no price list (it would go stale) and infers nothing
+  per provider, so a model that has not been priced is reported as `unpriced` rather than costed.
+- Currency is a label, not a unit: prices from providers billing in different currencies would be
+  summed as if they were the same one.
 - Unix installer behavior has not been exercised locally from the Windows development environment.
 
 ## Definition of Done

@@ -179,6 +179,59 @@ instead of comparing incompatible vectors. Chunk boundaries still use lightweigh
 heuristics rather than a full parser, while FTS5 plus LSH avoids loading every vector for larger
 projects.
 
+### Cost tracking
+
+Kamui already records how many input and output tokens each request used and which model produced
+them. Tell it what your models cost and `/stats` and `/usage` report money as well as tokens:
+
+```toml
+[pricing]
+currency = "$"                  # optional, display only — Kamui never converts currencies
+
+[pricing.models."gpt-4o"]
+input_per_million = 2.50
+output_per_million = 10.00
+
+[pricing.models."gpt-4o-mini"]
+input_per_million = 0.15
+output_per_million = 0.60
+```
+
+Prices are **per million tokens**, the same unit every provider quotes on its pricing page, so you
+can copy the two numbers across without converting anything. Input and output are separate rates
+because providers charge more for output; both are required. The key is the model identifier your
+provider expects — the same string as `model` in your profile — matched ignoring case and
+surrounding spaces, with no wildcards. Quote it if it contains a `/` or a `.`.
+
+Prices are not secrets and grant nothing, so a project `kamui.toml` may set them too; per-model
+entries there override the global ones and can add models the global file never listed.
+
+```text
+> /stats
+
+Session:       Fix the streaming parser
+Requests:      6
+Input tokens:  1500400
+Output tokens: 49020
+Total tokens:  1549420
+Cost:          $3.4012+
+
+--- Per model ---
+  gpt-4o                     4 req   1200000 in     40000 out   1240000 total       $3.4000
+  codeqwen:latest            2 req    300000 in      9000 out    309000 total      unpriced
+
+Some usage came from a model with no price in [pricing.models]; it is excluded, not free.
+```
+
+Two rules make the numbers trustworthy. A model you have not priced is reported as `unpriced`,
+never as `$0.0000` — Kamui will not tell you something was free when it does not know. And a total
+that mixes priced with unpriced usage carries a trailing `+`, so an amount never quietly stands for
+less spend than actually happened. Cost covers every request that was billed, including the small
+call that generates a session title.
+
+All of this is optional and off by default. With no `[pricing]` section, `/stats` and `/usage` look
+exactly as they did before — no cost column, no empty cells, no zeroes.
+
 ### Skipping approval
 
 Every `run_command`/`patch_file` call asks for approval by default, even for something as safe as
@@ -385,7 +438,8 @@ light markdown styling. Styling and the thinking spinner are disabled when input
 terminal; `NO_COLOR` disables colour while retaining the structured feed.
 
 `/stats` covers the current session; `/usage` zooms out to every session, reporting tokens per day
-and per month.
+and per month so you can see what a week of work actually cost. Configure
+[cost tracking](#cost-tracking) and both report money alongside the tokens.
 
 Long conversations are compacted automatically: once the recent history grows large, Kamui folds the
 older messages into a running summary so the session can continue without overflowing the model's

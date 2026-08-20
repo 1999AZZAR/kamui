@@ -59,6 +59,20 @@ pub struct MemoryEntry {
     pub content: String,
 }
 
+/// `strftime` groupings behind `/usage`'s two report levels, shared with the per-model token
+/// sums that price them so the two can never disagree about what a period is.
+const DAY_FORMAT: &str = "%Y-%m-%d";
+const MONTH_FORMAT: &str = "%Y-%m";
+
+/// Input and output tokens for one model, across *every* usage kind — a title generation costs
+/// money like any other request. `model` is `None` for rows written before Kamui recorded one
+/// (`user_version = 5`); such a row can never be priced.
+pub struct ModelTokens {
+    pub model: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
 /// Token usage aggregated over one calendar period (a day or a month), across every session.
 /// `period` is already formatted for display in the user's local timezone.
 pub struct UsagePeriod {
@@ -850,12 +864,12 @@ impl Database {
     /// request count covers only primary chat requests while the token sums include every kind
     /// (notably `title`), so the totals reflect what was actually spent.
     pub fn usage_by_day(&self, limit: usize) -> Result<Vec<UsagePeriod>> {
-        self.usage_by_period("%Y-%m-%d", limit)
+        self.usage_by_period(DAY_FORMAT, limit)
     }
 
     /// Token usage per calendar month across every session, most recent first.
     pub fn usage_by_month(&self, limit: usize) -> Result<Vec<UsagePeriod>> {
-        self.usage_by_period("%Y-%m", limit)
+        self.usage_by_period(MONTH_FORMAT, limit)
     }
 
     /// Group `usage_records` by a `strftime` format applied to `created_at`. Periods are computed
@@ -904,6 +918,72 @@ impl Database {
                 },
             )
             .map_err(Into::into)
+    }
+
+    /// Per-model token totals for one session, for optional cost reporting. Unlike `model_stats`,
+    /// which powers the per-model *request* breakdown, this counts every usage kind, matching the
+    /// convention that token sums include title generation while request counts do not.
+    pub fn session_model_tokens(&self, session_id: &str) -> Result<Vec<ModelTokens>> {
+        let mut statement = self.connection.prepare(
+            "SELECT model, COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+             FROM usage_records WHERE session_id = ?1 GROUP BY model",
+        )?;
+        let rows = statement.query_map([session_id], model_tokens)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Per-model token totals across every session, to price a usage report's lifetime row.
+    pub fn usage_model_tokens(&self) -> Result<Vec<ModelTokens>> {
+        let mut statement = self.connection.prepare(
+            "SELECT model, COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+             FROM usage_records GROUP BY model",
+        )?;
+        let rows = statement.query_map([], model_tokens)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Per-model token totals per day, keyed by the same period string `usage_by_day` produces so
+    /// a report can look each of its rows up.
+    pub fn usage_model_tokens_by_day(&self) -> Result<HashMap<String, Vec<ModelTokens>>> {
+        self.usage_model_tokens_by_period(DAY_FORMAT)
+    }
+
+    /// Per-model token totals per calendar month, keyed like `usage_by_month`'s periods.
+    pub fn usage_model_tokens_by_month(&self) -> Result<HashMap<String, Vec<ModelTokens>>> {
+        self.usage_model_tokens_by_period(MONTH_FORMAT)
+    }
+
+    /// Group tokens by period and model in one scan. Deliberately unlimited, unlike
+    /// `usage_by_period`: a caller only looks up the periods it is already showing, and one
+    /// grouped scan is cheaper than a windowed query repeated per row.
+    fn usage_model_tokens_by_period(
+        &self,
+        format: &str,
+    ) -> Result<HashMap<String, Vec<ModelTokens>>> {
+        let mut statement = self.connection.prepare(
+            "SELECT strftime(?1, created_at, 'unixepoch', 'localtime') AS period, model,
+                    COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+             FROM usage_records
+             GROUP BY period, model",
+        )?;
+        let rows = statement.query_map(params![format], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                ModelTokens {
+                    model: row.get(1)?,
+                    input_tokens: row.get(2)?,
+                    output_tokens: row.get(3)?,
+                },
+            ))
+        })?;
+        let mut grouped: HashMap<String, Vec<ModelTokens>> = HashMap::new();
+        for row in rows {
+            let (period, tokens) = row?;
+            grouped.entry(period).or_default().push(tokens);
+        }
+        Ok(grouped)
     }
 
     /// A durable key-value store for small UI state, such as the active provider profile.
@@ -1364,6 +1444,15 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         title: row.get(1)?,
         provider: row.get(2)?,
         model: row.get(3)?,
+    })
+}
+
+/// Row mapper shared by the per-model token queries, which differ only in what they group over.
+fn model_tokens(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelTokens> {
+    Ok(ModelTokens {
+        model: row.get(0)?,
+        input_tokens: row.get(1)?,
+        output_tokens: row.get(2)?,
     })
 }
 
@@ -1878,6 +1967,100 @@ mod tests {
         assert_eq!(total.input_tokens, 24);
         assert_eq!(total.output_tokens, 11);
         assert_eq!(total.total_tokens, 35);
+    }
+
+    #[test]
+    fn session_model_tokens_cover_every_usage_kind() {
+        let database = database();
+        let session = database.create_session("test", "sol").unwrap();
+        database
+            .save_turn(
+                &session.id,
+                &[Message::user("hi"), Message::assistant("yo")],
+                &Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                },
+                "gpt-5.6-sol",
+                "stop",
+            )
+            .unwrap();
+        database
+            .save_generated_title(
+                &session.id,
+                "A title",
+                &Usage {
+                    prompt_tokens: 4,
+                    completion_tokens: 1,
+                    total_tokens: 5,
+                },
+                "codeqwen:latest",
+                "stop",
+            )
+            .unwrap();
+
+        let mut tokens = database.session_model_tokens(&session.id).unwrap();
+        tokens.sort_by(|a, b| a.model.cmp(&b.model));
+
+        // Both models appear, including the one that only generated a title — it costs money too.
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].model.as_deref(), Some("codeqwen:latest"));
+        assert_eq!(tokens[0].input_tokens, 4);
+        assert_eq!(tokens[0].output_tokens, 1);
+        assert_eq!(tokens[1].model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(tokens[1].input_tokens, 10);
+        assert_eq!(tokens[1].output_tokens, 5);
+    }
+
+    #[test]
+    fn usage_model_tokens_are_grouped_by_period_and_model() {
+        let database = database();
+        let session = database.create_session("test", "sol").unwrap();
+        let turn = |model: &str, input: u64, output: u64| {
+            database
+                .save_turn(
+                    &session.id,
+                    &[Message::user("hi")],
+                    &Usage {
+                        prompt_tokens: input,
+                        completion_tokens: output,
+                        total_tokens: input + output,
+                    },
+                    model,
+                    "stop",
+                )
+                .unwrap();
+        };
+        turn("gpt-5.6-sol", 10, 5);
+        turn("gpt-5.6-sol", 20, 1);
+        turn("codeqwen:latest", 7, 3);
+
+        let daily = database.usage_model_tokens_by_day().unwrap();
+        let day = database.usage_by_day(30).unwrap();
+
+        // Keyed by exactly the period strings a usage report prints, so rows can be looked up.
+        assert_eq!(daily.len(), 1);
+        let mut rows = daily.into_values().next().unwrap();
+        rows.sort_by(|a, b| a.model.cmp(&b.model));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(rows[1].input_tokens, 30);
+        assert_eq!(rows[1].output_tokens, 6);
+        assert!(
+            database
+                .usage_model_tokens_by_day()
+                .unwrap()
+                .contains_key(&day[0].period)
+        );
+
+        let monthly = database.usage_model_tokens_by_month().unwrap();
+        let month = database.usage_by_month(12).unwrap();
+        assert!(monthly.contains_key(&month[0].period));
+
+        let lifetime = database.usage_model_tokens().unwrap();
+        assert_eq!(lifetime.len(), 2);
+        assert_eq!(lifetime.iter().map(|row| row.input_tokens).sum::<i64>(), 37);
     }
 
     #[test]
