@@ -63,6 +63,10 @@ pub struct SkillLibrary {
 }
 
 impl SkillLibrary {
+    pub fn from_parts(skills: Vec<Skill>, warnings: Vec<String>) -> Self {
+        Self { skills, warnings }
+    }
+
     /// Discover skills from the four locations. Missing/unreadable directories are silently
     /// ignored; invalid skills are skipped with a warning (never a crash).
     pub fn load(project_root: &Path) -> Self {
@@ -152,15 +156,35 @@ impl SkillLibrary {
         })
     }
 
+    /// Like `load` but filters out skills whose names are in `disabled`.
+    /// The full library is still returned as `self` for the popup; this is only for the
+    /// two injection points (eager prompt + lazy expand).
+    pub fn enabled_only(&self, disabled: &std::collections::HashSet<String>) -> Vec<&Skill> {
+        self.skills
+            .iter()
+            .filter(|s| !disabled.contains(&s.name))
+            .collect()
+    }
+
     /// Render the eager block for the system prompt: `name: description` per skill.
     /// `allowed-tools` is included as a hint when present (not a filter).
+    /// Disabled skills are omitted.
+    #[allow(dead_code)]
     pub fn eager_block(&self) -> Option<String> {
-        if self.skills.is_empty() {
+        self.eager_block_filtered(&std::collections::HashSet::new())
+    }
+
+    pub fn eager_block_filtered(
+        &self,
+        disabled: &std::collections::HashSet<String>,
+    ) -> Option<String> {
+        let enabled: Vec<&Skill> = self.enabled_only(disabled);
+        if enabled.is_empty() {
             return None;
         }
         let mut block =
             String::from("Available skills (invoke with /<skill-name> or /skill:<name>):");
-        for skill in &self.skills {
+        for skill in enabled {
             block.push_str(&format!("\n- {}: {}", skill.name, skill.description));
             if let Some(tools) = &skill.allowed_tools {
                 block.push_str(&format!(" (tools: {tools})"));
@@ -168,6 +192,27 @@ impl SkillLibrary {
             block.push_str(&format!(" {}", skill.source.badge()));
         }
         Some(block)
+    }
+
+    /// Filtered expand: disabled skills do not expand (both bare and namespaced).
+    pub fn expand_filtered(
+        &self,
+        input: &str,
+        disabled: &std::collections::HashSet<String>,
+    ) -> Option<String> {
+        let rest = input.strip_prefix('/')?;
+        let name = if let Some(after) = rest.strip_prefix("skill:") {
+            after
+                .split_once(char::is_whitespace)
+                .unwrap_or((after, ""))
+                .0
+        } else {
+            rest.split_once(char::is_whitespace).unwrap_or((rest, "")).0
+        };
+        if disabled.contains(name.trim().to_ascii_lowercase().as_str()) {
+            return None;
+        }
+        self.expand(input)
     }
 }
 

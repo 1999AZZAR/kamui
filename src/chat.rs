@@ -13,9 +13,10 @@ use crate::tools;
 use crate::tools::ToolRegistry;
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
+use dialoguer::console::{Key, Term};
 use futures_util::future::join_all;
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -136,6 +137,7 @@ where
     }
     let mut input_rx = input_channel();
     let ui = Ui::stdio();
+    let mut disabled_skills = crate::settings::load_disabled_skills(project.root());
 
     // Rolling context compaction: `summary` folds in messages before `summarized_upto`; the rest of
     // `messages` is sent verbatim. Both reset whenever a command replaces the loaded history.
@@ -186,7 +188,7 @@ where
         // force the skill. The original line is kept for titling.
         let expanded_command = command_library.expand(input);
         let expanded_skill = if expanded_command.is_none() {
-            skill_library.expand(input)
+            skill_library.expand_filtered(input, &disabled_skills)
         } else {
             None
         };
@@ -201,7 +203,34 @@ where
                 continue;
             }
             if command == "/skills" {
-                print_skills(&skill_library);
+                // Non-interactive (piped) fallback: plain list.
+                if !Ui::stdio().interactive() {
+                    print_skills(&skill_library, &disabled_skills);
+                    continue;
+                }
+                let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+                if !is_tty {
+                    print_skills(&skill_library, &disabled_skills);
+                    continue;
+                }
+                // Run popup on a blocking thread so the tokio runtime is not blocked.
+                // Clone the library's data for 'static; the popup needs no live borrow.
+                let skills_snapshot = skill_library.list().to_vec();
+                let warnings_snapshot = skill_library.warnings().to_vec();
+                let root = project.root().to_path_buf();
+                let root2 = root.clone();
+                let mut ds = disabled_skills.clone();
+                let changed = tokio::task::spawn_blocking(move || {
+                    let lib =
+                        crate::skills::SkillLibrary::from_parts(skills_snapshot, warnings_snapshot);
+                    run_skills_popup(&lib, &root, &mut ds)
+                })
+                .await
+                .unwrap_or(Ok(false))
+                .unwrap_or(false);
+                if changed {
+                    disabled_skills = crate::settings::load_disabled_skills(&root2);
+                }
                 continue;
             }
             if command == "/model" {
@@ -420,7 +449,7 @@ where
         // every turn (unlike Kumo's frozen-at-startup snapshot): Kamui is a single interactive
         // process, not a server shared across many chats, so a fact remembered in this turn should
         // be visible on the very next one without needing a restart.
-        let skills_eager = skill_library.eager_block();
+        let skills_eager = skill_library.eager_block_filtered(&disabled_skills);
         let mut system = prompt::build(
             active.tools,
             project.system_message().as_deref(),
@@ -928,9 +957,10 @@ where
     for warning in skill_library.warnings() {
         eprintln!("warning: {warning}");
     }
+    let disabled_skills = crate::settings::load_disabled_skills(project.root());
     let expanded_command = command_library.expand(prompt);
     let expanded_skill = if expanded_command.is_none() {
-        skill_library.expand(prompt)
+        skill_library.expand_filtered(prompt, &disabled_skills)
     } else {
         None
     };
@@ -950,7 +980,7 @@ where
         tool_definitions.push(tools::search_code_definition());
     }
 
-    let skills_eager = skill_library.eager_block();
+    let skills_eager = skill_library.eager_block_filtered(&disabled_skills);
     let mut system = prompt::build(
         active.tools,
         project.system_message().as_deref(),
@@ -2535,7 +2565,10 @@ fn print_usage_report(database: &Database) -> Result<()> {
     Ok(())
 }
 
-fn print_skills(library: &crate::skills::SkillLibrary) {
+fn print_skills(
+    library: &crate::skills::SkillLibrary,
+    disabled: &std::collections::HashSet<String>,
+) {
     if library.list().is_empty() {
         println!("No skills discovered.");
         println!("Create a skill as a folder with SKILL.md:");
@@ -2554,13 +2587,18 @@ fn print_skills(library: &crate::skills::SkillLibrary) {
     }
     println!("Skills (eager: name+description in prompt, body on /<skill> or /skill:<name>):");
     for skill in library.list() {
+        let state = if disabled.contains(&skill.name) {
+            "[disabled]"
+        } else {
+            "[enabled] "
+        };
         let tools_hint = skill
             .allowed_tools
             .as_deref()
             .map(|tools| format!(" [tools: {tools}]"))
             .unwrap_or_default();
         println!(
-            "  /{:<18} {:<18} {}{tools_hint}",
+            "  {state} /{:<18} {:<18} {}{tools_hint}",
             skill.name,
             skill.source.badge(),
             skill.description
@@ -2573,6 +2611,166 @@ fn print_skills(library: &crate::skills::SkillLibrary) {
         }
     }
     println!("\nInvoke with /<skill-name> or /skill:<name> (namespaced, wins over collisions).\n");
+}
+
+/// Interactive popup for `/skills`: grouped by location, arrow keys navigate, Enter toggles
+/// enable/disable (persisted to user vs project settings.json), Esc closes.
+/// Returns `Ok(true)` if any toggle was made (caller should reload `disabled_skills`).
+fn run_skills_popup(
+    library: &crate::skills::SkillLibrary,
+    project_root: &std::path::Path,
+    disabled: &mut std::collections::HashSet<String>,
+) -> anyhow::Result<bool> {
+    if library.list().is_empty() {
+        print_skills(library, disabled);
+        return Ok(false);
+    }
+
+    // Build display order: grouped by SkillSource priority, then name.
+    let mut order: Vec<usize> = (0..library.list().len()).collect();
+    order.sort_by_key(|&i| {
+        let s = &library.list()[i];
+        let rank = match s.source {
+            crate::skills::SkillSource::ProjectKamui => 0,
+            crate::skills::SkillSource::ProjectAgents => 1,
+            crate::skills::SkillSource::GlobalKamui => 2,
+            crate::skills::SkillSource::GlobalAgents => 3,
+        };
+        (rank, s.name.clone())
+    });
+
+    let mut selected: usize = 0;
+    let mut changed = false;
+    let term = Term::stdout();
+
+    // Try to enter raw-ish mode via console Term; fall back to plain list if not a TTY.
+    // We render with manual ANSI and read keys via `Term::read_key`.
+    // Hide cursor during popup; restore on exit.
+    let is_term = term.is_term();
+    if !is_term {
+        print_skills(library, disabled);
+        return Ok(false);
+    }
+
+    // Hide cursor
+    let _ = term.hide_cursor();
+
+    let render = |selected: usize, disabled: &std::collections::HashSet<String>| -> String {
+        let mut out = String::new();
+        out.push_str(
+            "\x1b[1mSkills\x1b[0m  \x1b[2m(↑/↓ navigate · Enter toggle · Esc close)\x1b[0m\n",
+        );
+        let mut last_rank: Option<u8> = None;
+        for (pos, &idx) in order.iter().enumerate() {
+            let skill = &library.list()[idx];
+            let rank = match skill.source {
+                crate::skills::SkillSource::ProjectKamui => 0,
+                crate::skills::SkillSource::ProjectAgents => 1,
+                crate::skills::SkillSource::GlobalKamui => 2,
+                crate::skills::SkillSource::GlobalAgents => 3,
+            };
+            if last_rank != Some(rank) {
+                let label = match skill.source {
+                    crate::skills::SkillSource::ProjectKamui => "project .kamui",
+                    crate::skills::SkillSource::ProjectAgents => "project .agents",
+                    crate::skills::SkillSource::GlobalKamui => "global .kamui",
+                    crate::skills::SkillSource::GlobalAgents => "global .agents",
+                };
+                out.push_str(&format!("\n\x1b[2m─ {} ─\x1b[0m\n", label));
+                last_rank = Some(rank);
+            }
+            let is_on = pos == selected;
+            let enabled = !disabled.contains(&skill.name);
+            let badge = if enabled { "●" } else { "○" };
+            let state = if enabled { "enabled" } else { "disabled" };
+            let prefix = if is_on { "\x1b[7m" } else { "" };
+            let suffix = if is_on { "\x1b[0m" } else { "" };
+            let dim = if enabled { "" } else { "\x1b[2m" };
+            let dim_off = if enabled { "" } else { "\x1b[0m" };
+            out.push_str(&format!(
+                "{prefix}{dim} {badge} /{:<18} {:<18} {} [{state}]{dim_off}{suffix}\n",
+                skill.name,
+                skill.source.badge(),
+                skill.description
+            ));
+        }
+        out.push_str("\n\x1b[2mEnter toggles the selected skill; Esc closes.\x1b[0m");
+        out
+    };
+
+    // Initial draw: clear below and print
+    let mut last_lines: usize = 0;
+    let draw =
+        |selected: usize, disabled: &std::collections::HashSet<String>, last_lines: &mut usize| {
+            let text = render(selected, disabled);
+            let lines = text.matches('\n').count() + 1;
+            if *last_lines > 0 {
+                // Move up and clear
+                let _ = term.write_str(&format!("\x1b[{}A\x1b[J", last_lines));
+            }
+            let _ = term.write_str(&text);
+            let _ = term.flush();
+            *last_lines = lines;
+        };
+
+    draw(selected, disabled, &mut last_lines);
+
+    #[allow(clippy::while_let_loop)]
+    loop {
+        let key = match term.read_key() {
+            Ok(k) => k,
+            Err(_) => break,
+        };
+        match key {
+            Key::ArrowUp => {
+                if selected > 0 {
+                    selected -= 1;
+                } else {
+                    selected = order.len() - 1;
+                }
+                draw(selected, disabled, &mut last_lines);
+            }
+            Key::ArrowDown => {
+                selected = (selected + 1) % order.len();
+                draw(selected, disabled, &mut last_lines);
+            }
+            Key::Enter => {
+                let idx = order[selected];
+                let skill = &library.list()[idx];
+                let was_disabled = disabled.contains(&skill.name);
+                let now_disabled = !was_disabled;
+                // Persist
+                if let Err(e) =
+                    crate::settings::set_skill_disabled(project_root, skill, now_disabled)
+                {
+                    // Show error inline then continue
+                    let _ = term.write_str(&format!("\n\x1b[31mFailed to save: {e}\x1b[0m\n"));
+                    let _ = term.flush();
+                } else {
+                    if now_disabled {
+                        disabled.insert(skill.name.clone());
+                    } else {
+                        disabled.remove(&skill.name);
+                    }
+                    changed = true;
+                }
+                draw(selected, disabled, &mut last_lines);
+            }
+            Key::Escape => break,
+            Key::Char('q') | Key::Char('Q') => break,
+            _ => {}
+        }
+    }
+
+    // Restore cursor and move to next line
+    let _ = term.show_cursor();
+    let _ = term.write_line("");
+    let _ = term.flush();
+
+    if changed {
+        println!("\nUpdated disabledSkills. Changes apply to the next turn.\n");
+    }
+    Ok(changed)
 }
 
 /// List the user's own prompt commands, or explain where to put one when there are none yet.
