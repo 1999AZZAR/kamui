@@ -163,11 +163,50 @@ pub enum StreamEvent {
     },
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    pub cached_tokens: u64,
+}
+
+fn parse_u64(value: &Value) -> u64 {
+    match value {
+        Value::Number(number) => number.as_u64().unwrap_or(0),
+        Value::String(text) => text.parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+impl<'de> Deserialize<'de> for Usage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let map = match &value {
+            Value::Object(map) => map,
+            _ => return Ok(Self::default()),
+        };
+        let prompt_tokens = map.get("prompt_tokens").map(parse_u64).unwrap_or(0);
+        let completion_tokens = map.get("completion_tokens").map(parse_u64).unwrap_or(0);
+        let total_tokens = map.get("total_tokens").map(parse_u64).unwrap_or(0);
+        let cached_tokens = map
+            .get("prompt_tokens_details")
+            .and_then(|details| match details {
+                Value::Object(details_map) => details_map.get("cached_tokens").map(parse_u64),
+                _ => None,
+            })
+            .or_else(|| map.get("cache_read_input_tokens").map(parse_u64))
+            .unwrap_or(0);
+        Ok(Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_tokens,
+        })
+    }
 }
 
 #[async_trait]
@@ -229,5 +268,43 @@ mod tests {
         assert_eq!(message.role_name(), "tool");
         assert_eq!(message.tool_call_id.as_deref(), Some("c1"));
         assert!(message.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn usage_deserializes_openai_cached_tokens() {
+        let usage: Usage = serde_json::from_str(
+            r#"{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_tokens_details":{"cached_tokens":42}}"#,
+        )
+        .unwrap();
+        assert_eq!(usage.cached_tokens, 42);
+    }
+
+    #[test]
+    fn usage_deserializes_anthropic_cache_read() {
+        let usage: Usage = serde_json::from_str(
+            r#"{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"cache_read_input_tokens":37}"#,
+        )
+        .unwrap();
+        assert_eq!(usage.cached_tokens, 37);
+    }
+
+    #[test]
+    fn usage_cached_tokens_defaults_to_zero() {
+        let usage: Usage =
+            serde_json::from_str(r#"{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}"#)
+                .unwrap();
+        assert_eq!(usage.cached_tokens, 0);
+        let null: Usage =
+            serde_json::from_str(r#"{"prompt_tokens":10,"prompt_tokens_details":null}"#).unwrap();
+        assert_eq!(null.cached_tokens, 0);
+    }
+
+    #[test]
+    fn usage_prefers_openai_details_over_anthropic_field() {
+        let usage: Usage = serde_json::from_str(
+            r#"{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":42},"cache_read_input_tokens":99}"#,
+        )
+        .unwrap();
+        assert_eq!(usage.cached_tokens, 42);
     }
 }

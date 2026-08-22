@@ -444,6 +444,7 @@ where
                 usage.prompt_tokens,
                 usage.completion_tokens,
                 usage.total_tokens,
+                usage.cached_tokens,
                 &finish_reason,
                 ttft,
                 started.elapsed(),
@@ -1163,17 +1164,35 @@ fn print_stats(database: &Database, session: &Session, context_window: Option<u6
     println!("Input tokens:  {}", stats.input_tokens);
     println!("Output tokens: {}", stats.output_tokens);
     println!("Total tokens:  {}", stats.total_tokens);
+    if stats.cached_tokens > 0 {
+        let percent = if stats.input_tokens > 0 {
+            (stats.cached_tokens as f64 / stats.input_tokens as f64 * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        println!("Cached tokens: {} ({percent:.0}%)", stats.cached_tokens);
+    }
     if let (Some(last_input), Some(window)) = (stats.last_input_tokens, context_window) {
         let percent = last_input as f64 / window as f64 * 100.0;
-        println!("Last context:  {last_input}/{window} ({percent:.1}%)");
+        print!("Last context:  {last_input}/{window} ({percent:.1}%)");
+        if let Some(cached) = stats.last_cached_tokens.filter(|cached| *cached > 0) {
+            let cached_percent = (cached as f64 / last_input as f64 * 100.0).min(100.0);
+            print!(" | Cached: {cached} ({cached_percent:.0}%)");
+        }
+        println!();
     }
     let by_model = database.model_stats(&session.id)?;
     if by_model.len() > 1 {
         println!("\n--- Per model ---");
         for m in &by_model {
             println!(
-                "  {:<24} {:>3} req  {:>8} in  {:>8} out  {:>8} total",
-                m.model, m.request_count, m.input_tokens, m.output_tokens, m.total_tokens
+                "  {:<24} {:>3} req  {:>8} in  {:>8} out  {:>8} total  {:>8} cached",
+                m.model,
+                m.request_count,
+                m.input_tokens,
+                m.output_tokens,
+                m.total_tokens,
+                m.cached_tokens
             );
         }
     }
@@ -1364,12 +1383,21 @@ fn print_usage(
     input: u64,
     output: u64,
     total: u64,
+    cached: u64,
     finish_reason: &str,
     ttft: Option<Duration>,
     elapsed: Duration,
     context_window: Option<u64>,
 ) {
     print!("Tokens: {input} input + {output} output = {total} total");
+    if cached > 0 {
+        let percent = if input > 0 {
+            (cached as f64 / input as f64 * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        print!(" | Cached: {cached} ({percent:.0}%)");
+    }
     if let Some(window) = context_window {
         let percent = input as f64 / window as f64 * 100.0;
         print!(" | Context: {percent:.1}%");
@@ -1387,6 +1415,7 @@ fn print_usage(
 fn accumulate_usage(total: &mut Usage, round: &Usage) {
     total.completion_tokens += round.completion_tokens;
     total.prompt_tokens = round.prompt_tokens;
+    total.cached_tokens = round.cached_tokens;
     total.total_tokens = total.prompt_tokens + total.completion_tokens;
 }
 
@@ -2189,14 +2218,31 @@ fn print_usage_report(database: &Database) -> Result<()> {
     }
 
     let row = |period: &storage::UsagePeriod| {
-        println!(
-            "  {:<10} {:>4} req  {:>10} in  {:>10} out  {:>10} total",
-            period.period,
-            period.request_count,
-            period.input_tokens,
-            period.output_tokens,
-            period.total_tokens
-        );
+        if period.cached_tokens > 0 {
+            let percent = if period.input_tokens > 0 {
+                (period.cached_tokens as f64 / period.input_tokens as f64 * 100.0).min(100.0)
+            } else {
+                0.0
+            };
+            println!(
+                "  {:<10} {:>4} req  {:>10} in  {:>10} out  {:>10} total  {:>10} cached ({percent:.0}%)",
+                period.period,
+                period.request_count,
+                period.input_tokens,
+                period.output_tokens,
+                period.total_tokens,
+                period.cached_tokens
+            );
+        } else {
+            println!(
+                "  {:<10} {:>4} req  {:>10} in  {:>10} out  {:>10} total",
+                period.period,
+                period.request_count,
+                period.input_tokens,
+                period.output_tokens,
+                period.total_tokens
+            );
+        }
     };
 
     println!("\nLast {USAGE_REPORT_DAYS} days");
@@ -2451,6 +2497,7 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 20,
                 total_tokens: 120,
+                cached_tokens: 10,
             },
         );
         accumulate_usage(
@@ -2459,12 +2506,14 @@ mod tests {
                 prompt_tokens: 150,
                 completion_tokens: 30,
                 total_tokens: 180,
+                cached_tokens: 40,
             },
         );
 
         assert_eq!(total.prompt_tokens, 150); // final round's context size
         assert_eq!(total.completion_tokens, 50); // output summed across rounds
         assert_eq!(total.total_tokens, 200); // last input + all output
+        assert_eq!(total.cached_tokens, 40); // last round wins, like prompt_tokens
     }
 
     #[test]
