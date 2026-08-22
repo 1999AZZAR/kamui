@@ -654,10 +654,10 @@ where
                         if approved {
                             if let Some(state) = plan_mode.as_mut() {
                                 state.status = PlanStatus::Approved;
-                                if let Some(session) = session.as_ref() {
-                                    if let Some(json) = state.plan_json.clone() {
-                                        let _ = database.set_plan(&session.id, &json, "approved");
-                                    }
+                                if let Some(session) = session.as_ref()
+                                    && let Some(json) = state.plan_json.clone()
+                                {
+                                    let _ = database.set_plan(&session.id, &json, "approved");
                                 }
                             }
                             println!("    (plan approved — gate open for this session)\n");
