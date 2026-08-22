@@ -10,6 +10,7 @@ mod mcp;
 mod onboarding;
 mod prompt;
 mod provider;
+mod skills;
 mod storage;
 mod terminal;
 mod tools;
@@ -644,7 +645,7 @@ mod tests {
         assert!(matches!(
             command,
             Command::Benchmark { suite, profile: Some(profile), runs: 3 }
-                if suite == std::path::PathBuf::from("suite.json") && profile == "fast"
+                if *suite == *"suite.json" && profile == "fast"
         ));
     }
 

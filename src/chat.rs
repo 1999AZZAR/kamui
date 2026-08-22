@@ -59,6 +59,10 @@ where
     let mut context_window = active.context_window;
     let job_registry = tools.jobs();
     let command_library = commands::CommandLibrary::load(project.root());
+    let skill_library = crate::skills::SkillLibrary::load(project.root());
+    for warning in skill_library.warnings() {
+        eprintln!("warning: {warning}");
+    }
 
     print_status(
         project,
@@ -176,17 +180,28 @@ where
             continue;
         }
 
-        // A custom command (`/review`, `/test`, ...) expands into this turn's prompt and then
-        // takes the ordinary path below; built-in commands are handled in the block after it. The
-        // original line is kept for titling, since an expanded body can be hundreds of lines.
+        // A custom command (`/review`, ...) or skill (`/my-skill`, `/skill:my-skill`) expands
+        // into this turn's prompt and then takes the ordinary path below. Built-in commands and
+        // custom commands win over a same-named skill on bare `/<name>`; use `/skill:<name>` to
+        // force the skill. The original line is kept for titling.
         let expanded_command = command_library.expand(input);
+        let expanded_skill = if expanded_command.is_none() {
+            skill_library.expand(input)
+        } else {
+            None
+        };
+        let expanded = expanded_command.as_deref().or(expanded_skill.as_deref());
         let title_source = input;
-        let input: &str = expanded_command.as_deref().unwrap_or(input);
+        let input: &str = expanded.unwrap_or(input);
 
-        if expanded_command.is_none() && input.starts_with('/') {
+        if expanded.is_none() && input.starts_with('/') {
             let (command, argument) = input.split_once(' ').unwrap_or((input, ""));
             if command == "/commands" {
                 print_commands(&command_library);
+                continue;
+            }
+            if command == "/skills" {
+                print_skills(&skill_library);
                 continue;
             }
             if command == "/model" {
@@ -405,7 +420,12 @@ where
         // every turn (unlike Kumo's frozen-at-startup snapshot): Kamui is a single interactive
         // process, not a server shared across many chats, so a fact remembered in this turn should
         // be visible on the very next one without needing a restart.
-        let mut system = prompt::build(active.tools, project.system_message().as_deref());
+        let skills_eager = skill_library.eager_block();
+        let mut system = prompt::build(
+            active.tools,
+            project.system_message().as_deref(),
+            skills_eager.as_deref(),
+        );
         let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
         if !memory_snapshot.is_empty() {
             system.push_str("\n\n");
@@ -902,12 +922,21 @@ where
         .unwrap_or_else(|| config.default().clone());
     let provider = build_provider(&active);
 
-    // `kamui -p /review` expands the same custom command interactive chat would, so a command is
-    // scriptable too. The original line is kept for titling, as in `start_chat`.
+    // `kamui -p /review` or `/skill:my-skill` expands the same way interactive chat does.
     let command_library = commands::CommandLibrary::load(project.root());
+    let skill_library = crate::skills::SkillLibrary::load(project.root());
+    for warning in skill_library.warnings() {
+        eprintln!("warning: {warning}");
+    }
     let expanded_command = command_library.expand(prompt);
+    let expanded_skill = if expanded_command.is_none() {
+        skill_library.expand(prompt)
+    } else {
+        None
+    };
+    let expanded = expanded_command.as_deref().or(expanded_skill.as_deref());
     let title_source = prompt;
-    let prompt: &str = expanded_command.as_deref().unwrap_or(prompt);
+    let prompt: &str = expanded.unwrap_or(prompt);
 
     let expanded = project
         .expand_file_references(prompt)
@@ -921,7 +950,12 @@ where
         tool_definitions.push(tools::search_code_definition());
     }
 
-    let mut system = prompt::build(active.tools, project.system_message().as_deref());
+    let skills_eager = skill_library.eager_block();
+    let mut system = prompt::build(
+        active.tools,
+        project.system_message().as_deref(),
+        skills_eager.as_deref(),
+    );
     let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
     if !memory_snapshot.is_empty() {
         system.push_str("\n\n");
@@ -1753,7 +1787,7 @@ async fn run_spawned_agent(
 
     let sub_tools = tools::ToolRegistry::read_only(project.root().to_path_buf());
     let tool_definitions = sub_tools.tool_definitions_only();
-    let system = prompt::build(true, project.system_message().as_deref());
+    let system = prompt::build(true, project.system_message().as_deref(), None);
     let mut messages = vec![Message::system(system), Message::user(&arguments.prompt)];
 
     let mut round = 0usize;
@@ -2419,6 +2453,7 @@ fn format_timestamp(timestamp: i64) -> String {
 
 fn print_help() {
     println!("/plan             Enter Plan Mode (gate mutating tools until plan approved)");
+    println!("/skills           List discovered skills");
     println!("/new              Start a new session");
     println!("/sessions         List saved sessions");
     println!("/resume <id>      Resume a session");
@@ -2498,6 +2533,46 @@ fn print_usage_report(database: &Database) -> Result<()> {
     row(&total);
     println!("\nRequests count chat turns only; tokens include title generation.\n");
     Ok(())
+}
+
+fn print_skills(library: &crate::skills::SkillLibrary) {
+    if library.list().is_empty() {
+        println!("No skills discovered.");
+        println!("Create a skill as a folder with SKILL.md:");
+        println!("  <project>/.kamui/skills/my-skill/SKILL.md  ->  /my-skill  (project)");
+        println!("  <config dir>/kamui/skills/my-skill/SKILL.md ->  /my-skill  (global)");
+        println!(
+            "Compat: .agents/skills is also scanned. Use /skill:<name> if a skill collides with a built-in or command.\n"
+        );
+        for warning in library.warnings() {
+            println!("  warning: {warning}");
+        }
+        if !library.warnings().is_empty() {
+            println!();
+        }
+        return;
+    }
+    println!("Skills (eager: name+description in prompt, body on /<skill> or /skill:<name>):");
+    for skill in library.list() {
+        let tools_hint = skill
+            .allowed_tools
+            .as_deref()
+            .map(|tools| format!(" [tools: {tools}]"))
+            .unwrap_or_default();
+        println!(
+            "  /{:<18} {:<18} {}{tools_hint}",
+            skill.name,
+            skill.source.badge(),
+            skill.description
+        );
+    }
+    if !library.warnings().is_empty() {
+        println!("\nWarnings (invalid skills skipped):");
+        for warning in library.warnings() {
+            println!("  - {warning}");
+        }
+    }
+    println!("\nInvoke with /<skill-name> or /skill:<name> (namespaced, wins over collisions).\n");
 }
 
 /// List the user's own prompt commands, or explain where to put one when there are none yet.

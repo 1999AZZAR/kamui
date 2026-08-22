@@ -45,8 +45,13 @@ call ask_user instead of writing the question as plain text and guessing at thei
 they say next; asking in plain text does not pause the turn or wait for a real answer.";
 
 /// Build the system prompt. The tool guidance is included only when the active profile offers tools,
-/// and any project instructions are appended after it.
-pub fn build(tools_enabled: bool, project_instructions: Option<&str>) -> String {
+/// any project instructions are appended after it, and the eager skill list (name+description)
+/// is appended last so the model knows what skills exist without loading their bodies.
+pub fn build(
+    tools_enabled: bool,
+    project_instructions: Option<&str>,
+    skills_eager: Option<&str>,
+) -> String {
     let mut prompt = String::from(BASE);
     if tools_enabled {
         prompt.push_str("\n\n");
@@ -55,6 +60,10 @@ pub fn build(tools_enabled: bool, project_instructions: Option<&str>) -> String 
     if let Some(instructions) = project_instructions {
         prompt.push_str("\n\n");
         prompt.push_str(instructions);
+    }
+    if let Some(skills) = skills_eager {
+        prompt.push_str("\n\n");
+        prompt.push_str(skills);
     }
     prompt
 }
@@ -65,20 +74,31 @@ mod tests {
 
     #[test]
     fn tool_guidance_is_present_only_when_tools_are_enabled() {
-        let with_tools = build(true, None);
+        let with_tools = build(true, None, None);
         assert!(with_tools.contains("patch_file"));
         assert!(with_tools.contains("Kamui"));
 
-        let without_tools = build(false, None);
+        let without_tools = build(false, None, None);
         assert!(!without_tools.contains("patch_file"));
         assert!(without_tools.contains("Kamui"));
     }
 
     #[test]
     fn project_instructions_are_appended() {
-        let prompt = build(true, Some("Always use tabs, never spaces."));
+        let prompt = build(true, Some("Always use tabs, never spaces."), None);
         assert!(prompt.contains("Always use tabs, never spaces."));
         // Instructions come after the tool guidance.
         assert!(prompt.find("patch_file").unwrap() < prompt.find("tabs").unwrap());
+    }
+
+    #[test]
+    fn skills_eager_block_is_appended_last() {
+        let prompt = build(
+            true,
+            Some("Use tabs."),
+            Some("Available skills:\n- review: Review code"),
+        );
+        assert!(prompt.contains("Available skills"));
+        assert!(prompt.find("tabs").unwrap() < prompt.find("Available skills").unwrap());
     }
 }
