@@ -1337,8 +1337,8 @@ fn encode_embedding(vector: &[f32]) -> Vec<u8> {
 
 fn decode_embedding(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("chunks_exact(4) yields 4 bytes")))
+        .chunks(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("chunks(4) yields 4 bytes")))
         .collect()
 }
 
