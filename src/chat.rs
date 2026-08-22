@@ -108,6 +108,28 @@ where
             (None, Vec::new())
         }
     };
+    // Restore pending plan on resume/startup.
+    let mut plan_mode: Option<PlanModeState> = session
+        .as_ref()
+        .and_then(|s| database.get_plan(&s.id).ok().flatten())
+        .and_then(|(json, status)| {
+            let status = match status.as_str() {
+                "pending" => PlanStatus::Pending,
+                "approved" => PlanStatus::Approved,
+                _ => return None,
+            };
+            Some(PlanModeState {
+                status,
+                plan_json: Some(json),
+            })
+        });
+    if let Some(state) = plan_mode.as_ref()
+        && state.status == PlanStatus::Pending
+        && let Some(json) = state.plan_json.as_deref()
+        && let Some(rendered) = tools::render_plan(json)
+    {
+        println!("(Plan Mode — pending plan)\n{rendered}\n");
+    }
     let mut input_rx = input_channel();
     let ui = Ui::stdio();
 
@@ -122,6 +144,8 @@ where
     // Kumo's "Always allow" approval button). Session-scoped: cleared whenever a chat effectively
     // restarts (`/new`, or `/delete` of the active session), same as `last_turn_snapshot`.
     let mut always_allowed: HashSet<String> = HashSet::new();
+    // `/plan` forces the next turn into Plan Mode even for a small task.
+    let mut plan_requested = false;
 
     'chat: loop {
         print!("> ");
@@ -211,6 +235,11 @@ where
                 }
                 continue;
             }
+            if command == "/plan" {
+                plan_requested = true;
+                println!("Plan Mode requested — next turn will require a plan.\n");
+                continue;
+            }
             if command == "/undo" {
                 match last_turn_snapshot.take() {
                     Some(snapshot) => {
@@ -244,6 +273,7 @@ where
                 }
                 continue;
             }
+            let prev_session_id = session.as_ref().map(|s| s.id.clone());
             let messages_before = messages.len();
             if let Err(error) = handle_command(
                 input,
@@ -256,6 +286,37 @@ where
                 &mut last_turn_snapshot,
             ) {
                 eprintln!("Command failed: {error:#}\n");
+            }
+            // Sync Plan Mode with session changes from /new /resume /delete.
+            let new_session_id = session.as_ref().map(|s| s.id.clone());
+            if prev_session_id != new_session_id {
+                if let Some(id) = new_session_id {
+                    plan_mode = database
+                        .get_plan(&id)
+                        .ok()
+                        .flatten()
+                        .and_then(|(json, status)| {
+                            let status = match status.as_str() {
+                                "pending" => PlanStatus::Pending,
+                                "approved" => PlanStatus::Approved,
+                                _ => return None,
+                            };
+                            Some(PlanModeState {
+                                status,
+                                plan_json: Some(json),
+                            })
+                        });
+                    if let Some(state) = plan_mode.as_ref()
+                        && state.status == PlanStatus::Pending
+                        && let Some(json) = state.plan_json.as_deref()
+                        && let Some(rendered) = tools::render_plan(json)
+                    {
+                        println!("(Plan Mode — pending plan)\n{rendered}\n");
+                    }
+                } else {
+                    plan_mode = None;
+                    plan_requested = false;
+                }
             }
             // Compaction state is tied to the current history; reset it if a command replaced it.
             if messages.len() != messages_before {
@@ -275,16 +336,42 @@ where
         };
 
         let model = active.model.clone();
+        // Plan Mode: auto-enter for ≥3-step tasks (heuristic on prompt) or manual /plan.
+        // Also auto-enter when model first calls update_plan with ≥3 steps (prompt heuristic
+        // is not the only signal — Q1=B covers both).
+        let should_enter_plan =
+            plan_requested || (plan_mode.is_none() && looks_like_multi_step(input));
+        if should_enter_plan && active.tools {
+            plan_mode = Some(PlanModeState {
+                status: PlanStatus::Pending,
+                plan_json: None,
+            });
+            plan_requested = false;
+            if let Some(session) = session.as_ref() {
+                let _ = database.set_plan(&session.id, "{}", "pending");
+            }
+            println!("(Plan Mode — only read-only tools + update_plan until approved)\n");
+        } else if plan_requested {
+            plan_requested = false;
+        }
         // Some models/endpoints reject the `tools` field; a profile can opt out so plain chat works.
-        let mut tool_definitions = if active.tools {
-            tools.definitions()
+        // In Plan Mode (pending), only read-only + update_plan + ask_user/search_code/spawn_agent.
+        let is_plan_pending = plan_mode
+            .as_ref()
+            .is_some_and(|s| s.status == PlanStatus::Pending);
+        let tool_definitions = if active.tools {
+            if is_plan_pending {
+                plan_mode_definitions(project.root(), active.embedding_model.is_some())
+            } else {
+                let mut defs = tools.definitions();
+                if active.embedding_model.is_some() {
+                    defs.push(tools::search_code_definition());
+                }
+                defs
+            }
         } else {
             Vec::new()
         };
-        // search_code is only offered when this profile has somewhere to embed a query against.
-        if active.tools && active.embedding_model.is_some() {
-            tool_definitions.push(tools::search_code_definition());
-        }
 
         // Auto-compact older history once the recent portion grows past the threshold.
         summarized_upto = summarized_upto.min(messages.len());
@@ -484,6 +571,27 @@ where
                     }
                 }
             };
+            // Plan Mode: auto-enter on first update_plan with ≥3 steps (Q1=B).
+            if plan_mode.is_none() {
+                for call in &tool_calls {
+                    if call.name == tools::UPDATE_PLAN_TOOL
+                        && let Some(count) = tools::plan_step_count(&call.arguments)
+                        && count >= 3
+                    {
+                        plan_mode = Some(PlanModeState {
+                            status: PlanStatus::Pending,
+                            plan_json: None,
+                        });
+                        if let Some(session) = session.as_ref() {
+                            let _ = database.set_plan(&session.id, "{}", "pending");
+                        }
+                        println!(
+                            "(Plan Mode — only read-only tools + update_plan until approved)\n"
+                        );
+                        break;
+                    }
+                }
+            }
             for call in &tool_calls {
                 let tool_started = Instant::now();
                 if call.name == tools::UPDATE_PLAN_TOOL
@@ -491,10 +599,64 @@ where
                 {
                     println!("  \u{2192} plan");
                     println!("{rendered}");
+                    // Persist plan: pending stays pending, approved stays tracker.
+                    if let Some(state) = plan_mode.as_mut() {
+                        state.plan_json = Some(call.arguments.clone());
+                        let status = match state.status {
+                            PlanStatus::Pending => "pending",
+                            PlanStatus::Approved => "approved",
+                        };
+                        if let Some(session) = session.as_ref() {
+                            let _ = database.set_plan(&session.id, &call.arguments, status);
+                        }
+                    }
+                    // Inline approval prompt when a plan is pending and this is the plan call.
+                    if plan_mode
+                        .as_ref()
+                        .is_some_and(|s| s.status == PlanStatus::Pending)
+                    {
+                        print!("    Plan ready — approve? [y/N] ");
+                        io::stdout().flush()?;
+                        let answer = tokio::select! {
+                            answer = input_rx.recv() => answer,
+                            signal = tokio::signal::ctrl_c() => {
+                                signal.context("failed to listen for Ctrl+C")?;
+                                revert_on_cancel(&turn_snapshot);
+                                println!("\n(interrupted — back to prompt)\n");
+                                continue 'chat;
+                            }
+                        };
+                        let approved = matches!(
+                            answer.as_deref().map(str::trim),
+                            Some("y" | "Y" | "yes" | "Yes")
+                        );
+                        if approved {
+                            if let Some(state) = plan_mode.as_mut() {
+                                state.status = PlanStatus::Approved;
+                                if let Some(session) = session.as_ref() {
+                                    if let Some(json) = state.plan_json.clone() {
+                                        let _ = database.set_plan(&session.id, &json, "approved");
+                                    }
+                                }
+                            }
+                            println!("    (plan approved — gate open for this session)\n");
+                        } else {
+                            println!(
+                                "    (plan not approved — still in Plan Mode, propose a revised plan)\n"
+                            );
+                        }
+                    }
                 } else {
                     println!("  \u{2192} {}", render_tool_call(call));
                 }
-                let output = if call.name == tools::ASK_USER_TOOL {
+                // In pending Plan Mode, hold mutating tools.
+                let is_mutating_held = plan_mode
+                    .as_ref()
+                    .is_some_and(|s| s.status == PlanStatus::Pending)
+                    && is_mutating_tool(&call.name);
+                let output = if is_mutating_held {
+                    "Plan Mode is active — propose a plan with update_plan and wait for approval before mutating tools.".to_string()
+                } else if call.name == tools::ASK_USER_TOOL {
                     tokio::select! {
                         output = ask_user(&mut input_rx, &call.arguments) => output?,
                         signal = tokio::signal::ctrl_c() => {
@@ -634,6 +796,21 @@ where
             &active.model,
             &final_finish,
         )?;
+        // Persist plan state after save (session now exists). Approved clears pending.
+        if let Some(state) = plan_mode.as_ref() {
+            match state.status {
+                PlanStatus::Approved => {
+                    if let Some(json) = state.plan_json.as_deref() {
+                        let _ = database.set_plan(&active_session.id, json, "approved");
+                    }
+                }
+                PlanStatus::Pending => {
+                    if let Some(json) = state.plan_json.as_deref() {
+                        let _ = database.set_plan(&active_session.id, json, "pending");
+                    }
+                }
+            }
+        }
         if active_session.title == "New chat" {
             active_session.title = make_title(title_source);
         }
@@ -1048,6 +1225,9 @@ fn handle_command(
             }
             *messages = database.load_messages(&resumed.id)?;
             println!("Resumed: {} ({})\n", resumed.title, short_id(&resumed.id));
+            // Note: Plan Mode restore is handled by the main loop's plan_mode state;
+            // /resume via handle_command is not the startup resume path, so we don't
+            // rehydrate here — the caller would need &mut plan_mode.
             *session = Some(resumed);
             print_history_preview(messages);
         }
@@ -1961,6 +2141,60 @@ fn is_memory_tool(name: &str) -> bool {
     )
 }
 
+// --- Plan Mode (ticket #9) ---
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlanStatus {
+    Pending,
+    Approved,
+}
+
+#[derive(Debug, Clone)]
+struct PlanModeState {
+    status: PlanStatus,
+    plan_json: Option<String>,
+}
+
+fn looks_like_multi_step(input: &str) -> bool {
+    // Heuristic: ≥3 bullet/numbered lines or explicit "step" mentions.
+    let lines: Vec<&str> = input.lines().collect();
+    let mut hits = 0usize;
+    for line in &lines {
+        let t = line.trim();
+        if t.starts_with("- ")
+            || t.starts_with("* ")
+            || t.starts_with("- [")
+            || (t.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains(". "))
+        {
+            hits += 1;
+        }
+        if t.to_ascii_lowercase().contains("step") {
+            hits += 1;
+        }
+    }
+    hits >= 3
+}
+
+fn is_mutating_tool(name: &str) -> bool {
+    matches!(
+        name,
+        tools::PATCH_FILE_TOOL | "run_command" | "command_status" | "stop_command"
+    )
+}
+
+fn plan_mode_definitions(
+    root: &std::path::Path,
+    has_embedding: bool,
+) -> Vec<crate::provider::ToolDefinition> {
+    let mut defs = tools::ToolRegistry::plan_mode(root.to_path_buf()).definitions();
+    // plan_mode() already includes update_plan; add ask_user/spawn_agent/memory via definitions()
+    // which plan_mode's definitions() already includes. Add search_code if available.
+    if has_embedding {
+        defs.push(tools::search_code_definition());
+    }
+    defs
+}
+
 #[derive(serde::Deserialize)]
 struct FactArguments {
     fact: String,
@@ -2155,6 +2389,7 @@ fn format_timestamp(timestamp: i64) -> String {
 }
 
 fn print_help() {
+    println!("/plan             Enter Plan Mode (gate mutating tools until plan approved)");
     println!("/new              Start a new session");
     println!("/sessions         List saved sessions");
     println!("/resume <id>      Resume a session");
