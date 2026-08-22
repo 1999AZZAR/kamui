@@ -309,6 +309,8 @@ impl Database {
         if version < 11 {
             connection.execute_batch(
                 "ALTER TABLE usage_records ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN plan_json TEXT;
+                 ALTER TABLE sessions ADD COLUMN plan_status TEXT CHECK (plan_status IN ('pending', 'approved'));
                  PRAGMA user_version = 11;",
             )?;
         }
@@ -872,6 +874,43 @@ impl Database {
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
         self.connection
             .execute("DELETE FROM sessions WHERE id = ?1", [session_id])?;
+        Ok(())
+    }
+
+    /// Plan Mode gate (ticket #9): pending/approved plan JSON stored per session.
+    /// `plan_json` holds the raw `update_plan` arguments (e.g. `{"plan":[...]}`),
+    /// `plan_status` is `pending` until the user approves with `y`.
+    pub fn get_plan(&self, session_id: &str) -> Result<Option<(String, String)>> {
+        self.connection
+            .query_row(
+                "SELECT plan_json, plan_status FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| {
+                    let json: Option<String> = row.get(0)?;
+                    let status: Option<String> = row.get(1)?;
+                    Ok(match (json, status) {
+                        (Some(j), Some(s)) => Some((j, s)),
+                        _ => None,
+                    })
+                },
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn set_plan(&self, session_id: &str, plan_json: &str, status: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE sessions SET plan_json = ?2, plan_status = ?3, updated_at = unixepoch() WHERE id = ?1",
+            params![session_id, plan_json, status],
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_plan(&self, session_id: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE sessions SET plan_json = NULL, plan_status = NULL, updated_at = unixepoch() WHERE id = ?1",
+            [session_id],
+        )?;
         Ok(())
     }
 
