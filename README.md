@@ -68,6 +68,23 @@ api_key = "ollama"                        # Ollama ignores this, but a value is 
 # tools = false                           # set this if the model rejects the tools field
 ```
 
+**Anthropic (Claude) via OpenAI-compatible proxy** (LiteLLM, `openai-to-anthropic`, etc.):
+
+```toml
+model = "claude-sonnet-4-5"               # model id as exposed by your proxy
+[provider]
+base_url = "http://localhost:4000/v1"     # shim that translates /v1/chat/completions → /v1/messages
+api_key = "sk-..."                        # proxy API key
+```
+
+Kamui drives Claude through the existing OpenAI-compatible `Provider` — no native Anthropic
+adapter. Point `base_url` at a shim that translates `POST /v1/chat/completions` to Anthropic
+`POST /v1/messages`. Cache-hit visibility works through the shim: Anthropic
+`cache_read_input_tokens` is surfaced via the same dual-path `Usage` deserializer as OpenAI
+`prompt_tokens_details.cached_tokens`, so the per-turn usage line and `/stats`/`/usage` show
+`cached_tokens` without native code. Prompt-caching `cache_control` and extended thinking remain
+native-only and are intentionally deferred (see `docs/research/anthropic-native-adapter-vs-shim.md`).
+
 Many small local models do not support tool calling and reject requests that include tools. If you
 see an error like `<model> does not support tools`, add `tools = false` to that profile — Kamui then
 chats without offering tools.
