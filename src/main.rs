@@ -10,6 +10,7 @@ mod mcp;
 mod onboarding;
 mod prompt;
 mod provider;
+mod settings;
 mod skills;
 mod storage;
 mod terminal;
