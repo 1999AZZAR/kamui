@@ -76,6 +76,14 @@ impl Ui {
         self.interactive
     }
 
+    #[cfg(test)]
+    pub fn plain() -> Self {
+        Self {
+            interactive: false,
+            color: false,
+        }
+    }
+
     pub fn tool_outcome(self, output: &str, elapsed: Duration) -> String {
         if !self.interactive {
             return match output.strip_prefix("Error: ") {

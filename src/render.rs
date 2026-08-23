@@ -166,7 +166,7 @@ mod tests {
     use super::*;
 
     fn ui() -> Ui {
-        Ui::stdio() // non-TTY in tests: plain output, deterministic layout
+        Ui::plain()
     }
 
     #[test]
