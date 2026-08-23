@@ -10,6 +10,7 @@
 //!
 //! Project shadows global; `.kamui` wins over `.agents` at the same level.
 
+use anyhow::Context;
 use std::path::{Path, PathBuf};
 
 /// Where a skill was discovered. Ordered by precedence (lower index = higher priority).
@@ -70,6 +71,10 @@ impl SkillLibrary {
     /// Discover skills from the four locations. Missing/unreadable directories are silently
     /// ignored; invalid skills are skipped with a warning (never a crash).
     pub fn load(project_root: &Path) -> Self {
+        Self::load_with_global(project_root, true)
+    }
+
+    fn load_with_global(project_root: &Path, include_global: bool) -> Self {
         let mut skills: Vec<Skill> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
 
@@ -88,11 +93,13 @@ impl SkillLibrary {
         );
 
         // Global locations.
-        if let Ok(dir) = global_kamui_skills_dir() {
-            load_dir(&dir, SkillSource::GlobalKamui, &mut skills, &mut warnings);
-        }
-        if let Ok(dir) = global_agents_skills_dir() {
-            load_dir(&dir, SkillSource::GlobalAgents, &mut skills, &mut warnings);
+        if include_global {
+            if let Ok(dir) = global_kamui_skills_dir() {
+                load_dir(&dir, SkillSource::GlobalKamui, &mut skills, &mut warnings);
+            }
+            if let Ok(dir) = global_agents_skills_dir() {
+                load_dir(&dir, SkillSource::GlobalAgents, &mut skills, &mut warnings);
+            }
         }
 
         skills.sort_by(|a, b| a.name.cmp(&b.name));
@@ -221,11 +228,12 @@ fn global_kamui_skills_dir() -> anyhow::Result<PathBuf> {
 }
 
 fn global_agents_skills_dir() -> anyhow::Result<PathBuf> {
-    // Compat: global .agents is beside the kamui config dir, e.g. ~/.config/agents/skills
-    // (global_config_dir is ~/.config/kamui, so parent is ~/.config).
-    let kamui_dir = crate::config::global_config_dir()?;
-    let parent = kamui_dir.parent().unwrap_or(&kamui_dir);
-    Ok(parent.join("agents/skills"))
+    // Compat: global .agents is at HOME/.agents/skills (e.g. ~/.agents/skills),
+    // not beside the OS config dir (which is ~/Library/Application Support/kamui on macOS).
+    let home = directories::BaseDirs::new()
+        .map(|dirs| dirs.home_dir().to_path_buf())
+        .context("could not determine home directory")?;
+    Ok(home.join(".agents/skills"))
 }
 
 fn load_dir(dir: &Path, source: SkillSource, skills: &mut Vec<Skill>, warnings: &mut Vec<String>) {
@@ -441,7 +449,7 @@ mod tests {
             "code-review",
             "---\nname: code-review\ndescription: Review code\n---\n\nYou are a reviewer.\n",
         );
-        let library = SkillLibrary::load(&root);
+        let library = SkillLibrary::load_with_global(&root, false);
         let skill = library.find("code-review").unwrap();
         assert_eq!(skill.description, "Review code");
         assert_eq!(skill.body, "You are a reviewer.");
@@ -459,7 +467,7 @@ mod tests {
             "my-skill",
             "---\nname: other-name\ndescription: desc\n---\n\nBody\n",
         );
-        let library = SkillLibrary::load(&root);
+        let library = SkillLibrary::load_with_global(&root, false);
         assert!(library.is_empty());
         assert!(
             library
@@ -479,7 +487,7 @@ mod tests {
             "bad-skill",
             "---\nname: bad-skill\n---\n\nBody\n",
         );
-        let library = SkillLibrary::load(&root);
+        let library = SkillLibrary::load_with_global(&root, false);
         assert!(library.is_empty());
         assert!(
             library
@@ -499,7 +507,7 @@ mod tests {
             "Bad_Name",
             "---\nname: Bad_Name\ndescription: desc\n---\n\nBody\n",
         );
-        let library = SkillLibrary::load(&root);
+        let library = SkillLibrary::load_with_global(&root, false);
         assert!(library.is_empty());
         assert!(!library.warnings().is_empty());
         fs::remove_dir_all(root).unwrap();
@@ -521,7 +529,7 @@ mod tests {
             "my-skill",
             "---\nname: my-skill\ndescription: from agents\n---\n\nAgents body\n",
         );
-        let library = SkillLibrary::load(&root);
+        let library = SkillLibrary::load_with_global(&root, false);
         assert_eq!(library.list().len(), 1);
         assert_eq!(library.find("my-skill").unwrap().description, "from kamui");
         assert_eq!(
@@ -540,7 +548,7 @@ mod tests {
             "my-skill",
             "---\nname: my-skill\ndescription: desc\nallowed-tools: read_file, grep\n---\n\nBody\n",
         );
-        let library = SkillLibrary::load(&root);
+        let library = SkillLibrary::load_with_global(&root, false);
         let skill = library.find("my-skill").unwrap();
         assert_eq!(skill.allowed_tools.as_deref(), Some("read_file, grep"));
         fs::remove_dir_all(root).unwrap();
@@ -555,7 +563,7 @@ mod tests {
             "my-skill",
             "---\nname: my-skill\ndescription: desc\n---\n\nBody text\n",
         );
-        let library = SkillLibrary::load(&root);
+        let library = SkillLibrary::load_with_global(&root, false);
         assert_eq!(library.expand("/my-skill").unwrap(), "Body text");
         assert_eq!(library.expand("/skill:my-skill").unwrap(), "Body text");
         assert_eq!(
@@ -579,7 +587,7 @@ mod tests {
             "my-skill",
             "---\nname: my-skill\ndescription: Does stuff\n---\n\nBody\n",
         );
-        let library = SkillLibrary::load(&root);
+        let library = SkillLibrary::load_with_global(&root, false);
         let block = library.eager_block().unwrap();
         assert!(block.contains("my-skill"));
         assert!(block.contains("Does stuff"));
@@ -590,7 +598,7 @@ mod tests {
     fn missing_skill_md_is_warning() {
         let root = project();
         fs::create_dir_all(root.join(".kamui/skills/empty-skill")).unwrap();
-        let library = SkillLibrary::load(&root);
+        let library = SkillLibrary::load_with_global(&root, false);
         assert!(library.is_empty());
         assert!(
             library
@@ -610,7 +618,7 @@ mod tests {
             "help",
             "---\nname: help\ndescription: Help skill\n---\n\nHelp body\n",
         );
-        let library = SkillLibrary::load(&root);
+        let library = SkillLibrary::load_with_global(&root, false);
         // Bare /help must not expand the skill (reserved).
         assert!(library.expand("/help").is_none());
         // Namespaced form still works.
@@ -627,7 +635,7 @@ mod tests {
             "no-frontmatter",
             "Just body without frontmatter\n",
         );
-        let library = SkillLibrary::load(&root);
+        let library = SkillLibrary::load_with_global(&root, false);
         assert!(library.is_empty());
         assert!(!library.warnings().is_empty());
         fs::remove_dir_all(root).unwrap();
