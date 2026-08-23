@@ -26,6 +26,8 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("status", "Show project and connection status"),
     ("memory", "List remembered facts"),
     ("forget", "Forget a remembered fact"),
+    ("expand", "Expand the last transcript card"),
+    ("collapse", "Collapse the last transcript card"),
     ("exit", "Save and quit"),
     ("plan", "Enter Plan Mode"),
     ("skills", "List discovered skills"),
@@ -193,7 +195,8 @@ impl Helper for SlashCompleter {}
 /// Whether the line editor + popup should be active.
 /// Matches `Ui::stdio().interactive()` (TTY on both stdin/stdout + NO_COLOR not set).
 pub fn is_interactive() -> bool {
-    crate::terminal::Ui::stdio().interactive()
+    let ui = crate::terminal::Ui::stdio();
+    ui.interactive() && std::env::var_os("NO_COLOR").is_none()
 }
 
 pub fn editor_config() -> Config {

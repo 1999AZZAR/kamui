@@ -363,6 +363,12 @@ they were created, have a 30-minute safety timeout, retain capped stdout/stderr 
 and missed recurring runs are coalesced rather than replayed in a burst. This queue is separate from
 the temporary `run_command(background: true)` jobs owned by an active chat process.
 
+### Interactive transcript UI
+
+When launched from an interactive terminal, Kamui uses a retained transcript UI with colored cards for user prompts, tool calls, tool output, assistant responses, warnings, and errors. The transcript wraps text to terminal display width, preserves Markdown emphasis and fenced-code styling, and returns to the normal terminal screen when the process exits. `-p`, pipes, redirects, and `NO_COLOR` retain the script-friendly line-oriented output path.
+
+The latest transcript card can be collapsed or expanded with `/collapse` and `/expand`. The command popup remains available for slash commands, while tool approval and Plan Mode notices are shown inside the transcript surface.
+
 ### Session commands
 
 | Command | Description |
@@ -383,6 +389,8 @@ the temporary `run_command(background: true)` jobs owned by an active chat proce
 | `/usage` | Show token usage by day and month, across all sessions |
 | `/memory` | List facts Kamui remembers across sessions and projects |
 | `/forget <text>` | Forget one remembered fact, or `/forget all` |
+| `/expand` | Expand the latest transcript card |
+| `/collapse` | Collapse the latest transcript card |
 | `/help` | List available commands |
 | `/exit` | Save and quit |
 

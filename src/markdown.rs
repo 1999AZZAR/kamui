@@ -11,6 +11,10 @@
 //! italics are skipped for the same reason (`src/*.rs`). Only unambiguous constructs are styled.
 
 use crate::terminal::{BOLD, CYAN, DIM, RESET};
+use ratatui::{
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+};
 use std::io::IsTerminal;
 
 /// Line-buffered renderer for one streamed response. Holds the partial line and whether the
@@ -91,6 +95,103 @@ impl Renderer {
             None => inline(line),
         }
     }
+}
+
+/// Render the supported Markdown subset into owned Ratatui spans. This mirrors the streaming ANSI
+/// renderer while keeping formatting semantic so the fullscreen transcript can wrap and scroll.
+pub fn render_ratatui(text: &str) -> Text<'static> {
+    let mut in_fence = false;
+    let mut lines = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim_end_matches(['\r', '\n']);
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            lines.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else if in_fence {
+            lines.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(Color::Cyan),
+            )));
+        } else if is_heading(trimmed) {
+            lines.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+        } else if trimmed.starts_with('>') || is_horizontal_rule(trimmed) {
+            lines.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else if let Some((marker, rest)) = split_list_marker(line) {
+            let mut spans = vec![Span::styled(
+                marker.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )];
+            spans.extend(ratatui_inline(rest));
+            lines.push(Line::from(spans));
+        } else {
+            lines.push(Line::from(ratatui_inline(line)));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(String::new()));
+    }
+    Text::from(lines)
+}
+
+fn ratatui_inline(text: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut plain = String::new();
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    let flush = |spans: &mut Vec<Span<'static>>, plain: &mut String| {
+        if !plain.is_empty() {
+            spans.push(Span::raw(std::mem::take(plain)));
+        }
+    };
+    while index < bytes.len() {
+        if bytes[index] == b'`'
+            && let Some(end) = text[index + 1..].find('`').map(|at| index + 1 + at)
+        {
+            flush(&mut spans, &mut plain);
+            spans.push(Span::styled(
+                text[index + 1..end].to_string(),
+                Style::default().fg(Color::Cyan),
+            ));
+            index = end + 1;
+            continue;
+        }
+        if bytes[index] == b'*'
+            && bytes.get(index + 1) == Some(&b'*')
+            && let Some(end) = text[index + 2..].find("**").map(|at| index + 2 + at)
+        {
+            let inner = &text[index + 2..end];
+            if !inner.is_empty()
+                && !inner.starts_with(char::is_whitespace)
+                && !inner.ends_with(char::is_whitespace)
+            {
+                flush(&mut spans, &mut plain);
+                spans.push(Span::styled(
+                    inner.to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+                index = end + 2;
+                continue;
+            }
+        }
+        let character = text[index..]
+            .chars()
+            .next()
+            .expect("index is on a boundary");
+        plain.push(character);
+        index += character.len_utf8();
+    }
+    flush(&mut spans, &mut plain);
+    spans
 }
 
 fn is_heading(trimmed: &str) -> bool {
@@ -294,5 +395,32 @@ mod tests {
     #[test]
     fn carriage_returns_are_stripped_from_line_ends() {
         assert_eq!(Renderer::new(true).render_block("plain\r\n"), "plain\n");
+    }
+
+    #[test]
+    fn ratatui_renderer_keeps_semantic_markdown_spans() {
+        let text =
+            render_ratatui("# Title\nUse `cargo test` and **check** it.\n```rs\nlet x = 1;\n```");
+        assert_eq!(text.lines.len(), 5);
+        assert!(
+            text.lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            text.lines[1]
+                .spans
+                .iter()
+                .any(|span| span.content == "cargo test")
+        );
+        assert!(
+            text.lines[1]
+                .spans
+                .iter()
+                .any(|span| span.content == "check")
+        );
+        assert_eq!(text.lines[3].spans[0].content, "let x = 1;");
+        assert_eq!(text.lines[3].spans[0].style.fg, Some(Color::Cyan));
     }
 }

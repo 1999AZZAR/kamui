@@ -17,6 +17,7 @@ mod storage;
 mod terminal;
 mod tools;
 mod tui;
+mod ui;
 
 use anyhow::{Context, Result};
 use config::Config;
