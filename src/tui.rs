@@ -34,13 +34,11 @@ pub const BUILTINS: &[(&str, &str)] = &[
 struct Candidate {
     /// Without leading `/` (e.g. `help`, `my-skill`)
     name: String,
-    /// `[skill]`, `[cmd]`, or `[builtin]`
-    badge: &'static str,
     description: String,
 }
 
 /// Completer that merges built-ins + custom commands + skills.
-/// Display shows `/{name}  {badge}  {description}`, replacement is `/{name} `.
+/// Display shows `{name}  {description}`, replacement is `/{name} `.
 pub struct SlashCompleter {
     candidates: Vec<Candidate>,
 }
@@ -55,14 +53,12 @@ impl SlashCompleter {
         for (name, desc) in BUILTINS {
             candidates.push(Candidate {
                 name: name.to_string(),
-                badge: "[builtin]",
                 description: desc.to_string(),
             });
         }
         for cmd in commands {
             candidates.push(Candidate {
                 name: cmd.name.clone(),
-                badge: "[cmd]",
                 description: cmd
                     .description
                     .clone()
@@ -75,7 +71,6 @@ impl SlashCompleter {
             }
             candidates.push(Candidate {
                 name: skill.name.clone(),
-                badge: "[skill]",
                 description: skill.description.clone(),
             });
         }
@@ -95,21 +90,18 @@ impl SlashCompleter {
         for (name, desc) in builtins {
             candidates.push(Candidate {
                 name: name.to_string(),
-                badge: "[builtin]",
                 description: desc.to_string(),
             });
         }
         for (name, desc) in commands {
             candidates.push(Candidate {
                 name: name.to_string(),
-                badge: "[cmd]",
                 description: desc.to_string(),
             });
         }
         for (name, desc) in skills {
             candidates.push(Candidate {
                 name: name.to_string(),
-                badge: "[skill]",
                 description: desc.to_string(),
             });
         }
@@ -120,7 +112,8 @@ impl SlashCompleter {
     fn pairs_for(&self, prefix: &str) -> Vec<Pair> {
         // prefix includes leading `/`, e.g. "/" or "/he"
         let needle = prefix.trim_start_matches('/').to_ascii_lowercase();
-        self.candidates
+        let filtered: Vec<&Candidate> = self
+            .candidates
             .iter()
             .filter(|c| {
                 if needle.is_empty() {
@@ -129,8 +122,11 @@ impl SlashCompleter {
                     c.name.to_ascii_lowercase().starts_with(&needle)
                 }
             })
+            .collect();
+        filtered
+            .into_iter()
             .map(|c| Pair {
-                display: format!("/{:<18} {:<9} {}", c.name, c.badge, c.description),
+                display: format!("{:<20}  {}", c.name, c.description),
                 replacement: format!("/{} ", c.name),
             })
             .collect()
@@ -301,18 +297,21 @@ mod tests {
     }
 
     #[test]
-    fn badges_are_correct() {
+    fn display_shows_name_and_description() {
         let c = completer();
         let pairs = c.pairs_for("/");
         let help = pairs.iter().find(|p| p.replacement == "/help ").unwrap();
-        assert!(help.display.contains("[builtin]"));
+        assert!(help.display.contains("help"));
+        assert!(help.display.contains("Show help"));
         let review = pairs.iter().find(|p| p.replacement == "/review ").unwrap();
-        assert!(review.display.contains("[cmd]"));
+        assert!(review.display.contains("review"));
+        assert!(review.display.contains("Review code"));
         let skill = pairs
             .iter()
             .find(|p| p.replacement == "/my-skill ")
             .unwrap();
-        assert!(skill.display.contains("[skill]"));
+        assert!(skill.display.contains("my-skill"));
+        assert!(skill.display.contains("Does stuff"));
     }
 
     #[test]
