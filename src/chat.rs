@@ -135,8 +135,10 @@ where
     {
         println!("(Plan Mode — pending plan)\n{rendered}\n");
     }
-    let mut input_rx = input_channel();
+    let use_tui = crate::tui::is_interactive();
+    let mut input_rx = if use_tui { None } else { Some(input_channel()) };
     let ui = Ui::stdio();
+    let mut tui_history: Vec<String> = Vec::new();
     let mut disabled_skills = crate::settings::load_disabled_skills(project.root());
 
     // Rolling context compaction: `summary` folds in messages before `summarized_upto`; the rest of
@@ -154,24 +156,52 @@ where
     let mut plan_requested = false;
 
     'chat: loop {
-        print!("> ");
-        io::stdout().flush()?;
-
-        let input = tokio::select! {
-            input = input_rx.recv() => match input {
-                Some(input) => input,
+        let input = if use_tui {
+            // Snapshot completer data for this prompt (commands/skills + disabled set).
+            let cmds: Vec<crate::commands::CustomCommand> = command_library.list().to_vec();
+            let sks: Vec<crate::skills::Skill> = skill_library.list().to_vec();
+            let dis = disabled_skills.clone();
+            let hist = tui_history.clone();
+            let line = tokio::task::spawn_blocking(move || {
+                crate::tui::read_line_blocking(&cmds, &sks, &dis, &hist)
+            })
+            .await
+            .unwrap_or(None);
+            match line {
+                Some(s) => s,
                 None => {
                     shutdown(database, session.as_ref(), context_window, &job_registry)?;
                     break;
                 }
-            },
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("failed to listen for Ctrl+C")?;
-                println!();
-                shutdown(database, session.as_ref(), context_window, &job_registry)?;
-                break;
             }
+        } else {
+            print!("> ");
+            io::stdout().flush()?;
+            let rx = input_rx.as_mut().expect("plain mode has input channel");
+            let line = tokio::select! {
+                input = rx.recv() => match input {
+                    Some(input) => input,
+                    None => {
+                        shutdown(database, session.as_ref(), context_window, &job_registry)?;
+                        break;
+                    }
+                },
+                signal = tokio::signal::ctrl_c() => {
+                    signal.context("failed to listen for Ctrl+C")?;
+                    println!();
+                    shutdown(database, session.as_ref(), context_window, &job_registry)?;
+                    break;
+                }
+            };
+            line
         };
+        // Keep TUI history in sync when in TUI mode (plain mode history is via input channel).
+        if use_tui && !input.trim().is_empty() {
+            tui_history.push(input.clone());
+            if tui_history.len() > 1000 {
+                tui_history.remove(0);
+            }
+        }
         let input = input.trim();
 
         if input.eq_ignore_ascii_case("exit") || input == "/exit" {
@@ -668,7 +698,7 @@ where
                         print!("    Plan ready — approve? [y/N] ");
                         io::stdout().flush()?;
                         let answer = tokio::select! {
-                            answer = input_rx.recv() => answer,
+                            answer = read_approval_line(&mut input_rx, use_tui) => answer,
                             signal = tokio::signal::ctrl_c() => {
                                 signal.context("failed to listen for Ctrl+C")?;
                                 revert_on_cancel(&turn_snapshot);
@@ -708,7 +738,7 @@ where
                     "Plan Mode is active — propose a plan with update_plan and wait for approval before mutating tools.".to_string()
                 } else if call.name == tools::ASK_USER_TOOL {
                     tokio::select! {
-                        output = ask_user(&mut input_rx, &call.arguments) => output?,
+                        output = ask_user(&mut input_rx, use_tui, &call.arguments) => output?,
                         signal = tokio::signal::ctrl_c() => {
                             signal.context("failed to listen for Ctrl+C")?;
                             revert_on_cancel(&turn_snapshot);
@@ -756,7 +786,7 @@ where
                     print!("    approve? [y/N/a] ");
                     io::stdout().flush()?;
                     let answer = tokio::select! {
-                        answer = input_rx.recv() => answer,
+                        answer = read_approval_line(&mut input_rx, use_tui) => answer,
                         signal = tokio::signal::ctrl_c() => {
                             signal.context("failed to listen for Ctrl+C")?;
                             revert_on_cancel(&turn_snapshot);
@@ -1212,6 +1242,15 @@ impl Spinner {
 async fn stop_spinner(spinner: &mut Option<Spinner>) {
     if let Some(spinner) = spinner.take() {
         spinner.finish().await;
+    }
+}
+
+fn read_plain_line() -> Option<String> {
+    let mut input = String::new();
+    match std::io::stdin().read_line(&mut input) {
+        Ok(0) => None,
+        Ok(_) => Some(input),
+        Err(_) => None,
     }
 }
 
@@ -1723,8 +1762,22 @@ struct AskUserArguments {
 /// text (a number out of range, or free-form text when no options were offered) is returned as
 /// typed. Returns an `Error: ...` string, not an `Err`, for bad JSON — same convention as
 /// `ToolRegistry::dispatch` — so the model can recover on the next round.
+async fn read_approval_line(
+    input_rx: &mut Option<mpsc::UnboundedReceiver<String>>,
+    use_tui: bool,
+) -> Option<String> {
+    if use_tui {
+        tokio::task::spawn_blocking(read_plain_line)
+            .await
+            .unwrap_or(None)
+    } else {
+        input_rx.as_mut().unwrap().recv().await
+    }
+}
+
 async fn ask_user(
-    input_rx: &mut mpsc::UnboundedReceiver<String>,
+    input_rx: &mut Option<mpsc::UnboundedReceiver<String>>,
+    use_tui: bool,
     arguments: &str,
 ) -> Result<String> {
     let arguments: AskUserArguments = match serde_json::from_str(arguments) {
@@ -1742,7 +1795,14 @@ async fn ask_user(
     print!("    > ");
     io::stdout().flush()?;
 
-    let answer = input_rx.recv().await.unwrap_or_default();
+    let answer = if use_tui {
+        tokio::task::spawn_blocking(read_plain_line)
+            .await
+            .unwrap_or(None)
+            .unwrap_or_default()
+    } else {
+        input_rx.as_mut().unwrap().recv().await.unwrap_or_default()
+    };
     let answer = answer.trim();
     let resolved = answer
         .parse::<usize>()
@@ -3055,30 +3115,34 @@ mod tests {
         assert!(snippet.contains("NEEDLE"));
     }
 
-    fn respond_with(text: &str) -> mpsc::UnboundedReceiver<String> {
+    fn respond_with(text: &str) -> Option<mpsc::UnboundedReceiver<String>> {
         let (sender, receiver) = mpsc::unbounded_channel();
         sender.send(text.to_string()).unwrap();
-        receiver
+        Some(receiver)
     }
 
     #[tokio::test]
     async fn ask_user_rejects_invalid_json_arguments() {
         let mut rx = respond_with("anything");
-        let output = ask_user(&mut rx, "not json").await.unwrap();
+        let output = ask_user(&mut rx, false, "not json").await.unwrap();
         assert!(output.starts_with("Error:"));
     }
 
     #[tokio::test]
     async fn ask_user_rejects_a_blank_question() {
         let mut rx = respond_with("anything");
-        let output = ask_user(&mut rx, r#"{"question":"   "}"#).await.unwrap();
+        let output = ask_user(&mut rx, false, r#"{"question":"   "}"#)
+            .await
+            .unwrap();
         assert!(output.starts_with("Error:"));
     }
 
     #[tokio::test]
     async fn ask_user_returns_free_text_when_no_options_are_offered() {
         let mut rx = respond_with("Tuesday works better");
-        let output = ask_user(&mut rx, r#"{"question":"When?"}"#).await.unwrap();
+        let output = ask_user(&mut rx, false, r#"{"question":"When?"}"#)
+            .await
+            .unwrap();
         assert_eq!(output, "Tuesday works better");
     }
 
@@ -3087,6 +3151,7 @@ mod tests {
         let mut rx = respond_with("2");
         let output = ask_user(
             &mut rx,
+            false,
             r#"{"question":"Pick one","options":["red","green","blue"]}"#,
         )
         .await
@@ -3099,6 +3164,7 @@ mod tests {
         let mut rx = respond_with("99");
         let output = ask_user(
             &mut rx,
+            false,
             r#"{"question":"Pick one","options":["red","green"]}"#,
         )
         .await
@@ -3111,6 +3177,7 @@ mod tests {
         let mut rx = respond_with("actually neither");
         let output = ask_user(
             &mut rx,
+            false,
             r#"{"question":"Pick one","options":["red","green"]}"#,
         )
         .await

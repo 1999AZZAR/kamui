@@ -15,6 +15,7 @@ mod skills;
 mod storage;
 mod terminal;
 mod tools;
+mod tui;
 
 use anyhow::{Context, Result};
 use config::Config;
