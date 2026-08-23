@@ -2537,12 +2537,25 @@ fn truncate(text: &str, max: usize) -> String {
     result
 }
 
-/// First 20 lines, capped at 1000 chars, of a tool result for the boxed preview.
-/// ponytail: fixed preview window; the box truncates each row to terminal width.
+/// Collapsed preview: head/tail trimmed, expand hint — box truncates rows to width.
 fn preview_output(text: &str) -> String {
-    let clipped: String = text.lines().take(20).collect::<Vec<_>>().join("\n");
-    let mut out: String = clipped.chars().take(1000).collect();
-    if clipped.chars().count() > 1000 || text.lines().count() > 20 {
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let preview = if total <= 20 {
+        let clipped = lines.join("\n");
+        let mut out: String = clipped.chars().take(1000).collect();
+        if clipped.chars().count() > 1000 {
+            out.push_str(" … (truncated, collapsed)");
+        }
+        out
+    } else {
+        let head = lines[..10].join("\n");
+        let tail = lines[total - 10..].join("\n");
+        let hidden = total - 20;
+        format!("{head}\n… ({hidden} lines hidden, collapsed) …\n{tail}")
+    };
+    let mut out: String = preview.chars().take(1000).collect();
+    if preview.chars().count() > 1000 {
         out.push('…');
     }
     out
@@ -3078,8 +3091,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let previewed = preview_output(&many_lines);
-        assert_eq!(previewed.lines().count(), 20);
-        assert!(previewed.ends_with('…'));
+        assert!(previewed.contains("lines hidden, collapsed"));
+        assert!(previewed.starts_with("line 0"));
+        assert!(previewed.contains("line 24"));
         assert_eq!(preview_output("short"), "short");
         assert!(!preview_output(&"x".repeat(1200)).ends_with('x'));
     }

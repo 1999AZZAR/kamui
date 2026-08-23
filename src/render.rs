@@ -103,15 +103,15 @@ pub fn render_tool_call(name: &str, args: &str, ui: Ui) -> String {
     )
 }
 
-/// Boxed tool result: `┌─ Tool Output ─…┐`, plain (darker than the call box).
+/// Boxed tool result: `┌─ Tool Output ─…┐`, darker bg than the call box (per prototype).
 pub fn render_tool_output(text: &str, ui: Ui) -> String {
     box_lines(
         "Tool Output",
         &body(text),
         terminal_width(),
         ui,
-        &[Style::Bold],
-        &[],
+        &[Style::BgDark, Style::White, Style::Bold],
+        &[Style::BgDark],
     )
 }
 

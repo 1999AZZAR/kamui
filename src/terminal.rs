@@ -15,6 +15,7 @@ pub const BG_BLUE: &str = "\x1b[44m";
 pub const BG_GREEN: &str = "\x1b[42m";
 pub const BG_RED: &str = "\x1b[41m";
 pub const BG_GRAY: &str = "\x1b[100m";
+pub const BG_DARK: &str = "\x1b[48;5;236m";
 
 /// Minimal semantic styles; `Ui::style` applies one or more, honouring the colour gate.
 #[allow(dead_code)]
@@ -35,6 +36,7 @@ pub enum Style {
     BgGreen,
     BgRed,
     BgGray,
+    BgDark,
 }
 
 impl Style {
@@ -53,6 +55,7 @@ impl Style {
             Style::BgGreen => BG_GREEN,
             Style::BgRed => BG_RED,
             Style::BgGray => BG_GRAY,
+            Style::BgDark => BG_DARK,
         }
     }
 }
