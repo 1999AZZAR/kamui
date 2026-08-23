@@ -6,6 +6,7 @@ use crate::markdown;
 use crate::mcp::ConnectionStatus;
 use crate::prompt;
 use crate::provider::{ChatRequest, Message, Provider, StreamEvent, ToolCall, Usage};
+use crate::render;
 use crate::storage;
 use crate::storage::{Database, Session};
 use crate::terminal::{Style, Ui};
@@ -64,6 +65,7 @@ where
     for warning in skill_library.warnings() {
         eprintln!("warning: {warning}");
     }
+    let ui = Ui::stdio();
 
     print_status(
         project,
@@ -87,8 +89,12 @@ where
         );
     }
     if auto_approve {
-        println!(
-            "\u{26a0} --auto-approve is active: commands and file edits will run without asking."
+        print!(
+            "{}",
+            render::render_warning(
+                "--auto-approve is active: commands and file edits will run without asking",
+                ui
+            )
         );
     }
     println!("Type /help for commands or exit to quit.\n");
@@ -104,12 +110,20 @@ where
                 );
             }
             let messages = database.load_messages(&session.id)?;
-            println!("Resuming: {} ({})\n", session.title, short_id(&session.id));
+            print!(
+                "{}",
+                render::render_system(
+                    &format!("Resuming: {} ({})", session.title, short_id(&session.id)),
+                    ui
+                )
+            );
+            println!();
             print_history_preview(&messages);
             (Some(session), messages)
         }
         None => {
-            println!("New chat\n");
+            print!("{}", render::render_system("New chat", ui));
+            println!();
             (None, Vec::new())
         }
     };
@@ -137,7 +151,6 @@ where
     }
     let use_tui = crate::tui::is_interactive();
     let mut input_rx = if use_tui { None } else { Some(input_channel()) };
-    let ui = Ui::stdio();
     let mut tui_history: Vec<String> = Vec::new();
     let mut disabled_skills = crate::settings::load_disabled_skills(project.root());
 
@@ -210,6 +223,10 @@ where
         }
         if input.is_empty() {
             continue;
+        }
+        // Boxed prompt echo only in plain mode — the TUI already echoes input with a background.
+        if !use_tui {
+            print!("{}", render::render_user_prompt(input, ui));
         }
 
         // A custom command (`/review`, ...) or skill (`/my-skill`, `/skill:my-skill`) expands
@@ -563,8 +580,8 @@ where
                     Err(error) => {
                         stop_spinner(&mut spinner).await;
                         eprintln!(
-                            "{}",
-                            ui.style(&format!("\nRequest failed: {error:#}\n"), &[Style::Red])
+                            "\n{}",
+                            render::render_error(&format!("Request failed: {error:#}"), ui)
                         );
                         revert_on_cancel(&turn_snapshot);
                         continue 'chat;
@@ -621,8 +638,8 @@ where
                         stop_spinner(&mut spinner).await;
                         print!("{}", renderer.finish());
                         eprintln!(
-                            "{}",
-                            ui.style(&format!("\n\nRequest failed: {error:#}\n"), &[Style::Red])
+                            "\n{}",
+                            render::render_error(&format!("Request failed: {error:#}"), ui)
                         );
                         revert_on_cancel(&turn_snapshot);
                         continue 'chat;
@@ -631,10 +648,10 @@ where
                         stop_spinner(&mut spinner).await;
                         print!("{}", renderer.finish());
                         eprintln!(
-                            "{}",
-                            ui.style(
-                                "\n\nRequest failed: provider stream closed unexpectedly\n",
-                                &[Style::Red]
+                            "\n{}",
+                            render::render_error(
+                                "Request failed: provider stream closed unexpectedly",
+                                ui
                             )
                         );
                         revert_on_cancel(&turn_snapshot);
@@ -671,10 +688,17 @@ where
             let spawned_outputs = if spawn_calls.is_empty() {
                 HashMap::new()
             } else {
-                println!(
-                    "  \u{2192} running {} sub-agent(s), up to {MAX_CONCURRENT_SUB_AGENTS} concurrently",
-                    spawn_calls.len()
+                print!(
+                    "{}",
+                    render::render_progress(
+                        &format!(
+                            "running {} sub-agent(s), up to {MAX_CONCURRENT_SUB_AGENTS} concurrently",
+                            spawn_calls.len()
+                        ),
+                        ui
+                    )
                 );
+                println!();
                 tokio::select! {
                     output = dispatch_spawn_agents(
                         provider.as_ref(), &active.model, project, &spawn_calls,
@@ -713,9 +737,9 @@ where
                 if call.name == tools::UPDATE_PLAN_TOOL
                     && let Some(rendered) = tools::render_plan(&call.arguments)
                 {
-                    println!(
+                    print!(
                         "{}",
-                        ui.style("  \u{2192} plan", &[Style::BgGray, Style::White])
+                        render::render_tool_call(&call.name, &call.arguments, ui)
                     );
                     println!("{rendered}");
                     // Persist plan: pending stays pending, approved stays tracker.
@@ -766,12 +790,9 @@ where
                         }
                     }
                 } else {
-                    println!(
+                    print!(
                         "{}",
-                        ui.style(
-                            &format!("  \u{2192} {}", render_tool_call(call)),
-                            &[Style::BgGray, Style::White]
-                        )
+                        render::render_tool_call(&call.name, &call.arguments, ui)
                     );
                 }
                 // In pending Plan Mode, hold mutating tools.
@@ -892,6 +913,12 @@ where
                     .get(&call.id)
                     .map(|(_, elapsed)| *elapsed)
                     .unwrap_or_else(|| tool_started.elapsed());
+                if !output.starts_with("Error: ") && !output.is_empty() {
+                    print!(
+                        "{}",
+                        render::render_tool_output(&preview_output(&output), ui)
+                    );
+                }
                 println!("{}", ui.tool_outcome(&output, elapsed));
                 let result_message = Message::tool_result(&call.id, output);
                 turn_messages.push(result_message.clone());
@@ -1119,18 +1146,15 @@ where
             if call.name == tools::UPDATE_PLAN_TOOL
                 && let Some(rendered) = tools::render_plan(&call.arguments)
             {
-                println!(
+                print!(
                     "{}",
-                    ui.style("  \u{2192} plan", &[Style::BgGray, Style::White])
+                    render::render_tool_call(&call.name, &call.arguments, ui)
                 );
                 println!("{rendered}");
             } else {
-                println!(
+                print!(
                     "{}",
-                    ui.style(
-                        &format!("  \u{2192} {}", render_tool_call(call)),
-                        &[Style::BgGray, Style::White]
-                    )
+                    render::render_tool_call(&call.name, &call.arguments, ui)
                 );
             }
             let output = if call.name == tools::ASK_USER_TOOL {
@@ -1178,6 +1202,12 @@ where
                 .get(&call.id)
                 .map(|(_, elapsed)| *elapsed)
                 .unwrap_or_else(|| tool_started.elapsed());
+            if !output.starts_with("Error: ") && !output.is_empty() {
+                print!(
+                    "{}",
+                    render::render_tool_output(&preview_output(&output), ui)
+                );
+            }
             println!("{}", ui.tool_outcome(&output, elapsed));
             let result_message = Message::tool_result(&call.id, output);
             turn_messages.push(result_message.clone());
@@ -2507,66 +2537,15 @@ fn truncate(text: &str, max: usize) -> String {
     result
 }
 
-fn render_tool_call(call: &ToolCall) -> String {
-    let arguments = call.arguments.trim();
-    if arguments.is_empty() {
-        return format!("{}()", call.name);
+/// First 20 lines, capped at 1000 chars, of a tool result for the boxed preview.
+/// ponytail: fixed preview window; the box truncates each row to terminal width.
+fn preview_output(text: &str) -> String {
+    let clipped: String = text.lines().take(20).collect::<Vec<_>>().join("\n");
+    let mut out: String = clipped.chars().take(1000).collect();
+    if clipped.chars().count() > 1000 || text.lines().count() > 20 {
+        out.push('…');
     }
-
-    let Ok(serde_json::Value::Object(object)) =
-        serde_json::from_str::<serde_json::Value>(arguments)
-    else {
-        return format!("{}({})", call.name, truncate(arguments, 120));
-    };
-
-    let mut keys: Vec<&str> = object
-        .keys()
-        .map(String::as_str)
-        .filter(|key| !matches!(*key, "old_text" | "new_text" | "content"))
-        .collect();
-    keys.sort_unstable_by_key(|key| tool_argument_priority(key));
-
-    let parts = keys
-        .into_iter()
-        .take(4)
-        .filter_map(|key| {
-            object
-                .get(key)
-                .map(|value| format!("{key}={}", render_tool_argument(value)))
-        })
-        .collect::<Vec<_>>();
-
-    if parts.is_empty() {
-        format!("{}({})", call.name, truncate(arguments, 120))
-    } else {
-        format!("{}({})", call.name, parts.join(", "))
-    }
-}
-
-fn tool_argument_priority(key: &str) -> (usize, &str) {
-    let priority = match key {
-        "path" => 0,
-        "command" => 1,
-        "query" | "pattern" | "glob" => 2,
-        "background" | "case_insensitive" => 3,
-        "job_id" => 4,
-        "question" | "task" => 5,
-        "fact" | "matching" | "replacement" => 6,
-        _ => 10,
-    };
-    (priority, key)
-}
-
-fn render_tool_argument(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(text) => {
-            format!("{:?}", truncate(&text.replace('\n', "\\n"), 60))
-        }
-        serde_json::Value::Bool(value) => value.to_string(),
-        serde_json::Value::Number(value) => value.to_string(),
-        serde_json::Value::Null => "null".to_string(),
-        value => truncate(&value.to_string(), 60),
-    }
+    out
 }
 
 /// Build a single-line preview of `content` centered on the first match of `query`.
@@ -3093,28 +3072,16 @@ mod tests {
     }
 
     #[test]
-    fn render_tool_call_shows_useful_arguments() {
-        let call = ToolCall {
-            id: "c1".to_string(),
-            name: "run_command".to_string(),
-            arguments: r#"{"command":"cargo test","background":true}"#.to_string(),
-        };
-
-        assert_eq!(
-            render_tool_call(&call),
-            r#"run_command(command="cargo test", background=true)"#
-        );
-    }
-
-    #[test]
-    fn render_tool_call_hides_patch_payloads() {
-        let call = ToolCall {
-            id: "c1".to_string(),
-            name: "patch_file".to_string(),
-            arguments: r#"{"path":"src/main.rs","old_text":"old","new_text":"new"}"#.to_string(),
-        };
-
-        assert_eq!(render_tool_call(&call), r#"patch_file(path="src/main.rs")"#);
+    fn preview_output_caps_lines_and_chars() {
+        let many_lines = (0..25)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let previewed = preview_output(&many_lines);
+        assert_eq!(previewed.lines().count(), 20);
+        assert!(previewed.ends_with('…'));
+        assert_eq!(preview_output("short"), "short");
+        assert!(!preview_output(&"x".repeat(1200)).ends_with('x'));
     }
 
     #[test]
