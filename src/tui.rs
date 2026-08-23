@@ -125,9 +125,17 @@ impl SlashCompleter {
             .collect();
         filtered
             .into_iter()
-            .map(|c| Pair {
-                display: format!("{:<20}  {}", c.name, c.description),
-                replacement: format!("/{} ", c.name),
+            .map(|c| {
+                // ponytail: truncate — long skill descs (300+ chars) wrap & break last_lines counting
+                let d = if c.description.len() > 60 {
+                    format!("{}…", &c.description[..59])
+                } else {
+                    c.description.clone()
+                };
+                Pair {
+                    display: format!("{:<20}  {}", c.name, d),
+                    replacement: format!("/{} ", c.name),
+                }
             })
             .collect()
     }
@@ -199,6 +207,216 @@ pub fn editor_config() -> Config {
         .build()
 }
 
+fn slash_candidates(
+    commands: &[crate::commands::CustomCommand],
+    skills: &[crate::skills::Skill],
+    disabled: &std::collections::HashSet<String>,
+) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    for (name, desc) in BUILTINS {
+        out.push(Candidate {
+            name: name.to_string(),
+            description: desc.to_string(),
+        });
+    }
+    for cmd in commands {
+        out.push(Candidate {
+            name: cmd.name.clone(),
+            description: cmd
+                .description
+                .clone()
+                .unwrap_or_else(|| format!("custom command ({})", cmd.source.label())),
+        });
+    }
+    for skill in skills {
+        if disabled.contains(&skill.name) {
+            continue;
+        }
+        out.push(Candidate {
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+fn filter_candidates<'a>(candidates: &'a [Candidate], needle: &str) -> Vec<&'a Candidate> {
+    if needle.is_empty() {
+        return candidates.iter().collect();
+    }
+    let n = needle.to_ascii_lowercase();
+    candidates
+        .iter()
+        .filter(|c| c.name.to_ascii_lowercase().starts_with(&n))
+        .collect()
+}
+
+fn read_line_with_slash_popup(candidates: &[Candidate], history: &[String]) -> Option<String> {
+    use dialoguer::console::{Key, Term};
+    let term = Term::stdout();
+    if !term.is_term() {
+        return None;
+    }
+    let _ = term.hide_cursor();
+    let mut buf = String::new();
+    let mut history_idx = history.len();
+    let mut saved_buf = String::new();
+    let mut selected: usize = 0;
+    let mut last_lines: usize = 0;
+
+    let render = |buf: &str, selected: usize, last_lines: &mut usize, term: &Term| {
+        let is_slash = buf.trim_start().starts_with('/') && !buf.trim_start().contains(' ');
+        let mut out = String::new();
+        out.push_str(&format!("\r\x1b[J> {buf}"));
+        if is_slash {
+            let needle = buf
+                .trim_start()
+                .trim_start_matches('/')
+                .to_ascii_lowercase();
+            let filtered = filter_candidates(candidates, &needle);
+            let total = filtered.len();
+            let visible = 10usize;
+            let start = if total <= visible {
+                0
+            } else {
+                let s = selected.saturating_sub(visible / 2);
+                s.min(total - visible)
+            };
+            out.push_str("\n\x1b[2m─\x1b[0m");
+            let term_w = term.size().1 as usize;
+            let max_desc = term_w.saturating_sub(26).clamp(20, 60);
+            for (i, c) in filtered.iter().skip(start).take(visible).enumerate() {
+                let idx = start + i;
+                let is_on = idx == selected;
+                let prefix = if is_on { "→ " } else { "  " };
+                let hl_on = if is_on { "\x1b[7m" } else { "" };
+                let desc = if c.description.len() > max_desc {
+                    format!("{}…", &c.description[..max_desc.saturating_sub(1)])
+                } else {
+                    c.description.clone()
+                };
+                out.push_str(&format!("\n{hl_on}{prefix}{:<20}  {}\x1b[0m", c.name, desc));
+            }
+            if total > 0 {
+                out.push_str(&format!("\n\x1b[2m  ({}/{}) \x1b[0m", selected + 1, total));
+            } else {
+                out.push_str("\n\x1b[2m  (no match)\x1b[0m");
+            }
+        }
+        let rows_below = out.matches('\n').count();
+        if *last_lines > 0 {
+            let _ = term.write_str(&format!("\x1b[{}A\x1b[J", last_lines));
+        }
+        let _ = term.write_str(&out);
+        let _ = term.flush();
+        *last_lines = rows_below;
+    };
+
+    render(&buf, selected, &mut last_lines, &term);
+    loop {
+        let key = match term.read_key() {
+            Ok(k) => k,
+            Err(_) => {
+                let _ = term.show_cursor();
+                return None;
+            }
+        };
+        let is_slash = buf.trim_start().starts_with('/') && !buf.trim_start().contains(' ');
+        let needle = buf
+            .trim_start()
+            .trim_start_matches('/')
+            .to_ascii_lowercase();
+        let filtered = filter_candidates(candidates, &needle);
+        match key {
+            Key::ArrowUp => {
+                if is_slash && !filtered.is_empty() {
+                    if selected > 0 {
+                        selected -= 1;
+                    } else {
+                        selected = filtered.len() - 1;
+                    }
+                } else if history_idx > 0 {
+                    if history_idx == history.len() {
+                        saved_buf = buf.clone();
+                    }
+                    history_idx -= 1;
+                    buf = history[history_idx].clone();
+                    selected = 0;
+                }
+                render(&buf, selected, &mut last_lines, &term);
+            }
+            Key::ArrowDown => {
+                if is_slash && !filtered.is_empty() {
+                    selected = (selected + 1) % filtered.len();
+                } else if history_idx < history.len() {
+                    history_idx += 1;
+                    if history_idx == history.len() {
+                        buf = saved_buf.clone();
+                    } else {
+                        buf = history[history_idx].clone();
+                    }
+                    selected = 0;
+                }
+                render(&buf, selected, &mut last_lines, &term);
+            }
+            Key::Enter => {
+                if is_slash && !filtered.is_empty() {
+                    let chosen = filtered[selected].name.clone();
+                    buf = format!("/{chosen} ");
+                }
+                let _ = term.show_cursor();
+                if last_lines > 0 {
+                    let _ = term.write_str(&format!("\x1b[{}A\x1b[J", last_lines));
+                    let _ = term.write_str(&format!("> {buf}\n"));
+                    let _ = term.flush();
+                }
+                return Some(buf);
+            }
+            Key::Escape => {
+                if is_slash {
+                    buf.clear();
+                    selected = 0;
+                    render(&buf, selected, &mut last_lines, &term);
+                } else {
+                    let _ = term.show_cursor();
+                    if last_lines > 0 {
+                        let _ = term.write_str(&format!("\x1b[{}A\x1b[J", last_lines));
+                        let _ = term.write_str(&format!("> {buf}\n"));
+                    }
+                    return None;
+                }
+            }
+            Key::Backspace => {
+                if !buf.is_empty() {
+                    buf.pop();
+                    selected = 0;
+                    if history_idx == history.len() {
+                        saved_buf = buf.clone();
+                    }
+                    render(&buf, selected, &mut last_lines, &term);
+                }
+            }
+            Key::Char(c) => {
+                if c == '\x03' {
+                    let _ = term.show_cursor();
+                    if last_lines > 0 {
+                        let _ = term.write_str(&format!("\x1b[{}A\x1b[J", last_lines));
+                    }
+                    return None;
+                }
+                buf.push(c);
+                selected = 0;
+                if history_idx == history.len() {
+                    saved_buf = buf.clone();
+                }
+                render(&buf, selected, &mut last_lines, &term);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Read one line interactively with history + completer.
 /// Returns `None` on EOF/Ctrl+C (caller should treat as shutdown).
 /// Runs on the current thread (caller should `spawn_blocking` this).
@@ -208,6 +426,13 @@ pub fn read_line_blocking(
     disabled: &std::collections::HashSet<String>,
     history: &[String],
 ) -> Option<String> {
+    let candidates = slash_candidates(commands, skills, disabled);
+    // The slash-popup owns the terminal. When stdout is a TTY, `None` from it means the
+    // user quit (Ctrl+C/Escape/EOF) — do NOT fall through to rustyline, which would print
+    // a second prompt and discard the typed line. rustyline is only for piped (non-TTY) input.
+    if dialoguer::console::Term::stdout().is_term() {
+        return read_line_with_slash_popup(&candidates, history);
+    }
     let config = editor_config();
     let helper = SlashCompleter::new(commands, skills, disabled);
     let mut editor = match rustyline::Editor::with_config(config) {
@@ -218,46 +443,6 @@ pub fn read_line_blocking(
     for entry in history.iter() {
         let _ = editor.add_history_entry(entry.as_str());
     }
-    // Arrow keys navigate the popup when in "/" context, otherwise history.
-    // Esc dismisses the popup (Abort). Tab / Shift-Tab also cycle completions.
-    struct SlashNav;
-    impl rustyline::ConditionalEventHandler for SlashNav {
-        fn handle(
-            &self,
-            evt: &rustyline::Event,
-            _n: rustyline::RepeatCount,
-            _positive: bool,
-            ctx: &rustyline::EventContext,
-        ) -> Option<rustyline::Cmd> {
-            let line = ctx.line();
-            let pos = ctx.pos().min(line.len());
-            let prefix = &line[..pos];
-            let trimmed = prefix.trim_start();
-            let in_slash = trimmed.starts_with('/') && !trimmed.contains(' ');
-            if !in_slash {
-                return None;
-            }
-            if let rustyline::Event::KeySeq(seq) = evt
-                && seq.len() == 1
-            {
-                let k = &seq[0];
-                if *k == rustyline::KeyEvent(rustyline::KeyCode::Up, rustyline::Modifiers::NONE) {
-                    return Some(rustyline::Cmd::CompleteBackward);
-                }
-                if *k == rustyline::KeyEvent(rustyline::KeyCode::Down, rustyline::Modifiers::NONE) {
-                    return Some(rustyline::Cmd::Complete);
-                }
-                if *k == rustyline::KeyEvent(rustyline::KeyCode::Esc, rustyline::Modifiers::NONE) {
-                    return Some(rustyline::Cmd::Abort);
-                }
-            }
-            None
-        }
-    }
-    editor.bind_sequence(
-        rustyline::Event::Any,
-        rustyline::EventHandler::Conditional(Box::new(SlashNav)),
-    );
     match editor.readline("> ") {
         Ok(line) => Some(line),
         Err(rustyline::error::ReadlineError::Interrupted) => None,
