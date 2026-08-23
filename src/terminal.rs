@@ -1,9 +1,48 @@
 use std::io::IsTerminal;
 use std::time::Duration;
 
-const RESET: &str = "\x1b[0m";
-const GREEN: &str = "\x1b[32m";
-const RED: &str = "\x1b[31m";
+pub const RESET: &str = "\x1b[0m";
+pub const BOLD: &str = "\x1b[1m";
+pub const DIM: &str = "\x1b[2m";
+pub const CYAN: &str = "\x1b[36m";
+pub const GREEN: &str = "\x1b[32m";
+pub const RED: &str = "\x1b[31m";
+pub const YELLOW: &str = "\x1b[33m";
+pub const BLUE: &str = "\x1b[34m";
+pub const WHITE: &str = "\x1b[37m";
+pub const BG_BLUE: &str = "\x1b[44m";
+
+/// Minimal semantic styles; `Ui::style` applies one or more, honouring the colour gate.
+#[derive(Clone, Copy)]
+pub enum Style {
+    Bold,
+    Dim,
+    #[expect(dead_code)] // wired to markdown styling in a parallel change
+    Cyan,
+    Green,
+    Red,
+    Yellow,
+    #[expect(dead_code)] // wired to markdown styling in a parallel change
+    Blue,
+    White,
+    BgBlue,
+}
+
+impl Style {
+    fn code(self) -> &'static str {
+        match self {
+            Style::Bold => BOLD,
+            Style::Dim => DIM,
+            Style::Cyan => CYAN,
+            Style::Green => GREEN,
+            Style::Red => RED,
+            Style::Yellow => YELLOW,
+            Style::Blue => BLUE,
+            Style::White => WHITE,
+            Style::BgBlue => BG_BLUE,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct Ui {
@@ -35,24 +74,30 @@ impl Ui {
         match output.strip_prefix("Error: ") {
             Some(error) => format!(
                 "    {} failed · {} · {error}",
-                self.paint("x", RED),
+                self.style("x", &[Style::Red]),
                 format_duration(elapsed)
             ),
             None => format!(
                 "    {} completed · {} · {} chars",
-                self.paint("✓", GREEN),
+                self.style("✓", &[Style::Green]),
                 format_duration(elapsed),
                 output.chars().count()
             ),
         }
     }
 
-    fn paint(self, text: &str, color: &str) -> String {
-        if self.color {
-            format!("{color}{text}{RESET}")
-        } else {
-            text.to_string()
+    /// Wrap `text` in the given styles, or return it plain when colour is disabled.
+    pub fn style(self, text: &str, styles: &[Style]) -> String {
+        if !self.color {
+            return text.to_string();
         }
+        let mut out = String::with_capacity(text.len() + styles.len() * 5 + 4);
+        for style in styles {
+            out.push_str(style.code());
+        }
+        out.push_str(text);
+        out.push_str(RESET);
+        out
     }
 }
 

@@ -8,7 +8,7 @@ use crate::prompt;
 use crate::provider::{ChatRequest, Message, Provider, StreamEvent, ToolCall, Usage};
 use crate::storage;
 use crate::storage::{Database, Session};
-use crate::terminal::Ui;
+use crate::terminal::{Style, Ui};
 use crate::tools;
 use crate::tools::ToolRegistry;
 use anyhow::{Context, Result};
@@ -175,7 +175,7 @@ where
                 }
             }
         } else {
-            print!("> ");
+            print!("{}", ui.style("> ", &[Style::BgBlue, Style::White]));
             io::stdout().flush()?;
             let rx = input_rx.as_mut().expect("plain mode has input channel");
             let line = tokio::select! {
@@ -273,7 +273,10 @@ where
                     database,
                     &build_provider,
                 ) {
-                    eprintln!("Command failed: {error:#}\n");
+                    eprintln!(
+                        "{}",
+                        ui.style(&format!("Command failed: {error:#}\n"), &[Style::Red])
+                    );
                 }
                 continue;
             }
@@ -305,7 +308,10 @@ where
                         println!("Compacted {count} earlier messages into the summary.\n");
                     }
                     Ok(None) => println!("Not enough history to compact yet.\n"),
-                    Err(error) => eprintln!("Compaction failed: {error:#}\n"),
+                    Err(error) => eprintln!(
+                        "{}",
+                        ui.style(&format!("Compaction failed: {error:#}\n"), &[Style::Red])
+                    ),
                 }
                 continue;
             }
@@ -343,7 +349,10 @@ where
                 };
                 match outcome {
                     Ok(summary) => println!("{summary}\n"),
-                    Err(error) => eprintln!("Index failed: {error:#}\n"),
+                    Err(error) => eprintln!(
+                        "{}",
+                        ui.style(&format!("Index failed: {error:#}\n"), &[Style::Red])
+                    ),
                 }
                 continue;
             }
@@ -359,7 +368,10 @@ where
                 &mut always_allowed,
                 &mut last_turn_snapshot,
             ) {
-                eprintln!("Command failed: {error:#}\n");
+                eprintln!(
+                    "{}",
+                    ui.style(&format!("Command failed: {error:#}\n"), &[Style::Red])
+                );
             }
             // Sync Plan Mode with session changes from /new /resume /delete.
             let new_session_id = session.as_ref().map(|s| s.id.clone());
@@ -404,7 +416,13 @@ where
         let expanded = match project.expand_file_references(input) {
             Ok(expanded) => expanded,
             Err(error) => {
-                eprintln!("\nCould not attach file: {error:#}\n");
+                eprintln!(
+                    "{}",
+                    ui.style(
+                        &format!("\nCould not attach file: {error:#}\n"),
+                        &[Style::Red]
+                    )
+                );
                 continue;
             }
         };
@@ -469,7 +487,13 @@ where
                     println!("(compacted {count} earlier messages into a running summary)\n");
                 }
                 Ok(None) => {}
-                Err(error) => eprintln!("(could not compact history: {error:#})\n"),
+                Err(error) => eprintln!(
+                    "{}",
+                    ui.style(
+                        &format!("(could not compact history: {error:#})\n"),
+                        &[Style::Red]
+                    )
+                ),
             }
         }
 
@@ -538,7 +562,10 @@ where
                     Ok(stream) => stream,
                     Err(error) => {
                         stop_spinner(&mut spinner).await;
-                        eprintln!("\nRequest failed: {error:#}\n");
+                        eprintln!(
+                            "{}",
+                            ui.style(&format!("\nRequest failed: {error:#}\n"), &[Style::Red])
+                        );
                         revert_on_cancel(&turn_snapshot);
                         continue 'chat;
                     }
@@ -593,14 +620,23 @@ where
                     Some(Err(error)) => {
                         stop_spinner(&mut spinner).await;
                         print!("{}", renderer.finish());
-                        eprintln!("\n\nRequest failed: {error:#}\n");
+                        eprintln!(
+                            "{}",
+                            ui.style(&format!("\n\nRequest failed: {error:#}\n"), &[Style::Red])
+                        );
                         revert_on_cancel(&turn_snapshot);
                         continue 'chat;
                     }
                     None => {
                         stop_spinner(&mut spinner).await;
                         print!("{}", renderer.finish());
-                        eprintln!("\n\nRequest failed: provider stream closed unexpectedly\n");
+                        eprintln!(
+                            "{}",
+                            ui.style(
+                                "\n\nRequest failed: provider stream closed unexpectedly\n",
+                                &[Style::Red]
+                            )
+                        );
                         revert_on_cancel(&turn_snapshot);
                         continue 'chat;
                     }
@@ -677,7 +713,10 @@ where
                 if call.name == tools::UPDATE_PLAN_TOOL
                     && let Some(rendered) = tools::render_plan(&call.arguments)
                 {
-                    println!("  \u{2192} plan");
+                    println!(
+                        "{}",
+                        ui.style("  \u{2192} plan", &[Style::Bold, Style::Yellow])
+                    );
                     println!("{rendered}");
                     // Persist plan: pending stays pending, approved stays tracker.
                     if let Some(state) = plan_mode.as_mut() {
@@ -727,7 +766,13 @@ where
                         }
                     }
                 } else {
-                    println!("  \u{2192} {}", render_tool_call(call));
+                    println!(
+                        "{}",
+                        ui.style(
+                            &format!("  \u{2192} {}", render_tool_call(call)),
+                            &[Style::Bold, Style::Yellow]
+                        )
+                    );
                 }
                 // In pending Plan Mode, hold mutating tools.
                 let is_mutating_held = plan_mode
@@ -947,7 +992,13 @@ where
                         session.title = title;
                     }
                 }
-                Err(error) => eprintln!("Could not generate session title: {error:#}\n"),
+                Err(error) => eprintln!(
+                    "{}",
+                    ui.style(
+                        &format!("Could not generate session title: {error:#}\n"),
+                        &[Style::Red]
+                    )
+                ),
             }
         }
     }
@@ -1071,7 +1122,13 @@ where
                 println!("  \u{2192} plan");
                 println!("{rendered}");
             } else {
-                println!("  \u{2192} {}", render_tool_call(call));
+                println!(
+                    "{}",
+                    ui.style(
+                        &format!("  \u{2192} {}", render_tool_call(call)),
+                        &[Style::Bold, Style::Yellow]
+                    )
+                );
             }
             let output = if call.name == tools::ASK_USER_TOOL {
                 println!("    skipped: ask_user is not available in non-interactive mode");
@@ -1178,7 +1235,13 @@ where
                 )?;
             }
         }
-        Err(error) => eprintln!("Could not generate session title: {error:#}"),
+        Err(error) => eprintln!(
+            "{}",
+            ui.style(
+                &format!("Could not generate session title: {error:#}"),
+                &[Style::Red]
+            )
+        ),
     }
 
     eprintln!(
@@ -1214,7 +1277,11 @@ fn start_spinner(label: &'static str, ui: Ui) -> Option<Spinner> {
             tokio::select! {
                 _ = stop_task.notified() => break,
                 _ = interval.tick() => {
-                    print!("\r{} {label}", FRAMES[frame % FRAMES.len()]);
+                    print!(
+                        "\r{} {}",
+                        FRAMES[frame % FRAMES.len()],
+                        ui.style(label, &[Style::Dim])
+                    );
                     let _ = io::stdout().flush();
                     frame += 1;
                 }
@@ -2646,6 +2713,8 @@ fn print_skills(
         return;
     }
     println!("Skills (eager: name+description in prompt, body on /<skill> or /skill:<name>):");
+    let term_w = Term::stdout().size().1 as usize;
+    let max_desc = term_w.saturating_sub(40).clamp(20, 60);
     for skill in library.list() {
         let state = if disabled.contains(&skill.name) {
             "[disabled]"
@@ -2661,7 +2730,7 @@ fn print_skills(
             "  {state} /{:<18} {:<18} {}{tools_hint}",
             skill.name,
             skill.source.badge(),
-            skill.description
+            truncate(&skill.description, max_desc)
         );
     }
     if !library.warnings().is_empty() {
@@ -2676,6 +2745,24 @@ fn print_skills(
 /// Interactive popup for `/skills`: grouped by location, arrow keys navigate, Enter toggles
 /// enable/disable (persisted to user vs project settings.json), Esc closes.
 /// Returns `Ok(true)` if any toggle was made (caller should reload `disabled_skills`).
+fn source_rank(source: crate::skills::SkillSource) -> u8 {
+    match source {
+        crate::skills::SkillSource::ProjectKamui => 0,
+        crate::skills::SkillSource::ProjectAgents => 1,
+        crate::skills::SkillSource::GlobalKamui => 2,
+        crate::skills::SkillSource::GlobalAgents => 3,
+    }
+}
+
+fn source_label(source: crate::skills::SkillSource) -> &'static str {
+    match source {
+        crate::skills::SkillSource::ProjectKamui => "project .kamui",
+        crate::skills::SkillSource::ProjectAgents => "project .agents",
+        crate::skills::SkillSource::GlobalKamui => "global .kamui",
+        crate::skills::SkillSource::GlobalAgents => "global .agents",
+    }
+}
+
 fn run_skills_popup(
     library: &crate::skills::SkillLibrary,
     project_root: &std::path::Path,
@@ -2690,24 +2777,15 @@ fn run_skills_popup(
     let mut order: Vec<usize> = (0..library.list().len()).collect();
     order.sort_by_key(|&i| {
         let s = &library.list()[i];
-        let rank = match s.source {
-            crate::skills::SkillSource::ProjectKamui => 0,
-            crate::skills::SkillSource::ProjectAgents => 1,
-            crate::skills::SkillSource::GlobalKamui => 2,
-            crate::skills::SkillSource::GlobalAgents => 3,
-        };
-        (rank, s.name.clone())
+        (source_rank(s.source), s.name.clone())
     });
 
     let mut selected: usize = 0;
     let mut changed = false;
     let term = Term::stdout();
 
-    // Try to enter raw-ish mode via console Term; fall back to plain list if not a TTY.
-    // We render with manual ANSI and read keys via `Term::read_key`.
-    // Hide cursor during popup; restore on exit.
-    let is_term = term.is_term();
-    if !is_term {
+    // Fall back to a plain list when not a TTY or NO_COLOR is set (no ANSI).
+    if !Ui::stdio().interactive() || std::env::var_os("NO_COLOR").is_some() {
         print_skills(library, disabled);
         return Ok(false);
     }
@@ -2715,28 +2793,33 @@ fn run_skills_popup(
     // Hide cursor
     let _ = term.hide_cursor();
 
+    let (term_h, term_w) = term.size();
+    let visible = (term_h as usize).saturating_sub(6).clamp(5, 10);
+    let max_desc = (term_w as usize).saturating_sub(40).clamp(20, 60);
+
     let render = |selected: usize, disabled: &std::collections::HashSet<String>| -> String {
+        let total = order.len();
+        let start = selected
+            .saturating_sub(visible / 2)
+            .min(total.saturating_sub(visible));
         let mut out = String::new();
         out.push_str(
-            "\x1b[1mSkills\x1b[0m  \x1b[2m(↑/↓ navigate · Enter toggle · Esc close)\x1b[0m\n",
+            "\x1b[1mSkills\x1b[0m · \x1b[2m↑/↓ navigate · Enter toggle · Esc close\x1b[0m\n",
         );
-        let mut last_rank: Option<u8> = None;
-        for (pos, &idx) in order.iter().enumerate() {
+        let mut last_rank = if start > 0 {
+            Some(source_rank(library.list()[order[start - 1]].source))
+        } else {
+            None
+        };
+        for (row, &idx) in order.iter().skip(start).take(visible).enumerate() {
+            let pos = start + row;
             let skill = &library.list()[idx];
-            let rank = match skill.source {
-                crate::skills::SkillSource::ProjectKamui => 0,
-                crate::skills::SkillSource::ProjectAgents => 1,
-                crate::skills::SkillSource::GlobalKamui => 2,
-                crate::skills::SkillSource::GlobalAgents => 3,
-            };
+            let rank = source_rank(skill.source);
             if last_rank != Some(rank) {
-                let label = match skill.source {
-                    crate::skills::SkillSource::ProjectKamui => "project .kamui",
-                    crate::skills::SkillSource::ProjectAgents => "project .agents",
-                    crate::skills::SkillSource::GlobalKamui => "global .kamui",
-                    crate::skills::SkillSource::GlobalAgents => "global .agents",
-                };
-                out.push_str(&format!("\n\x1b[2m─ {} ─\x1b[0m\n", label));
+                out.push_str(&format!(
+                    "\n\x1b[2m─ {} ─\x1b[0m\n",
+                    source_label(skill.source)
+                ));
                 last_rank = Some(rank);
             }
             let is_on = pos == selected;
@@ -2747,14 +2830,12 @@ fn run_skills_popup(
             let suffix = if is_on { "\x1b[0m" } else { "" };
             let dim = if enabled { "" } else { "\x1b[2m" };
             let dim_off = if enabled { "" } else { "\x1b[0m" };
+            let desc = truncate(&skill.description, max_desc);
             out.push_str(&format!(
-                "{prefix}{dim} {badge} /{:<18} {:<18} {} [{state}]{dim_off}{suffix}\n",
-                skill.name,
-                skill.source.badge(),
-                skill.description
+                "{prefix}{dim} {badge} /{:<18} {} [{state}]{dim_off}{suffix}\n",
+                skill.name, desc
             ));
         }
-        out.push_str("\n\x1b[2mEnter toggles the selected skill; Esc closes.\x1b[0m");
         out
     };
 

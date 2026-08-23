@@ -1,3 +1,4 @@
+use crate::terminal::{Style, Ui};
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
@@ -259,6 +260,7 @@ fn read_line_with_slash_popup(candidates: &[Candidate], history: &[String]) -> O
         return None;
     }
     let _ = term.hide_cursor();
+    let prompt = Ui::stdio().style("> ", &[Style::BgBlue, Style::White]);
     let mut buf = String::new();
     let mut history_idx = history.len();
     let mut saved_buf = String::new();
@@ -268,7 +270,7 @@ fn read_line_with_slash_popup(candidates: &[Candidate], history: &[String]) -> O
     let render = |buf: &str, selected: usize, last_lines: &mut usize, term: &Term| {
         let is_slash = buf.trim_start().starts_with('/') && !buf.trim_start().contains(' ');
         let mut out = String::new();
-        out.push_str(&format!("\r\x1b[J> {buf}"));
+        out.push_str(&format!("\r\x1b[J{prompt}{buf}"));
         if is_slash {
             let needle = buf
                 .trim_start()
@@ -368,7 +370,7 @@ fn read_line_with_slash_popup(candidates: &[Candidate], history: &[String]) -> O
                 let _ = term.show_cursor();
                 if last_lines > 0 {
                     let _ = term.write_str(&format!("\x1b[{}A\x1b[J", last_lines));
-                    let _ = term.write_str(&format!("> {buf}\n"));
+                    let _ = term.write_str(&format!("{prompt}{buf}\n"));
                     let _ = term.flush();
                 }
                 return Some(buf);
@@ -382,7 +384,7 @@ fn read_line_with_slash_popup(candidates: &[Candidate], history: &[String]) -> O
                     let _ = term.show_cursor();
                     if last_lines > 0 {
                         let _ = term.write_str(&format!("\x1b[{}A\x1b[J", last_lines));
-                        let _ = term.write_str(&format!("> {buf}\n"));
+                        let _ = term.write_str(&format!("{prompt}{buf}\n"));
                     }
                     return None;
                 }

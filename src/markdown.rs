@@ -10,12 +10,8 @@
 //! corrupt `snake_case` identifiers, which appear constantly in this tool's output. Single-`*`
 //! italics are skipped for the same reason (`src/*.rs`). Only unambiguous constructs are styled.
 
+use crate::terminal::{BOLD, CYAN, DIM, RESET};
 use std::io::IsTerminal;
-
-const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const CYAN: &str = "\x1b[36m";
 
 /// Line-buffered renderer for one streamed response. Holds the partial line and whether the
 /// stream is currently inside a fenced code block.
