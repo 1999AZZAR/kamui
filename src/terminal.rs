@@ -10,9 +10,14 @@ pub const RED: &str = "\x1b[31m";
 pub const YELLOW: &str = "\x1b[33m";
 pub const BLUE: &str = "\x1b[34m";
 pub const WHITE: &str = "\x1b[37m";
+pub const BLACK: &str = "\x1b[30m";
 pub const BG_BLUE: &str = "\x1b[44m";
+pub const BG_GREEN: &str = "\x1b[42m";
+pub const BG_RED: &str = "\x1b[41m";
+pub const BG_GRAY: &str = "\x1b[100m";
 
 /// Minimal semantic styles; `Ui::style` applies one or more, honouring the colour gate.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub enum Style {
     Bold,
@@ -25,7 +30,11 @@ pub enum Style {
     #[expect(dead_code)] // wired to markdown styling in a parallel change
     Blue,
     White,
+    Black,
     BgBlue,
+    BgGreen,
+    BgRed,
+    BgGray,
 }
 
 impl Style {
@@ -39,7 +48,11 @@ impl Style {
             Style::Yellow => YELLOW,
             Style::Blue => BLUE,
             Style::White => WHITE,
+            Style::Black => BLACK,
             Style::BgBlue => BG_BLUE,
+            Style::BgGreen => BG_GREEN,
+            Style::BgRed => BG_RED,
+            Style::BgGray => BG_GRAY,
         }
     }
 }
@@ -72,16 +85,17 @@ impl Ui {
         }
 
         match output.strip_prefix("Error: ") {
-            Some(error) => format!(
-                "    {} failed · {} · {error}",
-                self.style("x", &[Style::Red]),
-                format_duration(elapsed)
+            Some(error) => self.style(
+                &format!("    x failed · {} · {error}", format_duration(elapsed)),
+                &[Style::BgRed, Style::White, Style::Bold],
             ),
-            None => format!(
-                "    {} completed · {} · {} chars",
-                self.style("✓", &[Style::Green]),
-                format_duration(elapsed),
-                output.chars().count()
+            None => self.style(
+                &format!(
+                    "    ✓ completed · {} · {} chars",
+                    format_duration(elapsed),
+                    output.chars().count()
+                ),
+                &[Style::BgGreen, Style::Black],
             ),
         }
     }

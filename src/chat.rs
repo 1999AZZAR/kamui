@@ -715,7 +715,7 @@ where
                 {
                     println!(
                         "{}",
-                        ui.style("  \u{2192} plan", &[Style::Bold, Style::Yellow])
+                        ui.style("  \u{2192} plan", &[Style::BgGray, Style::White])
                     );
                     println!("{rendered}");
                     // Persist plan: pending stays pending, approved stays tracker.
@@ -770,7 +770,7 @@ where
                         "{}",
                         ui.style(
                             &format!("  \u{2192} {}", render_tool_call(call)),
-                            &[Style::Bold, Style::Yellow]
+                            &[Style::BgGray, Style::White]
                         )
                     );
                 }
@@ -1119,14 +1119,17 @@ where
             if call.name == tools::UPDATE_PLAN_TOOL
                 && let Some(rendered) = tools::render_plan(&call.arguments)
             {
-                println!("  \u{2192} plan");
+                println!(
+                    "{}",
+                    ui.style("  \u{2192} plan", &[Style::BgGray, Style::White])
+                );
                 println!("{rendered}");
             } else {
                 println!(
                     "{}",
                     ui.style(
                         &format!("  \u{2192} {}", render_tool_call(call)),
-                        &[Style::Bold, Style::Yellow]
+                        &[Style::BgGray, Style::White]
                     )
                 );
             }
