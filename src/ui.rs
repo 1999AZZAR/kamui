@@ -313,7 +313,7 @@ impl FullScreen {
 
     fn add_notice(&mut self, text: impl Into<String>) -> Result<()> {
         self.model.notices.push(text.into());
-        if self.model.notices.len() > 32 {
+        if self.model.notices.len() > 6 {
             self.model.notices.remove(0);
         }
         self.draw()

@@ -137,7 +137,6 @@ where
         chat_ui
             .warning("--auto-approve is active: commands and file edits will run without asking")?;
     }
-    chat_ui.notice("Type / for commands · Tab completes · Ctrl+C cancels a turn")?;
 
     let (mut session, mut messages) = match resume_id {
         Some(id) => {
@@ -160,10 +159,7 @@ where
             }
             (Some(session), messages)
         }
-        None => {
-            chat_ui.notice("New chat")?;
-            (None, Vec::new())
-        }
+        None => (None, Vec::new()),
     };
     update_sidebar(
         &mut chat_ui,
@@ -320,6 +316,17 @@ where
             let (command, argument) = input.split_once(' ').unwrap_or((input, ""));
             if command == "/help" && use_tui {
                 chat_ui.toggle_help()?;
+                continue;
+            }
+            // Bare `/model` opens the picker; `/model <name>` still switches directly.
+            if command == "/model" && use_tui && argument.is_empty() {
+                let opened = hub
+                    .as_ref()
+                    .map(|h| h.open_models_dialog())
+                    .unwrap_or(false);
+                if !opened {
+                    chat_ui.notice("No provider profiles configured.")?;
+                }
                 continue;
             }
             if command == "/sessions" && use_tui {
