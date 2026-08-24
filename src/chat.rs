@@ -382,6 +382,7 @@ where
                 continue;
             }
             if command == "/model" {
+                let tui_sink = if use_tui { Some(&mut chat_ui) } else { None };
                 if let Err(error) = switch_profile(
                     argument.trim(),
                     &config,
@@ -390,6 +391,7 @@ where
                     &mut context_window,
                     database,
                     &build_provider,
+                    tui_sink,
                 ) {
                     if chat_ui.is_fullscreen() {
                         chat_ui.error(&format!("Command failed: {error:#}"))?;
@@ -1973,6 +1975,7 @@ async fn run_compaction(
 
 /// List profiles, or switch to a named one and persist the choice. Rebuilding the provider swaps the
 /// base URL and API key; the model and context window follow the profile.
+#[allow(clippy::too_many_arguments)]
 fn switch_profile<F>(
     name: &str,
     config: &Config,
@@ -1981,12 +1984,22 @@ fn switch_profile<F>(
     context_window: &mut Option<u64>,
     database: &Database,
     build_provider: &F,
+    mut tui: Option<&mut ChatUi>,
 ) -> Result<()>
 where
     F: Fn(&Profile) -> Box<dyn Provider>,
 {
+    macro_rules! out {
+        ($($arg:tt)*) => {
+            if let Some(ui) = tui.as_deref_mut() {
+                ui.notice(&format!($($arg)*))?;
+            } else {
+                println!($($arg)*);
+            }
+        };
+    }
     if name.is_empty() {
-        println!("Profiles:");
+        out!("Profiles:");
         for profile in &config.profiles {
             let marker = if profile.name == active.name {
                 "*"
@@ -1994,9 +2007,11 @@ where
                 " "
             };
             let tools = if profile.tools { "" } else { "  [no tools]" };
-            println!(
+            out!(
                 "{marker} {:<16} {:<22} {}{tools}",
-                profile.name, profile.model, profile.base_url
+                profile.name,
+                profile.model,
+                profile.base_url
             );
         }
         println!();
@@ -2009,9 +2024,9 @@ where
             *provider = build_provider(profile);
             *context_window = profile.context_window;
             database.set_setting(ACTIVE_PROFILE_KEY, &profile.name)?;
-            println!("Now using {} ({}).\n", profile.model, profile.name);
+            out!("Now using {} ({}).\n", profile.model, profile.name);
         }
-        None => println!("Unknown profile '{name}'. Type /model to list profiles.\n"),
+        None => out!("Unknown profile '{name}'. Type /model to list profiles.\n"),
     }
     Ok(())
 }

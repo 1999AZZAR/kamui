@@ -823,7 +823,7 @@ fn render_dialog(frame: &mut Frame<'_>, dialog: &DialogState, area: Rect) {
         if idx >= selected.saturating_sub(7) && idx < selected.saturating_sub(7) + 8 {
             let is_on = idx == selected;
             let prefix = if is_on { "\u{276f} " } else { "  " };
-            lines.push(Line::from(vec![
+            let mut row = vec![
                 Span::styled(
                     prefix.to_string(),
                     Style::default().fg(if is_on { BLUE } else { BORDER }),
@@ -838,9 +838,13 @@ fn render_dialog(frame: &mut Frame<'_>, dialog: &DialogState, area: Rect) {
                             Modifier::empty()
                         }),
                 ),
-                Span::raw("  "),
-                Span::styled(value.clone(), Style::default().fg(BORDER)),
-            ]));
+            ];
+            // Show the raw value only when the label doesn't already contain it.
+            if !label.contains(value.as_str()) {
+                row.push(Span::raw("  "));
+                row.push(Span::styled(value.clone(), Style::default().fg(BORDER)));
+            }
+            lines.push(Line::from(row));
         }
     }
     frame.render_widget(
@@ -1114,7 +1118,7 @@ fn input_thread(
             }
             KeyCode::Esc => {
                 if is_busy {
-                    interrupt.notify_waiters();
+                    interrupt.notify_one();
                     buf.clear();
                     selected = 0;
                     let mut s = lock_screen(&screen.0);
@@ -1138,7 +1142,7 @@ fn input_thread(
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if is_busy {
-                    interrupt.notify_waiters();
+                    interrupt.notify_one();
                 } else if last_ctrl_c
                     .map(|t| t.elapsed() < std::time::Duration::from_secs(3))
                     .unwrap_or(false)
@@ -1163,7 +1167,16 @@ fn input_thread(
             }
             _ => {}
         }
-        sync(&screen, &buf, selected, items_for(&needle));
+        // Menu visibility follows the post-keystroke buffer: an empty or non-slash line
+        // closes it (filtering with an empty needle would otherwise match every candidate
+        // and leave the helper stuck open).
+        let is_slash_now = buf.trim_start().starts_with('/') && !buf.trim_start().contains(' ');
+        let (items, selected) = if is_slash_now {
+            (items_for(&needle_of(&buf)), selected)
+        } else {
+            (Vec::new(), 0)
+        };
+        sync(&screen, &buf, selected, items);
     }
 }
 
@@ -1199,6 +1212,12 @@ fn submit_line(
     } else {
         let _ = tx.send(HubEvent::Line(line));
     }
+}
+
+fn needle_of(buf: &str) -> String {
+    buf.trim_start()
+        .trim_start_matches('/')
+        .to_ascii_lowercase()
 }
 
 fn filtered_len(candidates: &std::sync::RwLock<Vec<crate::tui::Candidate>>, needle: &str) -> usize {
