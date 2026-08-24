@@ -81,6 +81,9 @@ struct Model {
     thinking: Option<(usize, &'static str)>,
     /// True until the first message lands: the home screen shows the centered logo.
     intro: bool,
+    /// OpenCode-style right rail: bold keys with muted values (session, model, context…).
+    /// `None` hides it entirely (narrow terminals included).
+    sidebar: Option<Vec<(String, String)>>,
 }
 
 impl Default for Model {
@@ -96,6 +99,7 @@ impl Default for Model {
             prompt_visible: true,
             thinking: None,
             intro: true,
+            sidebar: None,
         }
     }
 }
@@ -322,6 +326,19 @@ impl ChatUi {
         }
     }
 
+    /// Replace the right-rail contents (opencode-style session info). Hidden on narrow
+    /// terminals; no-op outside fullscreen mode.
+    pub fn set_sidebar(&mut self, entries: Vec<(String, String)>) -> Result<()> {
+        match self.fullscreen.as_ref() {
+            Some(screen) => {
+                let mut screen = lock_screen(screen);
+                screen.model.sidebar = Some(entries);
+                screen.draw()
+            }
+            None => Ok(()),
+        }
+    }
+
     pub fn set_header(&mut self, header: String) -> Result<()> {
         match self.fullscreen.as_ref() {
             Some(screen) => lock_screen(screen).set_header(header),
@@ -483,22 +500,60 @@ fn render(frame: &mut Frame<'_>, model: &Model) {
     );
     frame.render_widget(header, areas[0]);
 
+    // OpenCode-style split: the sidebar rail takes the right side once the terminal is wide
+    // enough and a session is actually underway.
+    let body_area = areas[1];
+    let (transcript_area, sidebar_area) = match (&model.sidebar, model.intro) {
+        (Some(entries), false) if !entries.is_empty() && body_area.width >= 84 => {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(0), Constraint::Length(30)])
+                .split(body_area);
+            (cols[0], Some(cols[1]))
+        }
+        _ => (body_area, None),
+    };
+
     if model.intro && model.cards.is_empty() {
-        frame.render_widget(intro_paragraph(model, areas[1]), areas[1]);
+        frame.render_widget(intro_paragraph(model, body_area), body_area);
     } else {
-        let transcript = transcript_text(model, areas[1].width);
+        let transcript = transcript_text(model, transcript_area.width);
         let transcript_height = transcript.lines.len().saturating_add(1) as u16;
-        let visible = areas[1].height.saturating_sub(2);
+        let visible = transcript_area.height.saturating_sub(2);
         let scroll = transcript_height.saturating_sub(visible);
         let body = Paragraph::new(transcript)
             .wrap(Wrap { trim: false })
             .scroll((scroll.max(model.scroll), 0))
             .block(Block::default().borders(Borders::LEFT | Borders::RIGHT));
-        frame.render_widget(body, areas[1]);
+        frame.render_widget(body, transcript_area);
+    }
+    if let Some(area) = sidebar_area {
+        frame.render_widget(sidebar_paragraph(model, area), area);
     }
 
     let footer = footer_widget(model);
     frame.render_widget(footer, areas[2]);
+}
+
+/// Session-info rail: each entry renders its key in bold with the value muted beneath,
+/// sections separated by blank lines — the same visual grammar as opencode's sidebar.
+fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some(entries) = &model.sidebar {
+        for (key, value) in entries {
+            lines.push(Line::from(Span::styled(
+                format!("{key} "),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for value_line in wrap_display(value, area.width.saturating_sub(4) as usize) {
+                lines.push(Line::styled(value_line, Style::default().fg(NOTICE_FG)));
+            }
+            lines.push(Line::from(""));
+        }
+    }
+    Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::LEFT))
 }
 
 /// The home screen: two-tone block-letter logo centered above the version/model line and the

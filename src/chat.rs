@@ -145,6 +145,14 @@ where
             (None, Vec::new())
         }
     };
+    update_sidebar(
+        &mut chat_ui,
+        session.as_ref(),
+        &active.model,
+        project,
+        None,
+        context_window,
+    );
     // Restore pending plan on resume/startup.
     let mut plan_mode: Option<PlanModeState> = session
         .as_ref()
@@ -796,6 +804,14 @@ where
             } else {
                 println!("{usage_line}");
             }
+            update_sidebar(
+                &mut chat_ui,
+                session.as_ref(),
+                &active.model,
+                project,
+                Some(usage.prompt_tokens),
+                context_window,
+            );
             accumulate_usage(&mut final_usage, &usage);
             final_finish = finish_reason;
             last_content = content.clone();
@@ -2012,6 +2028,46 @@ fn print_history_preview(messages: &[Message]) {
         println!("{speaker}:\n{body}\n");
     }
     println!("--- End of history ---\n");
+}
+
+/// Refresh the fullscreen sidebar rail (opencode-style): session identity on top, model and
+/// context usage beneath. Called at startup and after every completed round so the context
+/// figure tracks the live conversation.
+fn update_sidebar(
+    chat_ui: &mut ChatUi,
+    session: Option<&Session>,
+    model: &str,
+    project: &ProjectContext,
+    last_input_tokens: Option<u64>,
+    context_window: Option<u64>,
+) {
+    if !chat_ui.is_fullscreen() {
+        return;
+    }
+    let mut entries = vec![(
+        "Session".to_string(),
+        match session {
+            Some(session) => session.title.clone(),
+            None => "New chat".to_string(),
+        },
+    )];
+    if let Some(session) = session {
+        entries.push(("Id".to_string(), short_id(&session.id).to_string()));
+    }
+    entries.push(("Model".to_string(), model.to_string()));
+    entries.push(("Project".to_string(), display_path(project.root())));
+    let context_line = match (last_input_tokens, context_window) {
+        (Some(tokens), Some(window)) => {
+            format!(
+                "{tokens} tokens ({:.1}% of {window})",
+                tokens as f64 / window as f64 * 100.0
+            )
+        }
+        (Some(tokens), None) => format!("{tokens} tokens"),
+        (None, _) => "\u{2014}".to_string(),
+    };
+    entries.push(("Context".to_string(), context_line));
+    let _ = chat_ui.set_sidebar(entries);
 }
 
 #[allow(clippy::too_many_arguments)]
