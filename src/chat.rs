@@ -13,7 +13,7 @@ use crate::storage::{Database, Session};
 use crate::terminal::{Style, Ui};
 use crate::tools;
 use crate::tools::ToolRegistry;
-use crate::ui::ChatUi;
+use crate::ui::{ChatUi, HubEvent, InputHub};
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
 use dialoguer::console::{Key, Term};
@@ -74,6 +74,10 @@ where
             display_path(project.root())
         ),
     )?;
+    // The keyboard hub owns all TUI input for the session: editor always live, Enter queues
+    // while the agent runs, Esc interrupts.
+    let mut hub = chat_ui.screen_handle().map(InputHub::spawn);
+    let interrupt = hub.as_ref().map(|h| h.interrupt.clone());
     let ui = Ui::stdio();
     // One tidy startup line instead of a wall of per-skill warnings; /skills still lists every
     // individual reason.
@@ -177,7 +181,6 @@ where
         chat_ui.notice(&format!("Plan Mode — pending plan\n{rendered}"))?;
     }
     let mut input_rx = if use_tui { None } else { Some(input_channel()) };
-    let mut tui_history: Vec<String> = Vec::new();
     let mut disabled_skills = crate::settings::load_disabled_skills(project.root());
 
     // Rolling context compaction: `summary` folds in messages before `summarized_upto`; the rest of
@@ -198,30 +201,27 @@ where
 
     'chat: loop {
         let input = if use_tui {
-            chat_ui.prompt()?;
-            // Snapshot completer data for this prompt (commands/skills + disabled set).
+            let hub = hub.as_mut().expect("tui implies hub");
             let cmds: Vec<crate::commands::CustomCommand> = command_library.list().to_vec();
             let sks: Vec<crate::skills::Skill> = skill_library.list().to_vec();
-            let dis = disabled_skills.clone();
-            let hist = tui_history.clone();
-            let candidates = crate::tui::slash_candidates(&cmds, &sks, &dis);
-            let handle = chat_ui.screen_handle();
-            let line = tokio::task::spawn_blocking(move || {
-                handle.and_then(|h| h.read_line_interactive(&candidates, &hist))
-            })
-            .await
-            .unwrap_or(None);
-            match line {
-                Some(s) => s,
-                None => {
-                    shutdown(
-                        database,
-                        session.as_ref(),
-                        context_window,
-                        &job_registry,
-                        &config.prices,
-                    )?;
-                    break;
+            hub.set_candidates(crate::tui::slash_candidates(&cmds, &sks, &disabled_skills));
+            chat_ui.prompt()?;
+            // Queued lines typed while the agent ran are consumed first, in order.
+            if let Some(queued) = hub.pop_queue() {
+                queued
+            } else {
+                match hub.next().await {
+                    Some(HubEvent::Line(line)) => line,
+                    Some(HubEvent::Quit) | None => {
+                        shutdown(
+                            database,
+                            session.as_ref(),
+                            context_window,
+                            &job_registry,
+                            &config.prices,
+                        )?;
+                        break;
+                    }
                 }
             }
         } else {
@@ -245,13 +245,6 @@ where
             };
             line
         };
-        // Keep TUI history in sync when in TUI mode (plain mode history is via input channel).
-        if use_tui && !input.trim().is_empty() {
-            tui_history.push(input.clone());
-            if tui_history.len() > 1000 {
-                tui_history.remove(0);
-            }
-        }
         let input = input.trim();
 
         if input.eq_ignore_ascii_case("exit") || input == "/exit" {
@@ -701,6 +694,8 @@ where
         // `snapshot_patch_target`/`revert_on_cancel`).
         let mut turn_snapshot: HashMap<PathBuf, Option<String>> = HashMap::new();
         let mut round = 0usize;
+        // Esc / Ctrl+C now interrupt; the editor stays live for queueing.
+        let _busy = hub.as_ref().map(|h| h.busy_guard());
         let assistant_message = 'agent: loop {
             round += 1;
             if round > MAX_TOOL_ROUNDS {
@@ -742,6 +737,12 @@ where
                     revert_on_cancel(&turn_snapshot);
                     chat_ui.notice("interrupted — back to prompt")?;
                     continue 'chat;
+                },
+                () = wait_interrupt(&interrupt) => {
+                    stop_spinner(&mut spinner, &mut chat_ui).await;
+                    revert_on_cancel(&turn_snapshot);
+                    chat_ui.notice("interrupted — back to prompt")?;
+                    continue 'chat;
                 }
             };
 
@@ -757,6 +758,17 @@ where
                         stop_spinner(&mut spinner, &mut chat_ui).await;
                         signal.context("failed to listen for Ctrl+C")?;
                         // Show the partial line still held by the line buffer before leaving.
+                        if chat_ui.is_fullscreen() {
+                            chat_ui.assistant_update(&content)?;
+                        } else {
+                            print!("{}", renderer.finish());
+                        }
+                        revert_on_cancel(&turn_snapshot);
+                        chat_ui.notice("interrupted — back to prompt")?;
+                        continue 'chat;
+                    }
+                    () = wait_interrupt(&interrupt) => {
+                        stop_spinner(&mut spinner, &mut chat_ui).await;
                         if chat_ui.is_fullscreen() {
                             chat_ui.assistant_update(&content)?;
                         } else {
@@ -949,7 +961,8 @@ where
                     {
                         chat_ui.notice("Plan ready — approve? [y/N]")?;
                         let answer = tokio::select! {
-                            answer = read_approval_line(&mut input_rx, use_tui) => answer,
+                            answer = read_approval_line(&mut input_rx, use_tui, hub.as_mut()) => answer,
+                        () = wait_interrupt(&interrupt) => None,
                             signal = tokio::signal::ctrl_c() => {
                                 signal.context("failed to listen for Ctrl+C")?;
                                 revert_on_cancel(&turn_snapshot);
@@ -989,9 +1002,14 @@ where
                     "Plan Mode is active — propose a plan with update_plan and wait for approval before mutating tools.".to_string()
                 } else if call.name == tools::ASK_USER_TOOL {
                     tokio::select! {
-                        output = ask_user(&mut input_rx, use_tui, &call.arguments) => output?,
+                        output = ask_user(&mut input_rx, use_tui, &call.arguments, hub.as_mut()) => output?,
                         signal = tokio::signal::ctrl_c() => {
                             signal.context("failed to listen for Ctrl+C")?;
+                            revert_on_cancel(&turn_snapshot);
+                            chat_ui.notice("interrupted — back to prompt")?;
+                            continue 'chat;
+                        }
+                        () = wait_interrupt(&interrupt) => {
                             revert_on_cancel(&turn_snapshot);
                             chat_ui.notice("interrupted — back to prompt")?;
                             continue 'chat;
@@ -1036,7 +1054,8 @@ where
                     }
                     chat_ui.notice("approve? [y/N/a]")?;
                     let answer = tokio::select! {
-                        answer = read_approval_line(&mut input_rx, use_tui) => answer,
+                        answer = read_approval_line(&mut input_rx, use_tui, hub.as_mut()) => answer,
+                        () = wait_interrupt(&interrupt) => None,
                         signal = tokio::signal::ctrl_c() => {
                             signal.context("failed to listen for Ctrl+C")?;
                             revert_on_cancel(&turn_snapshot);
@@ -1546,19 +1565,18 @@ impl Spinner {
     }
 }
 
+/// Resolves when the keyboard hub raises an interrupt; never fires in plain mode.
+async fn wait_interrupt(interrupt: &Option<Arc<tokio::sync::Notify>>) {
+    match interrupt {
+        Some(notify) => notify.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Stop the spinner if it is still running. Safe to call repeatedly.
 async fn stop_spinner(spinner: &mut Spinner, chat_ui: &mut ChatUi) {
     let spinner = std::mem::replace(spinner, Spinner::None);
     spinner.finish(chat_ui).await;
-}
-
-fn read_plain_line() -> Option<String> {
-    let mut input = String::new();
-    match std::io::stdin().read_line(&mut input) {
-        Ok(0) => None,
-        Ok(_) => Some(input),
-        Err(_) => None,
-    }
 }
 
 fn input_channel() -> mpsc::UnboundedReceiver<String> {
@@ -2133,7 +2151,8 @@ fn update_sidebar(
     };
     entries.push(("Context".to_string(), context_line));
     if let Some(last_turn) = last_turn {
-        entries.push(("Last turn".to_string(), last_turn));
+        // One metric per line reads better in the narrow rail than a pipe-separated row.
+        entries.push(("Last turn".to_string(), last_turn.replace(" | ", "\n")));
     }
     let _ = chat_ui.set_sidebar(entries);
 }
@@ -2256,11 +2275,11 @@ struct AskUserArguments {
 async fn read_approval_line(
     input_rx: &mut Option<mpsc::UnboundedReceiver<String>>,
     use_tui: bool,
+    hub: Option<&mut InputHub>,
 ) -> Option<String> {
     if use_tui {
-        tokio::task::spawn_blocking(read_plain_line)
-            .await
-            .unwrap_or(None)
+        let hub = hub.expect("tui implies hub");
+        hub.request_line().await
     } else {
         input_rx.as_mut().unwrap().recv().await
     }
@@ -2270,6 +2289,7 @@ async fn ask_user(
     input_rx: &mut Option<mpsc::UnboundedReceiver<String>>,
     use_tui: bool,
     arguments: &str,
+    hub: Option<&mut InputHub>,
 ) -> Result<String> {
     let arguments: AskUserArguments = match serde_json::from_str(arguments) {
         Ok(arguments) => arguments,
@@ -2287,10 +2307,8 @@ async fn ask_user(
     io::stdout().flush()?;
 
     let answer = if use_tui {
-        tokio::task::spawn_blocking(read_plain_line)
-            .await
-            .unwrap_or(None)
-            .unwrap_or_default()
+        let hub = hub.expect("tui implies hub");
+        hub.request_line().await.unwrap_or_default()
     } else {
         input_rx.as_mut().unwrap().recv().await.unwrap_or_default()
     };
@@ -3742,14 +3760,14 @@ mod tests {
     #[tokio::test]
     async fn ask_user_rejects_invalid_json_arguments() {
         let mut rx = respond_with("anything");
-        let output = ask_user(&mut rx, false, "not json").await.unwrap();
+        let output = ask_user(&mut rx, false, "not json", None).await.unwrap();
         assert!(output.starts_with("Error:"));
     }
 
     #[tokio::test]
     async fn ask_user_rejects_a_blank_question() {
         let mut rx = respond_with("anything");
-        let output = ask_user(&mut rx, false, r#"{"question":"   "}"#)
+        let output = ask_user(&mut rx, false, r#"{"question":"   "}"#, None)
             .await
             .unwrap();
         assert!(output.starts_with("Error:"));
@@ -3758,7 +3776,7 @@ mod tests {
     #[tokio::test]
     async fn ask_user_returns_free_text_when_no_options_are_offered() {
         let mut rx = respond_with("Tuesday works better");
-        let output = ask_user(&mut rx, false, r#"{"question":"When?"}"#)
+        let output = ask_user(&mut rx, false, r#"{"question":"When?"}"#, None)
             .await
             .unwrap();
         assert_eq!(output, "Tuesday works better");
@@ -3771,6 +3789,7 @@ mod tests {
             &mut rx,
             false,
             r#"{"question":"Pick one","options":["red","green","blue"]}"#,
+            None,
         )
         .await
         .unwrap();
@@ -3784,6 +3803,7 @@ mod tests {
             &mut rx,
             false,
             r#"{"question":"Pick one","options":["red","green"]}"#,
+            None,
         )
         .await
         .unwrap();
@@ -3797,6 +3817,7 @@ mod tests {
             &mut rx,
             false,
             r#"{"question":"Pick one","options":["red","green"]}"#,
+            None,
         )
         .await
         .unwrap();

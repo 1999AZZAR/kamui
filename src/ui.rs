@@ -13,6 +13,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 use std::{
+    collections::VecDeque,
     io::{self, Stdout, Write},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::Duration,
@@ -100,6 +101,8 @@ struct Model {
     /// Warning messages render separately so `/warnings` can hide or reveal them.
     warnings: Vec<String>,
     warnings_visible: bool,
+    /// Lines typed while the agent runs; shown in the footer until consumed.
+    queued_count: usize,
 }
 
 impl Default for Model {
@@ -121,6 +124,7 @@ impl Default for Model {
             ac_selected: 0,
             warnings: Vec::new(),
             warnings_visible: true,
+            queued_count: 0,
         }
     }
 }
@@ -536,163 +540,331 @@ impl ChatUi {
     }
 }
 
+// ---------------------------------------------------------------- input hub -----------------
+
+/// Events the chat loop consumes from the keyboard hub.
+pub enum HubEvent {
+    /// A submitted line at an idle prompt.
+    Line(String),
+    /// Ctrl+C at an idle prompt — shut down.
+    Quit,
+}
+
+/// Owns the keyboard for the whole session, opencode-style. While the agent runs the editor
+/// stays live: typed lines queue instead of racing the turn, Esc raises an interrupt, and
+/// page keys keep scrolling. Approval / ask_user prompts register a one-shot requester whose
+/// answer bypasses the queue.
+pub struct InputHub {
+    rx: tokio::sync::mpsc::UnboundedReceiver<HubEvent>,
+    pub interrupt: Arc<tokio::sync::Notify>,
+    busy: Arc<std::sync::atomic::AtomicBool>,
+    queue: Arc<Mutex<VecDeque<String>>>,
+    requester: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+    candidates: Arc<std::sync::RwLock<Vec<crate::tui::Candidate>>>,
+    screen: ScreenHandle,
+}
+
+impl InputHub {
+    /// Spawns the persistent keyboard thread. Call once at startup in TUI mode.
+    pub fn spawn(screen: ScreenHandle) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub_screen = screen.clone();
+        let interrupt = Arc::new(tokio::sync::Notify::new());
+        let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let requester: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>> =
+            Arc::new(Mutex::new(None));
+        let candidates = Arc::new(std::sync::RwLock::new(Vec::new()));
+        std::thread::spawn({
+            let interrupt = interrupt.clone();
+            let busy = busy.clone();
+            let queue = queue.clone();
+            let requester = requester.clone();
+            let candidates = candidates.clone();
+            move || {
+                input_thread(
+                    screen.clone(),
+                    tx,
+                    interrupt,
+                    busy,
+                    queue,
+                    requester,
+                    candidates,
+                )
+            }
+        });
+        Self {
+            rx,
+            interrupt,
+            busy,
+            queue,
+            requester,
+            candidates,
+            screen: hub_screen,
+        }
+    }
+
+    /// Refreshes the slash-menu snapshot (commands/skills change rarely).
+    pub fn set_candidates(&self, candidates: Vec<crate::tui::Candidate>) {
+        *self
+            .candidates
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = candidates;
+    }
+
+    /// Marks the agent busy while the guard lives; Drop returns the prompt to idle.
+    pub fn busy_guard(&self) -> BusyGuard {
+        self.busy.store(true, std::sync::atomic::Ordering::SeqCst);
+        BusyGuard {
+            busy: self.busy.clone(),
+        }
+    }
+
+    /// Next event from the keyboard.
+    pub async fn next(&mut self) -> Option<HubEvent> {
+        self.rx.recv().await
+    }
+
+    /// Pops a queued line, if any; drained between turns. Updates the footer count.
+    pub fn pop_queue(&self) -> Option<String> {
+        let popped = self
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front();
+        if popped.is_some() {
+            let mut s = lock_screen(&self.screen.0);
+            s.model.queued_count = self
+                .queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len();
+            drop(s);
+            let _ = self.screen.draw_now();
+        }
+        popped
+    }
+
+    /// Waits for a one-line answer (approval prompts, ask_user). Esc answers `None`.
+    pub async fn request_line(&mut self) -> Option<String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self
+            .requester
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(tx);
+        rx.await.ok()
+    }
+}
+
+/// RAII marker telling the keyboard thread the agent is running.
+pub struct BusyGuard {
+    busy: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.busy.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn scroll_screen(screen: &ScreenHandle, rows: i64) {
+    let mut s = lock_screen(&screen.0);
+    let page = s.last_viewport_rows.max(1) as i64;
+    let delta = if rows.abs() > 50_000 {
+        rows
+    } else {
+        rows * page
+    };
+    let next = s.model.scroll_from_bottom as i64 + delta;
+    s.model.scroll_from_bottom = next.clamp(0, 100_000) as usize;
+    let _ = s.draw();
+}
+
+/// The single keyboard reader for TUI mode.
+fn input_thread(
+    screen: ScreenHandle,
+    tx: tokio::sync::mpsc::UnboundedSender<HubEvent>,
+    interrupt: Arc<tokio::sync::Notify>,
+    busy: Arc<std::sync::atomic::AtomicBool>,
+    queue: Arc<Mutex<VecDeque<String>>>,
+    requester: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+    candidates: Arc<std::sync::RwLock<Vec<crate::tui::Candidate>>>,
+) {
+    use dialoguer::console::{Key, Term};
+    let term = Term::stdout();
+    if !term.is_term() {
+        return;
+    }
+    let _ = term.hide_cursor();
+    let mut buf = String::new();
+    let mut selected = 0usize;
+    let mut history: Vec<String> = Vec::new();
+    let mut history_idx = 0usize;
+    let mut saved_buf = String::new();
+
+    let sync = |screen: &ScreenHandle, buf: &str, selected: usize, items: Vec<(String, String)>| {
+        let mut s = lock_screen(&screen.0);
+        s.model.input = buf.to_string();
+        s.model.ac_selected = selected;
+        s.model.ac_items = items;
+        let _ = s.draw();
+    };
+    let items_for = |needle: &str| -> Vec<(String, String)> {
+        candidates
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|c| c.name.to_ascii_lowercase().starts_with(needle))
+            .map(|c| (c.name.clone(), c.description.clone()))
+            .collect()
+    };
+
+    sync(&screen, "", 0, Vec::new());
+    while let Ok(key) = term.read_key() {
+        let is_slash = buf.trim_start().starts_with('/') && !buf.trim_start().contains(' ');
+        let needle = buf
+            .trim_start()
+            .trim_start_matches('/')
+            .to_ascii_lowercase();
+        let is_busy = busy.load(std::sync::atomic::Ordering::SeqCst);
+        match key {
+            Key::ArrowUp => {
+                if is_slash {
+                    let total = filtered_len(&candidates, &needle);
+                    if total > 0 {
+                        selected = selected.checked_sub(1).unwrap_or(total - 1);
+                    }
+                } else if history_idx > 0 {
+                    if history_idx == history.len() {
+                        saved_buf = buf.clone();
+                    }
+                    history_idx -= 1;
+                    buf = history[history_idx].clone();
+                    selected = 0;
+                }
+            }
+            Key::ArrowDown => {
+                if is_slash {
+                    let total = filtered_len(&candidates, &needle);
+                    if total > 0 {
+                        selected = (selected + 1) % total;
+                    }
+                } else if history_idx < history.len() {
+                    history_idx += 1;
+                    buf = if history_idx == history.len() {
+                        saved_buf.clone()
+                    } else {
+                        history[history_idx].clone()
+                    };
+                    selected = 0;
+                }
+            }
+            Key::Tab => {
+                if is_slash {
+                    let all = items_for(&needle);
+                    if let Some(choice) = all.get(selected) {
+                        buf = format!("/{} ", choice.0);
+                        selected = 0;
+                    }
+                }
+            }
+            Key::Enter => {
+                let line = buf.trim().to_string();
+                buf.clear();
+                selected = 0;
+                if !line.is_empty() {
+                    history.push(line.clone());
+                    if history.len() > 500 {
+                        history.remove(0);
+                    }
+                    history_idx = history.len();
+                }
+                // A waiting approval/ask_user takes the answer before anything else.
+                let answer_tx = requester
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                if let Some(tx) = answer_tx {
+                    let _ = tx.send(line);
+                } else if line.is_empty() {
+                    // nothing to do
+                } else if is_busy {
+                    queue
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push_back(line.clone());
+                    let mut s = lock_screen(&screen.0);
+                    s.model.queued_count =
+                        queue.lock().unwrap_or_else(PoisonError::into_inner).len();
+                    s.model.notices.push(format!("queued: {line}"));
+                    let _ = s.draw();
+                } else {
+                    let _ = tx.send(HubEvent::Line(line));
+                }
+            }
+            Key::Escape => {
+                if is_busy {
+                    interrupt.notify_waiters();
+                    buf.clear();
+                    selected = 0;
+                    let mut s = lock_screen(&screen.0);
+                    s.model.notices.push("interrupt requested".to_string());
+                    let _ = s.draw();
+                } else {
+                    buf.clear();
+                    selected = 0;
+                }
+            }
+            Key::PageUp => scroll_screen(&screen, 100_000),
+            Key::PageDown => scroll_screen(&screen, -100_000),
+            Key::Home => scroll_screen(&screen, 100_000),
+            Key::End => scroll_screen(&screen, -100_000),
+            Key::Backspace => {
+                buf.pop();
+                selected = 0;
+                if history_idx == history.len() {
+                    saved_buf = buf.clone();
+                }
+            }
+            Key::Char('\u{3}') => {
+                if is_busy {
+                    interrupt.notify_waiters();
+                } else {
+                    let _ = tx.send(HubEvent::Quit);
+                    return;
+                }
+            }
+            Key::Char(c) => {
+                buf.push(c);
+                selected = 0;
+                if history_idx == history.len() {
+                    saved_buf = buf.clone();
+                }
+            }
+            _ => {}
+        }
+        sync(&screen, &buf, selected, items_for(&needle));
+    }
+}
+
+fn filtered_len(candidates: &std::sync::RwLock<Vec<crate::tui::Candidate>>, needle: &str) -> usize {
+    crate::tui::filter_candidates(
+        &candidates.read().unwrap_or_else(PoisonError::into_inner),
+        needle,
+    )
+    .len()
+}
+
 /// Blocking editor loop, opencode-style: keystrokes update `Model::input` and redraw through
 /// ratatui, so typed text lives inside the bordered editor instead of a raw ANSI popup below
 /// the frame. Runs on a dedicated thread (see `spawn_blocking` callers).
+#[derive(Clone)]
 pub struct ScreenHandle(Arc<Mutex<FullScreen>>);
 
 impl ScreenHandle {
-    /// Read one line with history and slash-command completion.
-    /// `None` means quit (Ctrl+C / Escape / EOF).
-    pub fn read_line_interactive(
-        &self,
-        candidates: &[crate::tui::Candidate],
-        history: &[String],
-    ) -> Option<String> {
-        use dialoguer::console::{Key, Term};
-        let term = Term::stdout();
-        if !term.is_term() {
-            return None;
-        }
-        let sync = |buf: &str, selected: usize, items: Vec<(String, String)>| {
-            let mut screen = lock_screen(&self.0);
-            screen.model.input = buf.to_string();
-            screen.model.ac_selected = selected;
-            screen.model.ac_items = items;
-            let _ = screen.draw();
-        };
-        let _ = term.hide_cursor();
-        // Page through the transcript; `page` is roughly one viewport of rows.
-        let scroll_by = |rows: i64| {
-            let mut screen = lock_screen(&self.0);
-            let page = screen.last_viewport_rows.max(1) as i64;
-            let rows = if rows.abs() > 50_000 {
-                rows
-            } else {
-                rows * page
-            };
-            let next = screen.model.scroll_from_bottom as i64 + rows;
-            screen.model.scroll_from_bottom = next.clamp(0, 100_000) as usize;
-            let _ = screen.draw();
-        };
-        let snap_to_tail = |buf: &str, selected: usize, items: Vec<(String, String)>| {
-            let mut screen = lock_screen(&self.0);
-            screen.model.scroll_from_bottom = 0;
-            screen.model.input = buf.to_string();
-            screen.model.ac_selected = selected;
-            screen.model.ac_items = items;
-            let _ = screen.draw();
-        };
-        let mut buf = String::new();
-        let mut selected = 0usize;
-        let mut history_idx = history.len();
-        let mut saved_buf = String::new();
-        sync(&buf, 0, Vec::new());
-        while let Ok(key) = term.read_key() {
-            let is_slash = buf.trim_start().starts_with('/') && !buf.trim_start().contains(' ');
-            let needle = buf
-                .trim_start()
-                .trim_start_matches('/')
-                .to_ascii_lowercase();
-            let filtered: Vec<&crate::tui::Candidate> = if is_slash {
-                crate::tui::filter_candidates(candidates, &needle)
-            } else {
-                Vec::new()
-            };
-            let items = |filtered: &[&crate::tui::Candidate]| {
-                filtered
-                    .iter()
-                    .map(|c| (c.name.clone(), c.description.clone()))
-                    .collect::<Vec<_>>()
-            };
-            match key {
-                Key::ArrowUp => {
-                    if !filtered.is_empty() {
-                        selected = if selected == 0 {
-                            filtered.len() - 1
-                        } else {
-                            selected - 1
-                        };
-                    } else if history_idx > 0 {
-                        if history_idx == history.len() {
-                            saved_buf = buf.clone();
-                        }
-                        history_idx -= 1;
-                        buf = history[history_idx].clone();
-                        selected = 0;
-                    }
-                }
-                Key::ArrowDown => {
-                    if !filtered.is_empty() {
-                        selected = (selected + 1) % filtered.len();
-                    } else if history_idx < history.len() {
-                        history_idx += 1;
-                        buf = if history_idx == history.len() {
-                            saved_buf.clone()
-                        } else {
-                            history[history_idx].clone()
-                        };
-                        selected = 0;
-                    }
-                }
-                Key::Tab => {
-                    if let Some(choice) = filtered.get(selected) {
-                        buf = format!("/{} ", choice.name);
-                        selected = 0;
-                    }
-                }
-                Key::Enter => {
-                    // Submitting while the menu is open accepts the highlighted command;
-                    // otherwise the typed line goes out as-is.
-                    let submitted = if !filtered.is_empty() {
-                        filtered
-                            .get(selected)
-                            .map(|c| format!("/{} ", c.name))
-                            .unwrap_or_else(|| buf.clone())
-                    } else {
-                        buf.clone()
-                    };
-                    let trimmed = submitted.trim().to_string();
-                    buf.clear();
-                    sync(&buf, 0, Vec::new());
-                    let _ = term.show_cursor();
-                    return Some(trimmed);
-                }
-                Key::Escape => {
-                    if is_slash {
-                        buf.clear();
-                        selected = 0;
-                    } else {
-                        break;
-                    }
-                }
-                Key::PageUp => scroll_by(1),
-                Key::PageDown => scroll_by(-1),
-                Key::Home => scroll_by(100_000),
-                Key::End => scroll_by(-100_000),
-                Key::Backspace => {
-                    buf.pop();
-                    selected = 0;
-                    if history_idx == history.len() {
-                        saved_buf = buf.clone();
-                    }
-                }
-                Key::Char('\u{3}') => break,
-                Key::Char(c) => {
-                    buf.push(c);
-                    selected = 0;
-                    if history_idx == history.len() {
-                        saved_buf = buf.clone();
-                    }
-                    snap_to_tail(&buf, selected, items(&filtered));
-                    continue;
-                }
-                _ => {}
-            }
-            sync(&buf, selected, items(&filtered));
-        }
-        let _ = term.show_cursor();
-        None
+    /// Redraws the frame from current model state.
+    pub fn draw_now(&self) -> Result<()> {
+        lock_screen(&self.0).draw()
     }
 }
 
@@ -949,12 +1121,21 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
     Paragraph::new(Text::from(lines))
 }
 
-/// One quiet status line — the editor above it carries the prompt itself.
+/// One quiet status line — the editor above it carries the prompt itself. Queue depth and
+/// interrupt hints appear while the agent is working.
 fn footer_widget(model: &Model) -> Paragraph<'static> {
-    Paragraph::new(Line::styled(
-        model.footer.clone(),
-        Style::default().fg(BORDER),
-    ))
+    let mut text = model.footer.clone();
+    if model.thinking.is_some() {
+        text.push_str(" · Esc interrupts");
+    }
+    if model.queued_count > 0 {
+        let plural = if model.queued_count == 1 { "" } else { "s" };
+        text.push_str(&format!(
+            " \u{b7} {} message{} queued",
+            model.queued_count, plural
+        ));
+    }
+    Paragraph::new(Line::styled(text, Style::default().fg(BORDER)))
 }
 
 fn transcript_text(model: &Model, width: u16) -> Text<'static> {
