@@ -976,9 +976,16 @@ where
                         .as_ref()
                         .is_some_and(|s| s.status == PlanStatus::Pending)
                     {
-                        chat_ui.notice("Plan ready — approve? [y/N]")?;
+                        let plan_title = "Approve plan?";
+                        let plan_body = tools::render_plan(
+                            plan_mode
+                                .as_ref()
+                                .and_then(|state| state.plan_json.as_deref())
+                                .unwrap_or(""),
+                        )
+                        .unwrap_or_default();
                         let answer = tokio::select! {
-                            answer = read_approval_line(&mut input_rx, use_tui, hub.as_mut()) => answer,
+                            answer = read_approval_line(&mut input_rx, use_tui, hub.as_mut(), plan_title, plan_body) => answer,
                         () = wait_interrupt(&interrupt) => None,
                             signal = tokio::signal::ctrl_c() => {
                                 signal.context("failed to listen for Ctrl+C")?;
@@ -1066,12 +1073,18 @@ where
                     && !auto_approve
                     && !always_allowed.contains(&call.name)
                 {
-                    if let Some(preview) = tools.preview(call) {
-                        chat_ui.notice(&preview)?;
+                    let preview = tools.preview(call);
+                    if !use_tui {
+                        if let Some(preview) = &preview {
+                            chat_ui.notice(preview)?;
+                        }
+                        chat_ui.notice("approve? [y/N/a]")?;
                     }
-                    chat_ui.notice("approve? [y/N/a]")?;
+                    let modal_title = format!("Allow {}?", call.name);
+                    let modal_body =
+                        preview.unwrap_or_else(|| format!("{} {}", call.name, call.arguments));
                     let answer = tokio::select! {
-                        answer = read_approval_line(&mut input_rx, use_tui, hub.as_mut()) => answer,
+                        answer = read_approval_line(&mut input_rx, use_tui, hub.as_mut(), &modal_title, modal_body) => answer,
                         () = wait_interrupt(&interrupt) => None,
                         signal = tokio::signal::ctrl_c() => {
                             signal.context("failed to listen for Ctrl+C")?;
@@ -2336,10 +2349,15 @@ async fn read_approval_line(
     input_rx: &mut Option<mpsc::UnboundedReceiver<String>>,
     use_tui: bool,
     hub: Option<&mut InputHub>,
+    title: &str,
+    body: String,
 ) -> Option<String> {
     if use_tui {
         let hub = hub.expect("tui implies hub");
-        hub.request_line().await
+        hub.open_permission_modal(title, body);
+        let answer = hub.request_line().await;
+        hub.close_permission_modal();
+        answer
     } else {
         input_rx.as_mut().unwrap().recv().await
     }

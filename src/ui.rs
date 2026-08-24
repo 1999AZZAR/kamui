@@ -113,6 +113,22 @@ struct Model {
     help_visible: bool,
     /// Right-side status-bar badge ("5.9k tok 41%", amber past 80%).
     token_badge: Option<(String, u8)>,
+    /// Open approval modal (opencode permission panel).
+    permission: Option<PermissionState>,
+}
+
+/// Approval modal options, opencode labels.
+pub const PERM_OPTIONS: [(&str, &str); 3] = [
+    ("y", "Allow once"),
+    ("a", "Always allow this session"),
+    ("n", "Reject"),
+];
+
+#[derive(Debug, Clone)]
+pub struct PermissionState {
+    pub title: String,
+    pub body: String,
+    pub selected: usize,
 }
 
 /// A modal picker that submits an existing slash command on Enter — pure UI sugar over
@@ -172,6 +188,7 @@ impl Default for Model {
             dialog: None,
             help_visible: false,
             token_badge: None,
+            permission: None,
         }
     }
 }
@@ -759,6 +776,27 @@ impl InputHub {
             .unwrap_or_else(PoisonError::into_inner) = Some(tx);
         rx.await.ok()
     }
+
+    /// Opens/closes the approval modal from the keyboard-thread side.
+    pub fn open_permission_modal(&self, title: &str, body: String) {
+        {
+            let mut s = lock_screen(&self.screen.0);
+            s.model.permission = Some(PermissionState {
+                title: title.to_string(),
+                body,
+                selected: 0,
+            });
+        }
+        let _ = self.screen.draw_now();
+    }
+
+    pub fn close_permission_modal(&self) {
+        {
+            let mut s = lock_screen(&self.screen.0);
+            s.model.permission = None;
+        }
+        let _ = self.screen.draw_now();
+    }
 }
 
 /// RAII marker telling the keyboard thread the agent is running.
@@ -875,6 +913,72 @@ fn render_dialog(frame: &mut Frame<'_>, dialog: &DialogState, area: Rect) {
     );
 }
 
+/// Approval modal: preview body plus the three opencode options.
+fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) {
+    let width = 64.min(area.width.saturating_sub(4));
+    let body_rows: Vec<String> = wrap_display(&perm.body, width.saturating_sub(6) as usize)
+        .into_iter()
+        .take(10)
+        .collect();
+    let height = (body_rows.len() as u16 + PERM_OPTIONS.len() as u16 + 5)
+        .min(area.height.saturating_sub(2))
+        .max(7);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, box_area);
+    let mut lines = Vec::new();
+    for row in &body_rows {
+        lines.push(Line::styled(row.clone(), Style::default().fg(TEXT)));
+    }
+    lines.push(Line::from(""));
+    for (idx, (_, label)) in PERM_OPTIONS.iter().enumerate() {
+        let is_on = idx == perm.selected;
+        let prefix = if is_on { "\u{276f} " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(
+                prefix.to_string(),
+                Style::default().fg(if is_on { BLUE } else { BORDER }),
+            ),
+            Span::styled(
+                (*label).to_string(),
+                Style::default()
+                    .fg(match (idx, is_on) {
+                        (2, true) => RED,
+                        (2, false) => MUTED,
+                        (_, true) => TEXT,
+                        _ => MUTED,
+                    })
+                    .add_modifier(if is_on {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        "Enter confirm \u{b7} Esc rejects".to_string(),
+        Style::default().fg(BORDER),
+    )));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(WARN))
+                .title(format!(" {} ", perm.title))
+                .title_style(Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
+        ),
+        box_area,
+    );
+}
+
 /// `?` overlay: the keybinding sheet.
 fn help_overlay() -> Paragraph<'static> {
     let rows: [(&str, &str); 12] = [
@@ -975,6 +1079,56 @@ fn input_thread(
         };
         let Some(key) = key else { break };
         feed_errors = 0;
+
+        // --- Approval modal owns the keys while open ---
+        {
+            let mut s = lock_screen(&screen.0);
+            if let Some(perm) = s.model.permission.as_mut() {
+                match key.code {
+                    KeyCode::Up => {
+                        perm.selected = perm
+                            .selected
+                            .checked_sub(1)
+                            .unwrap_or(PERM_OPTIONS.len() - 1);
+                    }
+                    KeyCode::Down => {
+                        perm.selected = (perm.selected + 1) % PERM_OPTIONS.len();
+                    }
+                    KeyCode::Enter => {
+                        let answer = PERM_OPTIONS[perm.selected.min(PERM_OPTIONS.len() - 1)]
+                            .0
+                            .to_string();
+                        s.model.permission = None;
+                        drop(s);
+                        if let Some(tx) = requester
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .take()
+                        {
+                            let _ = tx.send(answer);
+                        }
+                        continue;
+                    }
+                    KeyCode::Esc => {
+                        s.model.permission = None;
+                        drop(s);
+                        if let Some(tx) = requester
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .take()
+                        {
+                            let _ = tx.send("n".to_string());
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                drop(s);
+                let _ = screen.draw_now();
+                continue;
+            }
+            drop(s);
+        }
 
         // --- Modal overlays own the keys while open (opencode dialogs) ---
         {
@@ -1120,6 +1274,14 @@ fn input_thread(
                 }
             }
             KeyCode::Enter => {
+                // opencode editor behavior: a trailing backslash escapes the newline and
+                // continues the message on the next line.
+                if buf.ends_with('\\') {
+                    buf.pop();
+                    buf.push('\n');
+                    selected = 0;
+                    continue 'keys;
+                }
                 let line = buf.trim().to_string();
                 buf.clear();
                 selected = 0;
@@ -1131,6 +1293,12 @@ fn input_thread(
                     history_idx = history.len();
                 }
                 submit_line(&screen, &tx, &requester, &busy, &queue, line);
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                scroll_screen(&screen, -(page_rows(&screen) / 2));
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                scroll_screen(&screen, page_rows(&screen) / 2);
             }
             KeyCode::Esc => {
                 if is_busy {
@@ -1263,12 +1431,15 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> usize {
     // OpenCode layout: transcript on top, autocomplete menu above the bordered editor, a
     // one-line footer, and the sidebar rail splitting the body horizontally.
     let popup_height = menu_height(model.ac_items.len());
+    // Multiline editor: grows with the buffer's newlines (backslash-newline continuation).
+    let input_lines = model.input.lines().count().max(1);
+    let editor_rows = (input_lines as u16).min(6) + 2;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(popup_height),
-            Constraint::Length(3),
+            Constraint::Length(editor_rows),
             Constraint::Length(1),
         ])
         .split(frame.area());
@@ -1317,18 +1488,24 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> usize {
     frame.render_widget(editor_widget(model, editor_area), editor_area);
 
     // Terminal cursor sits at the end of the typed text whenever the editor owns input.
-    if model.thinking.is_none() {
-        let inner = editor_area.width.saturating_sub(4) as usize;
-        let visible = UnicodeWidthStr::width(input_tail(&model.input, inner));
-        let col = editor_area.x + 2 + visible.min(inner) as u16;
+    if model.thinking.is_none() && !model.intro {
+        let inner = editor_area.width.saturating_sub(4).max(1) as usize;
+        let segments: Vec<&str> = model.input.split('\n').collect();
+        let last = segments.last().copied().unwrap_or("");
+        let row = editor_area.y + 1 + segments.len().saturating_sub(1).min(4) as u16;
+        let col =
+            editor_area.x + 2 + UnicodeWidthStr::width(input_tail(last, inner)).min(inner) as u16;
         frame.set_cursor_position((
             col.min(editor_area.right().saturating_sub(1)),
-            editor_area.y + 1,
+            row.min(editor_area.bottom().saturating_sub(1)),
         ));
     }
 
     frame.render_widget(footer_widget(model), footer_area);
 
+    if let Some(perm) = &model.permission {
+        render_permission(frame, perm, frame.area());
+    }
     if model.help_visible {
         frame.render_widget(help_overlay(), frame.area());
     }
@@ -1347,7 +1524,6 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> usize {
 /// buffer, and a meta line pairing session info with key hints.
 fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
     // Horizontal viewport: keep the caret (always at the end of the buffer) on screen.
-    let inner = area.width.saturating_sub(4).max(1) as usize;
     let thinking = match model.thinking {
         Some((frame_idx, label)) => Line::from(vec![
             Span::styled(
@@ -1366,16 +1542,30 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
                 Style::default().add_modifier(Modifier::DIM),
             ),
         ]),
-        None => Line::from(vec![
-            Span::styled(
+        None => {
+            // Render every newline segment; viewport shows the last few lines.
+            let inner = area.width.saturating_sub(4).max(1) as usize;
+            let segments: Vec<&str> = model.input.split('\n').collect();
+            let first = segments.len().saturating_sub(5);
+            let mut spans = vec![Span::styled(
                 "\u{276f} ".to_string(),
                 Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                input_tail(&model.input, inner).to_string(),
-                Style::default().fg(TEXT),
-            ),
-        ]),
+            )];
+            for (i, seg) in segments[first..].iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::raw("  "));
+                }
+                spans.push(Span::styled(
+                    if i + 1 == segments[first..].len() {
+                        input_tail(seg, inner).to_string()
+                    } else {
+                        (*seg).to_string()
+                    },
+                    Style::default().fg(TEXT),
+                ));
+            }
+            Line::from(spans)
+        }
     };
     // Session info only; keybind hints live in the footer so long paths
     // never collide with them.
