@@ -267,6 +267,23 @@ where
         if input.is_empty() {
             continue;
         }
+        // `!cmd` runs a shell command directly — no model, no approval, the human typed it.
+        if let Some(direct) = input.strip_prefix('!') {
+            let direct = direct.trim();
+            if direct.is_empty() {
+                chat_ui.notice("usage: !<command> runs it in the shell (e.g. !git status)")?;
+                continue;
+            }
+            let output = tools::run_direct_command(
+                project.root(),
+                direct,
+                Duration::from_secs(config.command_timeout_secs),
+            )
+            .await;
+            chat_ui.tool_call("shell", direct)?;
+            chat_ui.tool_output(&output)?;
+            continue;
+        }
         chat_ui.user(input)?;
 
         // A custom command (`/review`, ...) or skill (`/my-skill`, `/skill:my-skill`) expands
@@ -295,8 +312,16 @@ where
                 }
                 continue;
             }
-            if command == "/warnings" {
-                show_warnings = !show_warnings;
+            if command == "/warnings" || command == "/warning" {
+                show_warnings = match argument.to_ascii_lowercase().as_str() {
+                    "" => !show_warnings,
+                    "on" | "show" => true,
+                    "off" | "hide" => false,
+                    other => {
+                        chat_ui.notice(&format!("usage: /warnings [on|off] (got \"{other}\")"))?;
+                        continue;
+                    }
+                };
                 chat_ui.set_warnings_visible(show_warnings)?;
                 chat_ui.notice(if show_warnings {
                     "Warnings shown."
@@ -481,6 +506,7 @@ where
             }
             let prev_session_id = session.as_ref().map(|s| s.id.clone());
             let messages_before = messages.len();
+            let tui_sink = if use_tui { Some(&mut chat_ui) } else { None };
             if let Err(error) = handle_command(
                 input,
                 provider.as_ref(),
@@ -491,6 +517,7 @@ where
                 &mut always_allowed,
                 &mut last_turn_snapshot,
                 &config.prices,
+                tui_sink,
             ) {
                 if chat_ui.is_fullscreen() {
                     chat_ui.error(&format!("Command failed: {error:#}"))?;
@@ -1560,9 +1587,21 @@ fn handle_command(
     always_allowed: &mut HashSet<String>,
     last_turn_snapshot: &mut Option<HashMap<PathBuf, Option<String>>>,
     prices: &Prices,
+    mut tui: Option<&mut ChatUi>,
 ) -> Result<()> {
     let (command, argument) = input.split_once(' ').unwrap_or((input, ""));
     let argument = argument.trim();
+    // Command output must land inside the fullscreen transcript instead of printing raw to a
+    // terminal the ratatui frame owns; plain mode keeps direct stdout.
+    macro_rules! out {
+        ($($arg:tt)*) => {
+            if let Some(ui) = tui.as_deref_mut() {
+                ui.notice(&format!($($arg)*))?;
+            } else {
+                println!($($arg)*);
+            }
+        };
+    }
 
     match command {
         "/help" => print_help(),
@@ -1571,12 +1610,12 @@ fn handle_command(
             messages.clear();
             always_allowed.clear();
             *last_turn_snapshot = None;
-            println!("Started a new chat. It will be saved after the first response.\n");
+            out!("Started a new chat. It will be saved after the first response.\n");
         }
         "/sessions" => {
             let sessions = database.list_sessions()?;
             if sessions.is_empty() {
-                println!("No saved sessions.\n");
+                out!("No saved sessions.\n");
             } else {
                 for item in sessions {
                     let marker = if session
@@ -1587,7 +1626,7 @@ fn handle_command(
                     } else {
                         " "
                     };
-                    println!(
+                    out!(
                         "{marker} {}  {}  {:<40} {:>3} messages  {:>8} tokens",
                         short_id(&item.id),
                         format_timestamp(item.updated_at),
@@ -1609,7 +1648,7 @@ fn handle_command(
                 );
             }
             *messages = database.load_messages(&resumed.id)?;
-            println!("Resumed: {} ({})\n", resumed.title, short_id(&resumed.id));
+            out!("Resumed: {} ({})\n", resumed.title, short_id(&resumed.id));
             // Note: Plan Mode restore is handled by the main loop's plan_mode state;
             // /resume via handle_command is not the startup resume path, so we don't
             // rehydrate here — the caller would need &mut plan_mode.
@@ -1619,7 +1658,7 @@ fn handle_command(
         "/delete" => {
             let target = resolve_session(database, argument)?;
             database.delete_session(&target.id)?;
-            println!("Deleted: {}\n", target.title);
+            out!("Deleted: {}\n", target.title);
             if session
                 .as_ref()
                 .is_some_and(|session| target.id == session.id)
@@ -1628,7 +1667,7 @@ fn handle_command(
                 messages.clear();
                 always_allowed.clear();
                 *last_turn_snapshot = None;
-                println!("Started a new chat. It will be saved after the first response.\n");
+                out!("Started a new chat. It will be saved after the first response.\n");
             }
         }
         "/rename" => {
@@ -1645,7 +1684,7 @@ fn handle_command(
             {
                 active.title = new_title.to_string();
             }
-            println!("Renamed {} to: {new_title}\n", short_id(&target.id));
+            out!("Renamed {} to: {new_title}\n", short_id(&target.id));
         }
         "/search" => {
             if argument.is_empty() {
@@ -1653,7 +1692,7 @@ fn handle_command(
             }
             let hits = database.search_messages(argument, 20)?;
             if hits.is_empty() {
-                println!("No messages matched \"{argument}\".\n");
+                out!("No messages matched \"{argument}\".\n");
             } else {
                 for hit in hits {
                     let speaker = match hit.role.as_str() {
@@ -1662,7 +1701,7 @@ fn handle_command(
                         "system" => "System",
                         _ => "?",
                     };
-                    println!(
+                    out!(
                         "{}  {}  {:<30}  {speaker}: {}",
                         short_id(&hit.session_id),
                         format_timestamp(hit.created_at),
@@ -1675,19 +1714,19 @@ fn handle_command(
         }
         "/stats" => match session.as_ref() {
             Some(session) => print_stats(database, session, context_window, prices)?,
-            None => println!("This chat has no saved messages yet.\n"),
+            None => out!("This chat has no saved messages yet.\n"),
         },
         "/usage" => print_usage_report(database, prices)?,
         "/memory" => {
             let entries = database.list_memory()?;
             if entries.is_empty() {
-                println!("Nothing remembered yet.\n");
+                out!("Nothing remembered yet.\n");
             } else {
-                println!("Remembered facts:");
+                out!("Remembered facts:");
                 for entry in &entries {
-                    println!("- {}", entry.content);
+                    out!("- {}", entry.content);
                 }
-                println!("\nUse /forget <text> or /forget all.\n");
+                out!("\nUse /forget <text> or /forget all.\n");
             }
         }
         "/forget" => {
@@ -1696,17 +1735,17 @@ fn handle_command(
             }
             if argument.eq_ignore_ascii_case("all") {
                 let count = database.clear_memory()?;
-                println!("Forgot all {count} remembered fact(s).\n");
+                out!("Forgot all {count} remembered fact(s).\n");
             } else if database.forget(argument)? {
-                println!("Forgot the fact matching \"{argument}\".\n");
+                out!("Forgot the fact matching \"{argument}\".\n");
             } else {
-                println!(
+                out!(
                     "No remembered fact matches \"{argument}\", or the text matches more than \
                      one. Use /memory to see exact wording.\n"
                 );
             }
         }
-        _ => println!("Unknown command. Type /help for available commands.\n"),
+        _ => out!("Unknown command. Type /help for available commands.\n"),
     }
 
     Ok(())
@@ -2956,6 +2995,7 @@ fn format_timestamp(timestamp: i64) -> String {
 }
 
 fn print_help() {
+    println!("!<command>        Run a shell command directly (no model involvement)");
     println!("/plan             Enter Plan Mode (gate mutating tools until plan approved)");
     println!("/skills           List discovered skills");
     println!("/warnings         Hide or show warning messages");
@@ -3960,6 +4000,7 @@ mod tests {
             &mut always_allowed,
             &mut last_turn_snapshot,
             &Prices::default(),
+            None,
         )
         .unwrap();
 
@@ -3989,6 +4030,7 @@ mod tests {
             &mut always_allowed,
             &mut last_turn_snapshot,
             &Prices::default(),
+            None,
         )
         .unwrap();
 

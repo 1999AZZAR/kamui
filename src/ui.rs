@@ -109,7 +109,7 @@ impl Default for Model {
             cards: Vec::new(),
             notices: Vec::new(),
             footer: String::from(
-                "/ commands · Tab complete · \u{2191} history · Enter send · Ctrl+C cancel",
+                "! shell · / commands · Tab · \u{2191} history · PgUp/PgDn scroll · Ctrl+C cancel",
             ),
             scroll_from_bottom: 0,
             prompt_visible: true,
@@ -701,11 +701,7 @@ impl ScreenHandle {
 fn render(frame: &mut Frame<'_>, model: &Model) -> usize {
     // OpenCode layout: transcript on top, autocomplete menu above the bordered editor, a
     // one-line footer, and the sidebar rail splitting the body horizontally.
-    let popup_height: u16 = if model.ac_items.is_empty() {
-        0
-    } else {
-        (model.ac_items.len() as u16 + 2).min(12)
-    };
+    let popup_height = menu_height(model.ac_items.len());
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -798,13 +794,12 @@ fn editor_widget(model: &Model) -> Paragraph<'static> {
             Span::styled(model.input.clone(), Style::default().fg(TEXT)),
         ]),
     };
-    let hints = "/ commands · Tab complete · \u{2191} history · Ctrl+C cancel";
-    let pad = 60usize.saturating_sub(model.header.chars().count() + 2 + hints.len());
-    let meta = Line::from(vec![
-        Span::styled(model.header.clone(), Style::default().fg(MUTED)),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(hints.to_string(), Style::default().fg(BORDER)),
-    ]);
+    // Session info only; keybind hints live in the footer so long paths
+    // never collide with them.
+    let meta = Line::styled(
+        crate::tui::truncate_chars(&model.header, 72),
+        Style::default().fg(MUTED),
+    );
     Paragraph::new(Text::from(vec![thinking, meta]))
         .style(Style::default().bg(BG_ELEMENT))
         .block(
@@ -815,13 +810,42 @@ fn editor_widget(model: &Model) -> Paragraph<'static> {
 }
 
 /// Slash-command menu rendered above the editor while the buffer looks like a command.
+/// How many menu rows fit above the editor at once; arrows scroll within this window.
+const MENU_VISIBLE: usize = 8;
+
+pub(crate) fn menu_height(item_count: usize) -> u16 {
+    if item_count == 0 {
+        0
+    } else {
+        (item_count.min(MENU_VISIBLE) as u16 + 2).min(10)
+    }
+}
+
 fn popup_widget(model: &Model) -> Paragraph<'static> {
-    let mut lines: Vec<Line<'static>> = vec![Line::styled(
-        "\u{2500}".repeat(40),
-        Style::default().fg(BORDER),
-    )];
-    for (idx, (name, description)) in model.ac_items.iter().enumerate() {
-        let is_on = idx == model.ac_selected;
+    let total = model.ac_items.len();
+    let selected = model.ac_selected.min(total.saturating_sub(1));
+    // Sliding window keeps the highlighted row in view no matter how many candidates match.
+    let start = if total <= MENU_VISIBLE {
+        0
+    } else {
+        selected
+            .saturating_sub(MENU_VISIBLE / 2)
+            .min(total - MENU_VISIBLE)
+    };
+    let end = total.min(start + MENU_VISIBLE);
+
+    let counter = if total > MENU_VISIBLE {
+        format!(" {} / {}", selected + 1, total)
+    } else {
+        String::new()
+    };
+    let mut lines: Vec<Line<'static>> = vec![Line::from(vec![
+        Span::styled("\u{2500}".repeat(40), Style::default().fg(BORDER)),
+        Span::styled(counter, Style::default().fg(BORDER)),
+    ])];
+    for idx in start..end {
+        let (name, description) = &model.ac_items[idx];
+        let is_on = idx == selected;
         let prefix = if is_on { "\u{276f} " } else { "  " };
         lines.push(Line::from(vec![
             Span::styled(
@@ -848,8 +872,6 @@ fn popup_widget(model: &Model) -> Paragraph<'static> {
     Paragraph::new(Text::from(lines)).style(Style::default().bg(BG_PANEL))
 }
 
-/// Session-info rail: each entry renders its key in bold with the value muted beneath,
-/// sections separated by blank lines — the same visual grammar as opencode's sidebar.
 fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     if let Some(entries) = &model.sidebar {
@@ -858,9 +880,10 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
                 format!("{key} "),
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             )));
-            for value_line in wrap_display(value, area.width.saturating_sub(4) as usize) {
-                lines.push(Line::styled(value_line, Style::default().fg(NOTICE_FG)));
-            }
+            lines.push(Line::styled(
+                crate::tui::truncate_chars(value, area.width.saturating_sub(4) as usize),
+                Style::default().fg(NOTICE_FG),
+            ));
             lines.push(Line::from(""));
         }
     }

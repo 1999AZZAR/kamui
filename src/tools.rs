@@ -1592,6 +1592,44 @@ pub(crate) fn write_atomic(path: &Path, content: &str) -> Result<()> {
     })
 }
 
+/// Runs a user-typed `!<command>` directly in the project shell. No approval flow — the human
+/// typed it — but the same timeout, output cap, and exit-code reporting as the model's
+/// `run_command` tool. Returns the formatted transcript text.
+pub async fn run_direct_command(
+    root: &std::path::Path,
+    command: &str,
+    timeout: std::time::Duration,
+) -> String {
+    let (shell, flag) = if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    };
+    let child = tokio::process::Command::new(shell)
+        .arg(flag)
+        .arg(command)
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn();
+    let child = match child {
+        Ok(child) => child,
+        Err(error) => return format!("Error: failed to start the command: {error:#}"),
+    };
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(result) => match result {
+            Ok(output) => format!("command: {command}\n{}", format_command_output(&output)),
+            Err(error) => format!("Error: failed to run the command: {error:#}"),
+        },
+        Err(_) => format!(
+            "Error: command timed out after {} seconds and was terminated",
+            timeout.as_secs()
+        ),
+    }
+}
+
 fn format_command_output(output: &Output) -> String {
     let code = output
         .status
