@@ -14,10 +14,10 @@ const GLOBAL_DIR: &str = "commands";
 
 /// Built-in chat commands a custom command may not shadow, so a stray file can never take over
 /// `/new` or `/exit`. Kept in sync with `chat::print_help` and the chat loop's own dispatch.
-const RESERVED: [&str; 20] = [
+const RESERVED: [&str; 21] = [
     "help", "new", "sessions", "resume", "model", "rename", "search", "compact", "undo", "jobs",
     "index", "delete", "stats", "status", "memory", "forget", "exit", "commands", "skills",
-    "usage",
+    "usage", "warnings",
 ];
 
 /// Where a command was loaded from. A project command shadows a global one of the same name, the

@@ -80,8 +80,8 @@ where
     let skill_warning_count = skill_library.warnings().len();
     if skill_warning_count > 0 {
         if use_tui {
-            chat_ui.notice(&format!(
-                "⚠ {skill_warning_count} skill folder(s) skipped (invalid name or frontmatter) — /skills for details"
+            chat_ui.warning(&format!(
+                "{skill_warning_count} skill folder(s) skipped (invalid name or frontmatter) — /skills for details; /warnings hides"
             ))?;
         } else {
             for warning in skill_library.warnings() {
@@ -152,6 +152,7 @@ where
         project,
         None,
         context_window,
+        None,
     );
     // Restore pending plan on resume/startup.
     let mut plan_mode: Option<PlanModeState> = session
@@ -192,6 +193,8 @@ where
     let mut always_allowed: HashSet<String> = HashSet::new();
     // `/plan` forces the next turn into Plan Mode even for a small task.
     let mut plan_requested = false;
+    // `/warnings` flips this; the transcript only renders the warning rail when it is set.
+    let mut show_warnings = true;
 
     'chat: loop {
         let input = if use_tui {
@@ -290,6 +293,16 @@ where
                 } else {
                     print_commands(&command_library);
                 }
+                continue;
+            }
+            if command == "/warnings" {
+                show_warnings = !show_warnings;
+                chat_ui.set_warnings_visible(show_warnings)?;
+                chat_ui.notice(if show_warnings {
+                    "Warnings shown."
+                } else {
+                    "Warnings hidden. /warnings to show again."
+                })?;
                 continue;
             }
             if command == "/expand" {
@@ -802,18 +815,28 @@ where
                 context_window,
             );
             if chat_ui.is_fullscreen() {
-                chat_ui.notice(&usage_line)?;
+                // The usage report lives in the sidebar rail; the transcript stays readable.
+                update_sidebar(
+                    &mut chat_ui,
+                    session.as_ref(),
+                    &active.model,
+                    project,
+                    Some(usage.prompt_tokens),
+                    context_window,
+                    Some(usage_line),
+                );
             } else {
                 println!("{usage_line}");
+                update_sidebar(
+                    &mut chat_ui,
+                    session.as_ref(),
+                    &active.model,
+                    project,
+                    Some(usage.prompt_tokens),
+                    context_window,
+                    None,
+                );
             }
-            update_sidebar(
-                &mut chat_ui,
-                session.as_ref(),
-                &active.model,
-                project,
-                Some(usage.prompt_tokens),
-                context_window,
-            );
             accumulate_usage(&mut final_usage, &usage);
             final_finish = finish_reason;
             last_content = content.clone();
@@ -2042,6 +2065,7 @@ fn update_sidebar(
     project: &ProjectContext,
     last_input_tokens: Option<u64>,
     context_window: Option<u64>,
+    last_turn: Option<String>,
 ) {
     if !chat_ui.is_fullscreen() {
         return;
@@ -2069,6 +2093,9 @@ fn update_sidebar(
         (None, _) => "\u{2014}".to_string(),
     };
     entries.push(("Context".to_string(), context_line));
+    if let Some(last_turn) = last_turn {
+        entries.push(("Last turn".to_string(), last_turn));
+    }
     let _ = chat_ui.set_sidebar(entries);
 }
 
@@ -2931,6 +2958,7 @@ fn format_timestamp(timestamp: i64) -> String {
 fn print_help() {
     println!("/plan             Enter Plan Mode (gate mutating tools until plan approved)");
     println!("/skills           List discovered skills");
+    println!("/warnings         Hide or show warning messages");
     println!("/new              Start a new session");
     println!("/sessions         List saved sessions");
     println!("/resume <id>      Resume a session");

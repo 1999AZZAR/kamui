@@ -54,6 +54,7 @@ const BG_ELEMENT: Color = Color::Rgb(0x1e, 0x1e, 0x1e);
 const BG_PANEL: Color = Color::Rgb(0x14, 0x14, 0x14);
 const BLUE: Color = Color::Rgb(0x5c, 0x9c, 0xf5);
 const GREEN: Color = Color::Rgb(0x7f, 0xd8, 0x8f);
+const WARN: Color = Color::Rgb(0xf5, 0xa7, 0x42);
 const RED: Color = Color::Rgb(0xe0, 0x6c, 0x75);
 /// Kept from the earlier blue scheme; NOTICE_FG aliases it for readability everywhere.
 const NOTICE_FG: Color = MUTED;
@@ -96,6 +97,9 @@ struct Model {
     /// Autocomplete menu state mirrored from the input loop each keystroke.
     ac_items: Vec<(String, String)>,
     ac_selected: usize,
+    /// Warning messages render separately so `/warnings` can hide or reveal them.
+    warnings: Vec<String>,
+    warnings_visible: bool,
 }
 
 impl Default for Model {
@@ -115,6 +119,8 @@ impl Default for Model {
             input: String::new(),
             ac_items: Vec::new(),
             ac_selected: 0,
+            warnings: Vec::new(),
+            warnings_visible: true,
         }
     }
 }
@@ -226,6 +232,14 @@ impl FullScreen {
         self.model.notices.push(text.into());
         if self.model.notices.len() > 32 {
             self.model.notices.remove(0);
+        }
+        self.draw()
+    }
+
+    fn add_warning(&mut self, text: String) -> Result<()> {
+        self.model.warnings.push(text);
+        if self.model.warnings.len() > 32 {
+            self.model.warnings.remove(0);
         }
         self.draw()
     }
@@ -455,12 +469,24 @@ impl ChatUi {
 
     pub fn warning(&mut self, text: &str) -> Result<()> {
         match self.fullscreen.as_ref() {
-            Some(screen) => lock_screen(screen).add_notice(format!("WARNING: {text}")),
+            Some(screen) => lock_screen(screen).add_warning(text.to_string()),
             None => {
                 print!("{}", crate::render::render_warning(text, self.plain));
                 io::stdout().flush()?;
                 Ok(())
             }
+        }
+    }
+
+    /// Show or hide warning messages in the transcript (`/warnings`).
+    pub fn set_warnings_visible(&mut self, visible: bool) -> Result<()> {
+        match self.fullscreen.as_ref() {
+            Some(screen) => {
+                let mut screen = lock_screen(screen);
+                screen.model.warnings_visible = visible;
+                screen.draw()
+            }
+            None => Ok(()),
         }
     }
 
@@ -883,14 +909,19 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
             Style::default().add_modifier(Modifier::DIM),
         ),
     ]));
-    // Startup notices (warnings, hints) still belong on the home screen — the logo must never
-    // hide them.
+    // Startup notices still belong on the home screen — the logo must never hide them.
     for notice in &model.notices {
         lines.push(Line::from(""));
-        lines.push(Line::styled(
-            format!("\u{2500}\u{2500}\u{2500} {notice} "),
-            Style::default().fg(NOTICE_FG),
-        ));
+        lines.push(Line::styled(notice.clone(), Style::default().fg(MUTED)));
+    }
+    if model.warnings_visible {
+        for warning in &model.warnings {
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                format!("\u{26a0} {warning}"),
+                Style::default().fg(WARN),
+            ));
+        }
     }
     Paragraph::new(Text::from(lines))
 }
@@ -913,6 +944,14 @@ fn transcript_text(model: &Model, width: u16) -> Text<'static> {
     // Status notes render as quiet plain lines, opencode-style.
     for notice in &model.notices {
         lines.push(Line::styled(notice.clone(), Style::default().fg(MUTED)));
+    }
+    if model.warnings_visible {
+        for warning in &model.warnings {
+            lines.push(Line::styled(
+                format!("\u{26a0} {warning}"),
+                Style::default().fg(WARN),
+            ));
+        }
     }
     Text::from(lines)
 }
