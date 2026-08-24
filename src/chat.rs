@@ -39,7 +39,7 @@ const ACTIVE_PROFILE_KEY: &str = "active_profile";
 
 #[allow(clippy::too_many_arguments)]
 pub async fn start_chat<F>(
-    config: Config,
+    mut config: Config,
     tools: ToolRegistry,
     mcp_statuses: Vec<ConnectionStatus>,
     database: &Database,
@@ -101,8 +101,15 @@ where
     if skill_warning_count > 0 {
         if use_tui {
             chat_ui.warning(&format!(
-                "{skill_warning_count} skill folder(s) skipped (invalid name or frontmatter) — /skills for details; /warnings hides"
+                "{skill_warning_count} skill folder(s) skipped (invalid name or frontmatter) — /warnings details, /warnings fix"
             ))?;
+            chat_ui.set_warning_details(
+                skill_library
+                    .warnings()
+                    .iter()
+                    .map(|w| w.to_string())
+                    .collect(),
+            )?;
         } else {
             for warning in skill_library.warnings() {
                 eprintln!("warning: {warning}");
@@ -210,6 +217,8 @@ where
     let mut plan_requested = false;
     // `/warnings` flips this; the transcript only renders the warning rail when it is set.
     let mut show_warnings = true;
+    // In-flight "Add provider" wizard: base URL + API key awaiting a picked model id.
+    let mut pending_add: Option<(String, String)> = None;
 
     'chat: loop {
         let input = if use_tui {
@@ -318,16 +327,89 @@ where
                 chat_ui.toggle_help()?;
                 continue;
             }
-            // Bare `/model` opens the picker; `/model <name>` still switches directly.
-            if command == "/model" && use_tui && argument.is_empty() {
-                let opened = hub
-                    .as_ref()
-                    .map(|h| h.open_models_dialog())
-                    .unwrap_or(false);
-                if !opened {
-                    chat_ui.notice("No provider profiles configured.")?;
+            // `/model` opens the picker; `__add__` runs the registry wizard; picking from
+            // that wizard registers + switches; `<name>` switches directly.
+            if command == "/model" && use_tui {
+                let hub_ref = hub.as_mut().expect("tui implies hub");
+                if argument == "__add__" {
+                    chat_ui
+                        .notice("Add provider — Base URL (Enter = https://api.openai.com/v1):")?;
+                    let base = hub_ref.request_line().await.unwrap_or_default();
+                    let base = base.trim().trim_end_matches('/');
+                    let base = if base.is_empty() {
+                        "https://api.openai.com/v1"
+                    } else {
+                        base
+                    }
+                    .to_string();
+                    chat_ui.notice("API key (input is echoed):")?;
+                    let key = hub_ref.request_line().await.unwrap_or_default();
+                    let key = key.trim().to_string();
+                    if key.is_empty() {
+                        chat_ui.notice("Cancelled—empty API key.")?;
+                        continue;
+                    }
+                    chat_ui.notice("Fetching models…")?;
+                    match crate::provider::openai::OpenAIProvider::list_models(&key, &base).await {
+                        Ok(models) if !models.is_empty() => {
+                            chat_ui.notice(&format!("{} models found— pick one.", models.len()))?;
+                            pending_add = Some((base, key));
+                            hub_ref.open_dialog(
+                                "Pick Model",
+                                "/model __picked__ ",
+                                models.iter().map(|m| (m.clone(), m.clone())).collect(),
+                            );
+                        }
+                        Ok(_) => chat_ui.notice("Provider returned no models.")?,
+                        Err(error) => {
+                            chat_ui.error(&format!("Could not load models: {error:#}"))?
+                        }
+                    }
+                    continue;
                 }
-                continue;
+                if let Some(rest) = argument.strip_prefix("__picked__ ") {
+                    let Some((base, key)) = pending_add.as_ref() else {
+                        chat_ui.error("No pending provider registration.")?;
+                        continue;
+                    };
+                    let path = crate::config::global_config_path()?;
+                    let name = crate::config::append_profile(&path, base, key, rest)?;
+                    let profile = crate::config::Profile {
+                        name: name.clone(),
+                        model: rest.to_string(),
+                        base_url: base.clone(),
+                        api_key: key.clone(),
+                        context_window: None,
+                        tools: true,
+                        embedding_model: None,
+                    };
+                    active = profile.clone();
+                    provider = build_provider(&active);
+                    context_window = None;
+                    database.set_setting(ACTIVE_PROFILE_KEY, &name)?;
+                    config.profiles.push(profile);
+                    pending_add = None;
+                    refresh_model_source(&config, hub_ref);
+                    update_sidebar(
+                        &mut chat_ui,
+                        session.as_ref(),
+                        &active.model,
+                        project,
+                        None,
+                        context_window,
+                        None,
+                    );
+                    chat_ui.notice(&format!("Added & switched to {rest} (profile {name})."))?;
+                    continue;
+                }
+                if argument.is_empty() {
+                    let opened = hub_ref.open_models_dialog();
+                    if !opened {
+                        chat_ui.notice("No provider profiles configured. Use /model __add__.")?;
+                    }
+                    continue;
+                }
+                // A concrete name: fall through to handle_command's direct switch.
             }
             if command == "/sessions" && use_tui {
                 let opened = hub
@@ -375,21 +457,54 @@ where
                 continue;
             }
             if command == "/warnings" || command == "/warning" {
-                show_warnings = match argument.to_ascii_lowercase().as_str() {
-                    "" => !show_warnings,
-                    "on" | "show" => true,
-                    "off" | "hide" => false,
-                    other => {
-                        chat_ui.notice(&format!("usage: /warnings [on|off] (got \"{other}\")"))?;
-                        continue;
+                match argument.to_ascii_lowercase().as_str() {
+                    "" => {
+                        show_warnings = !show_warnings;
+                        chat_ui.set_warnings_visible(show_warnings)?;
+                        chat_ui.notice(if show_warnings {
+                            "Warnings shown."
+                        } else {
+                            "Warnings hidden. /warnings to show again."
+                        })?;
                     }
-                };
-                chat_ui.set_warnings_visible(show_warnings)?;
-                chat_ui.notice(if show_warnings {
-                    "Warnings shown."
-                } else {
-                    "Warnings hidden. /warnings to show again."
-                })?;
+                    "details" | "expand" => {
+                        show_warnings = true;
+                        chat_ui.set_warning_details(
+                            skill_library
+                                .warnings()
+                                .iter()
+                                .map(|w| w.to_string())
+                                .collect(),
+                        )?;
+                        chat_ui.set_warnings_expanded(true)?;
+                        chat_ui.set_warnings_visible(true)?;
+                        chat_ui.notice("Warning details expanded.")?;
+                    }
+                    "collapse" => {
+                        chat_ui.set_warnings_expanded(false)?;
+                    }
+                    "fix" => {
+                        let details = skill_library.warnings().join("\n- ");
+                        if details.is_empty() {
+                            chat_ui.notice("No warnings to fix.")?;
+                            continue;
+                        }
+                        let prompt = format!(
+                            "Kamui's skill loader rejected these skill folders:\n- {details}\n\nInspect each path, repair the folder name and SKILL.md frontmatter (name + description required, lowercase-dash folder), and verify the loader would accept them. Do not delete skills unless they are clearly junk."
+                        );
+                        if let Some(h) = hub.as_ref() {
+                            h.push_prompt(prompt);
+                            chat_ui.notice("Asked Kamui to repair the flagged skills.")?;
+                        } else {
+                            anyhow::bail!("/warnings fix requires interactive TUI mode");
+                        }
+                    }
+                    other => {
+                        chat_ui.notice(&format!(
+                            "usage: /warnings [on|off|details|fix] (got \"{other}\")"
+                        ))?;
+                    }
+                }
                 continue;
             }
             if command == "/expand" {
@@ -2273,6 +2388,30 @@ fn print_history_preview(messages: &[Message]) {
 /// Refresh the fullscreen sidebar rail (opencode-style): session identity on top, model and
 /// context usage beneath. Called at startup and after every completed round so the context
 /// figure tracks the live conversation.
+/// Model-picker entries: every configured profile plus the registry entry that opens the
+/// add-provider wizard (onboarding reused as an in-TUI model registry).
+fn model_dialog_items(config: &Config) -> Vec<(String, String)> {
+    let mut items: Vec<(String, String)> = config
+        .profiles
+        .iter()
+        .map(|profile| {
+            (
+                profile.name.clone(),
+                format!("{} · {}", profile.name, profile.model),
+            )
+        })
+        .collect();
+    items.push((
+        "__add__".to_string(),
+        "＋ Add provider / model…".to_string(),
+    ));
+    items
+}
+
+/// Refreshes the picker source from the live config (after adds/switches).
+fn refresh_model_source(config: &Config, hub: &InputHub) {
+    hub.set_models(model_dialog_items(config));
+}
 /// Pushes recent sessions into the Ctrl+S switcher (id -> title labels).
 fn refresh_session_source(database: &Database, hub: &InputHub) {
     if let Ok(sessions) = database.list_sessions() {

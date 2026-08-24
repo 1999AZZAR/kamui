@@ -105,6 +105,8 @@ struct Model {
     /// Warning messages render separately so `/warnings` can hide or reveal them.
     warnings: Vec<String>,
     warnings_visible: bool,
+    warning_details: Vec<String>,
+    warning_details_visible: bool,
     /// Lines typed while the agent runs; shown in the footer until consumed.
     queued_count: usize,
     /// Open modal (model picker / session switcher), opencode-style.
@@ -184,6 +186,8 @@ impl Default for Model {
             ac_selected: 0,
             warnings: Vec::new(),
             warnings_visible: true,
+            warning_details: Vec::new(),
+            warning_details_visible: false,
             queued_count: 0,
             dialog: None,
             help_visible: false,
@@ -603,6 +607,29 @@ impl ChatUi {
         }
     }
 
+    /// Per-warning detail lines (paths + reasons).
+    pub fn set_warning_details(&mut self, details: Vec<String>) -> Result<()> {
+        match self.fullscreen.as_ref() {
+            Some(screen) => {
+                let mut screen = lock_screen(screen);
+                screen.model.warning_details = details;
+                screen.draw()
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub fn set_warnings_expanded(&mut self, expanded: bool) -> Result<()> {
+        match self.fullscreen.as_ref() {
+            Some(screen) => {
+                let mut screen = lock_screen(screen);
+                screen.model.warning_details_visible = expanded;
+                screen.draw()
+            }
+            None => Ok(()),
+        }
+    }
+
     pub fn set_warnings_visible(&mut self, visible: bool) -> Result<()> {
         match self.fullscreen.as_ref() {
             Some(screen) => {
@@ -768,6 +795,19 @@ impl InputHub {
         true
     }
 
+    /// Generic modal picker: Enter submits prefix+value as a chat line.
+    pub fn open_dialog(&self, title: &str, prefix: &str, items: Vec<(String, String)>) -> bool {
+        if items.is_empty() {
+            return false;
+        }
+        {
+            let mut s = lock_screen(&self.screen.0);
+            s.model.dialog = Some(DialogState::new(title, prefix, items));
+        }
+        let _ = self.screen.draw_now();
+        true
+    }
+
     pub fn open_models_dialog(&self) -> bool {
         let items = self
             .models_src
@@ -804,6 +844,14 @@ impl InputHub {
     /// Next event from the keyboard.
     pub async fn next(&mut self) -> Option<HubEvent> {
         self.rx.recv().await
+    }
+
+    /// Enqueues a prompt programmatically (e.g. `/warnings fix`). Runs on the next idle pass.
+    pub fn push_prompt(&self, line: String) {
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(line);
     }
 
     /// Pops a queued line, if any; drained between turns. Updates the footer count.
@@ -1779,6 +1827,15 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
                 Style::default().fg(WARN),
             ));
         }
+        if model.warning_details_visible {
+            for detail in &model.warning_details {
+                lines.push(Line::from(""));
+                lines.push(Line::styled(
+                    format!("  ↳ {detail}"),
+                    Style::default().fg(MUTED),
+                ));
+            }
+        }
     }
     Paragraph::new(Text::from(lines))
 }
@@ -1833,6 +1890,15 @@ fn transcript_text(model: &Model, width: u16) -> Text<'static> {
                 format!("\u{26a0} {warning}"),
                 Style::default().fg(WARN),
             ));
+        }
+        if model.warning_details_visible {
+            for detail in &model.warning_details {
+                lines.push(Line::from(""));
+                lines.push(Line::styled(
+                    format!("  ↳ {detail}"),
+                    Style::default().fg(MUTED),
+                ));
+            }
         }
     }
     Text::from(lines)

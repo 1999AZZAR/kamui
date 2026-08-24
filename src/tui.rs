@@ -23,7 +23,7 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("exit", "Save and quit"),
     ("plan", "Enter Plan Mode"),
     ("skills", "List discovered skills"),
-    ("warnings", "Hide or show warning messages"),
+    ("warnings", "Hide/show warnings; details; fix"),
 ];
 
 #[derive(Debug, Clone)]

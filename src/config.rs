@@ -584,7 +584,53 @@ pub fn global_config_dir() -> Result<PathBuf> {
         .context("could not determine the operating system config directory")
 }
 
-fn global_config_path() -> Result<PathBuf> {
+/// Appends a `[profiles.<name>]` block to the global `kamui.toml`, creating the file if
+/// needed. Used by the TUI "Add provider" flow; the name is sanitized and de-duplicated so a
+/// repeated append can never produce a TOML table collision.
+pub fn append_profile(path: &Path, base_url: &str, api_key: &str, model: &str) -> Result<String> {
+    use std::io::Write;
+
+    let mut name: String = model
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let name = name.as_mut_str();
+    // De-duplicate: read existing names from the file text.
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let taken: Vec<String> = existing
+        .lines()
+        .filter_map(|l| l.strip_prefix("[profiles."))
+        .map(|l| l.trim_end_matches(']').trim().to_string())
+        .collect();
+    let mut final_name = name.to_string();
+    let mut counter = 2;
+    while taken.iter().any(|t| t.eq_ignore_ascii_case(&final_name)) {
+        final_name = format!("{name}-{counter}");
+        counter += 1;
+    }
+
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::File::create(path)?;
+    }
+    let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+    writeln!(file)?;
+    writeln!(file, "[profiles.{final_name}]")?;
+    writeln!(file, "model = \"{model}\"")?;
+    writeln!(file, "base_url = \"{base_url}\"")?;
+    writeln!(file, "api_key = \"{api_key}\"")?;
+    Ok(final_name)
+}
+
+pub(crate) fn global_config_path() -> Result<PathBuf> {
     global_config_dir().map(|dir| dir.join(CONFIG_FILE))
 }
 

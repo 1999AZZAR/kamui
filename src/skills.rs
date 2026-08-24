@@ -255,13 +255,9 @@ fn load_dir(dir: &Path, source: SkillSource, skills: &mut Vec<Skill>, warnings: 
         else {
             continue;
         };
-        // Folder name must be valid skill name; otherwise skip with warning.
-        if !is_valid_skill_name(&folder_name) {
-            warnings.push(format!(
-                "skill '{}' in {} has invalid folder name (must be lowercase, numbers, hyphens)",
-                folder_name,
-                dir.display()
-            ));
+        // Lenient like opencode: any visible directory may host a skill. Hidden dot-folders
+        // are tooling noise (.git, caches) and are skipped silently.
+        if folder_name.starts_with('.') {
             continue;
         }
         // Skip if a higher-priority skill with same name already exists.
@@ -312,13 +308,6 @@ fn load_dir(dir: &Path, source: SkillSource, skills: &mut Vec<Skill>, warnings: 
 }
 
 /// Skill names: lowercase alphanumeric + hyphens only (no underscores, per spec).
-fn is_valid_skill_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.chars().all(|character| {
-            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
-        })
-}
-
 type ParsedSkill = (
     String,
     String,
@@ -333,32 +322,28 @@ fn parse_skill(folder_name: &str, content: &str) -> Result<ParsedSkill, String> 
         "missing frontmatter (expected --- block with name and description)".to_string()
     })?;
 
+    // Lenient parsing (mirrors opencode): a skill only needs SKILL.md. Missing frontmatter
+    // fields fall back to the folder name / first body line so real-world skills from other
+    // harnesses load instead of warning.
+    // Missing fields fall back to the folder name / first body line.
     let name = frontmatter
         .get("name")
-        .cloned()
-        .ok_or_else(|| "frontmatter is missing required 'name'".to_string())?;
+        .map(|n| n.trim().to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| folder_name.to_ascii_lowercase());
     let description = frontmatter
         .get("description")
-        .cloned()
-        .ok_or_else(|| "frontmatter is missing required 'description'".to_string())?;
-
-    if name.trim().is_empty() {
-        return Err("frontmatter 'name' is empty".to_string());
-    }
-    if description.trim().is_empty() {
-        return Err("frontmatter 'description' is empty".to_string());
-    }
-    let name = name.trim().to_ascii_lowercase();
-    if !is_valid_skill_name(&name) {
-        return Err(format!(
-            "frontmatter 'name' '{name}' is invalid (must be lowercase, numbers, hyphens)"
-        ));
-    }
-    if name != folder_name {
-        return Err(format!(
-            "folder name '{folder_name}' does not match frontmatter name '{name}'"
-        ));
-    }
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| {
+            body.lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("Skill")
+                .trim()
+                .chars()
+                .take(120)
+                .collect::<String>()
+        });
     let body = body.trim().to_string();
     if body.is_empty() {
         return Err("SKILL.md body is empty".to_string());
@@ -459,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn folder_name_must_match_frontmatter_name() {
+    fn frontmatter_name_wins_when_it_differs_from_folder() {
         let root = project();
         write_skill(
             &root,
@@ -468,38 +453,29 @@ mod tests {
             "---\nname: other-name\ndescription: desc\n---\n\nBody\n",
         );
         let library = SkillLibrary::load_with_global(&root, false);
-        assert!(library.is_empty());
-        assert!(
-            library
-                .warnings()
-                .iter()
-                .any(|warning| warning.contains("does not match"))
-        );
+        assert!(library.find("other-name").is_some());
+        assert!(library.warnings().is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn missing_name_or_description_is_invalid() {
+    fn missing_description_falls_back_to_first_body_line() {
         let root = project();
         write_skill(
             &root,
             ".kamui/skills",
             "bad-skill",
-            "---\nname: bad-skill\n---\n\nBody\n",
+            "---\nname: bad-skill\n---\n\nBody first line here.\n",
         );
         let library = SkillLibrary::load_with_global(&root, false);
-        assert!(library.is_empty());
-        assert!(
-            library
-                .warnings()
-                .iter()
-                .any(|warning| warning.contains("description"))
-        );
+        let skill = library.find("bad-skill").unwrap();
+        assert_eq!(skill.description, "Body first line here.");
+        assert!(library.warnings().is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn invalid_folder_name_is_skipped() {
+    fn odd_folder_names_still_load_but_hidden_dirs_are_skipped() {
         let root = project();
         write_skill(
             &root,
@@ -507,9 +483,17 @@ mod tests {
             "Bad_Name",
             "---\nname: Bad_Name\ndescription: desc\n---\n\nBody\n",
         );
+        // Hidden dot-folders are tooling noise and are skipped silently.
+        write_skill(
+            &root,
+            ".kamui/skills",
+            ".system",
+            "---\nname: system\ndescription: desc\n---\n\nBody\n",
+        );
         let library = SkillLibrary::load_with_global(&root, false);
-        assert!(library.is_empty());
-        assert!(!library.warnings().is_empty());
+        assert!(library.find("bad_name").is_some());
+        assert!(library.find("system").is_none());
+        assert!(library.warnings().is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
