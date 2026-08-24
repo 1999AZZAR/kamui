@@ -773,6 +773,22 @@ impl Drop for BusyGuard {
 }
 
 /// Viewport height from the last draw; one page for PageUp/PageDown.
+/// Suffix of `input` that fits `max` display columns - the editor scrolls horizontally,
+/// keeping the caret (always at the end of the buffer) visible.
+fn input_tail(input: &str, max: usize) -> &str {
+    let mut start = 0usize;
+    let mut used = 0usize;
+    for (i, ch) in input.char_indices().rev() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(1);
+        if used + cw > max {
+            start = i + ch.len_utf8();
+            break;
+        }
+        used += cw;
+    }
+    &input[start..]
+}
+
 fn page_rows(screen: &ScreenHandle) -> i64 {
     let s = lock_screen(&screen.0);
     s.last_viewport_rows.max(1) as i64
@@ -1298,14 +1314,13 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> usize {
     if popup_height > 0 {
         frame.render_widget(popup_widget(model), popup_area);
     }
-    frame.render_widget(editor_widget(model), editor_area);
+    frame.render_widget(editor_widget(model, editor_area), editor_area);
 
     // Terminal cursor sits at the end of the typed text whenever the editor owns input.
     if model.thinking.is_none() {
-        let col = editor_area.x
-            + 2
-            + UnicodeWidthStr::width(model.input.as_str())
-                .min((editor_area.width.saturating_sub(4)) as usize) as u16;
+        let inner = editor_area.width.saturating_sub(4) as usize;
+        let visible = UnicodeWidthStr::width(input_tail(&model.input, inner));
+        let col = editor_area.x + 2 + visible.min(inner) as u16;
         frame.set_cursor_position((
             col.min(editor_area.right().saturating_sub(1)),
             editor_area.y + 1,
@@ -1330,7 +1345,9 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> usize {
 
 /// The opencode-style prompt: left accent border, element background, `❯` glyph with the live
 /// buffer, and a meta line pairing session info with key hints.
-fn editor_widget(model: &Model) -> Paragraph<'static> {
+fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
+    // Horizontal viewport: keep the caret (always at the end of the buffer) on screen.
+    let inner = area.width.saturating_sub(4).max(1) as usize;
     let thinking = match model.thinking {
         Some((frame_idx, label)) => Line::from(vec![
             Span::styled(
@@ -1339,12 +1356,25 @@ fn editor_widget(model: &Model) -> Paragraph<'static> {
             ),
             Span::styled(label.to_string(), Style::default().fg(MUTED)),
         ]),
+        None if model.input.is_empty() => Line::from(vec![
+            Span::styled(
+                "\u{276f} ".to_string(),
+                Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "type a message, or / for commands".to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]),
         None => Line::from(vec![
             Span::styled(
                 "\u{276f} ".to_string(),
                 Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(model.input.clone(), Style::default().fg(TEXT)),
+            Span::styled(
+                input_tail(&model.input, inner).to_string(),
+                Style::default().fg(TEXT),
+            ),
         ]),
     };
     // Session info only; keybind hints live in the footer so long paths
