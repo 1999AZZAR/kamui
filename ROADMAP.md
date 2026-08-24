@@ -430,3 +430,21 @@ prompt.
 - [ ] Voice mode
 - [ ] MCP server
 - [ ] Infrastructure-specific plugins (Docker, Kubernetes, PostgreSQL)
+
+## Phase 7: Fullscreen TUI (stg-az)
+
+- [x] Retained Ratatui transcript with opencode-style thick-border message rails
+- [x] Two-tone KAMUI logo home screen with startup notices
+- [x] Live editor box: slash menu, placeholder, horizontal scroll, backslash-newline multiline
+- [x] InputHub: editor stays live while the agent runs, Enter queues, Esc/Ctrl+C interrupt at
+      every await point, approval and ask_user answers bypass the queue via requesters
+- [x] Sidebar rail: session title/id, model, project, context pressure, last-turn metrics
+- [x] Ctrl+K model picker, Ctrl+S session switcher, `?` keybinding sheet (modal overlays that
+      submit real slash commands)
+- [x] Permission modal for tool/plan approvals (Allow once / Always / Reject) with preview body
+- [x] Word-aware wrapping; PgUp/PgDn/Home/End/Ctrl+U/Ctrl+D scrolling; mouse-wheel scroll
+- [x] Model registry wizard reusing onboarding (base URL + key -> list_models -> pick -> profile)
+- [x] Skill loader leniency matching opencode plus /warnings details and agent-driven repair
+- [x] Safe exit: double Ctrl+C confirmation at idle prompt
+
+Deferred: theme switching, @-file completion popup, timeline/subagent dialogs.

@@ -64,6 +64,14 @@ menghentikan job pada timeout 30 menit. Missed interval dikoales, bukan dibackfi
 Menjalankan JSON benchmark suite pada profile tertentu. Tiap case dapat memiliki
 `expect_contains`; laporan mencakup pass rate, latency, dan token, dengan exit non-zero saat gagal.
 
+### `src/ui.rs` + `src/tui.rs`
+
+Fullscreen TUI bergaya opencode: transcript thick-border rail, sidebar info sesi, editor box
+dengan InputHub (satu thread keyboard permanen; antre saat agent jalan, Esc interrupt), dialog
+model/sesi/help, word-wrap sendiri agar viewport math presisi. Catatan penting: ratatui 0.30
+menghapus newline di dalam Span saat konstruksi - teks multi-baris harus dipecah menjadi Line
+terpisah sebelum Text dibuat.
+
 ### `src/terminal.rs` dan `src/markdown.rs`
 
 Terminal tetap line-oriented. Event tool menampilkan status, durasi, dan ukuran output; spinner hanya

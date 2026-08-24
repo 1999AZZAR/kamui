@@ -418,9 +418,32 @@ the temporary `run_command(background: true)` jobs owned by an active chat proce
 
 ### Interactive transcript UI
 
-When launched from an interactive terminal, Kamui uses a retained transcript UI with colored cards for user prompts, tool calls, tool output, assistant responses, warnings, and errors. The transcript wraps text to terminal display width, preserves Markdown emphasis and fenced-code styling, and returns to the normal terminal screen when the process exits. `-p`, pipes, redirects, and `NO_COLOR` retain the script-friendly line-oriented output path.
+When launched from an interactive terminal, Kamui uses a fullscreen, opencode-style interface: a
+word-wrapped transcript with thick-border message rails (user = blue, assistant = brand blue with
+Markdown styling, tool calls muted, errors red), a sidebar with session info and live context
+usage, an always-live editor box with slash-command menu, and a quiet footer with keybind hints.
 
-The latest transcript card can be collapsed or expanded with `/collapse` and `/expand`. The command popup remains available for slash commands, while tool approval and Plan Mode notices are shown inside the transcript surface.
+Highlights:
+
+- **Home screen** — a two-tone block-letter KAMUI logo greets you until the first message.
+- **Live input while the agent runs** — keep typing; Enter queues your message and it runs right
+  after the current turn. **Esc interrupts** the agent at any point.
+- **Scrolling** — mouse wheel, PgUp/PgDn (full page), Ctrl+U/Ctrl+D (half page), Home/End.
+  Typing snaps back to the live tail.
+- **Dialogs** — `Ctrl+K` model picker, `Ctrl+S` session switcher, `?` keybinding sheet. Bare
+  `/model`, `/sessions`, and `/help` open the same overlays. Enter submits through the normal
+  command path, so queueing still applies while busy.
+- **Permission modal** — tool and plan approvals render as "Allow once / Always allow this
+  session / Reject" with the diff or command preview inline.
+- **Model registry** — the model dialog ends with "+ Add provider / model": enter a base URL and
+  API key, Kamui fetches the provider's live model list and registers your pick as a new profile
+  in the global config, then switches to it.
+- **Multiline input** — end a line with `\` and press Enter to continue on the next line; the
+  editor box grows as you type.
+- Tool calls fold by default to a two-line peek (`/expand` // `/collapse` toggle the latest card),
+  and multi-line command output renders as proper lines instead of one run-on blob.
+
+`-p`, pipes, redirects, and `NO_COLOR` retain the script-friendly line-oriented output path.
 
 ### Session commands
 
@@ -445,12 +468,14 @@ The latest transcript card can be collapsed or expanded with `/collapse` and `/e
 | `/forget <text>` | Forget one remembered fact, or `/forget all` |
 | `/expand` | Expand the latest transcript card |
 | `/collapse` | Collapse the latest transcript card |
+| `/warnings [on\|off\|details\|fix]` | Hide/show, expand details of, or hand skill warnings to Kamui as a repair task |
 | `/help` | List available commands |
 | `/exit` | Save and quit |
 
-`Ctrl+C` while a turn is running — waiting on the model, streaming, at an approval prompt, or
-running a command — cancels that turn and returns you to the prompt, killing any running command.
-The cancelled turn is not saved. At the idle prompt, `Ctrl+C` exits.
+`Ctrl+C` or `Esc` while a turn is running — waiting on the model, streaming, at an approval
+prompt, or running a command — cancels that turn and returns you to the prompt, killing any
+running command. The cancelled turn is not saved. At the idle prompt, `Ctrl+C` must be pressed
+twice within three seconds to exit (a hint appears on the first press).
 
 `/rename` accepts a session ID prefix followed by the new title; if the renamed session is the
 active one, its in-memory title updates immediately. `/search` matches message text

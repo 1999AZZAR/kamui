@@ -39,9 +39,17 @@ effort or operational risk is disproportionate to their immediate value.
 - Streaming deltas are printed immediately. Usage and finish reason are shown after completion. On
   a real interactive TTY, a braille spinner runs until the first token and tool outcomes report
   status, duration, and output size. Pipes and `-p` remain plain and free of cursor-control output.
-  The fullscreen Ratatui transcript animates the same braille spinner in its footer (a background
-  ticker task redraws through the shared terminal mutex) so the wait never looks frozen there
-  either; the plain-mode inline spinner is suppressed in fullscreen to avoid double indicators.
+  The fullscreen Ratatui transcript (opencode-style: thick-border message rails, sidebar rail,
+  editor box, token badge) is driven by `InputHub` — one persistent keyboard thread that owns all
+  input. The editor stays live while the agent runs (typed lines queue and run after the turn),
+  Esc/Ctrl+C raise interrupts raced at every await point, approval/ask_user answers flow through
+  requester channels, and Ctrl+K/Ctrl+S/? plus bare /model, /sessions and /help open modal
+  dialogs that submit real slash commands. The braille spinner animates in the editor row via a
+  background ticker redrawing through the shared terminal mutex; Ctrl+C at an idle prompt needs a
+  double press within three seconds. ratatui 0.30 strips embedded newlines from Span content at
+  construction, so multi-line notices are split into separate Lines before building Text. Skill
+  loading is lenient like opencode: any visible folder may host a skill, missing frontmatter
+  fields fall back to folder name / first body line, hidden dot-folders are skipped silently.
 - `Ctrl+C` while a turn is in flight (waiting for the model, streaming, at an approval prompt, or
   running a command) interrupts that turn and returns to the prompt; the partial turn is discarded
   and not saved, and an interrupted command is killed via `kill_on_drop`. `Ctrl+C` at the idle
@@ -88,7 +96,10 @@ effort or operational risk is disproportionate to their immediate value.
   it. Full history stays in storage; the summary is in-memory and regenerated after a resume.
 - `/model` lists the configured provider profiles and marks the active one; `/model <name>` switches
   the active provider and model, rebuilding the provider and persisting the choice in the SQLite
-  `settings` table so it survives restarts. The banner shows the active model and profile.
+  `settings` table so it survives restarts. The banner shows the active model and profile. In
+  fullscreen TUI mode bare `/model` opens the picker dialog, whose "+ Add provider / model" entry
+  reuses onboarding (base URL + API key -> live list_models -> pick) to append a new profile to
+  the global kamui.toml via `config::append_profile` and switch immediately.
 - After each streamed response the usage line reports time-to-first-token and total response time.
   These latency figures are displayed only, not persisted.
 - Chat requests offer the model read-only `read_file`, `list_directory`, `grep`, `glob`, and
