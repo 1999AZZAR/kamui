@@ -29,6 +29,7 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("exit", "Save and quit"),
     ("plan", "Enter Plan Mode"),
     ("skills", "List discovered skills"),
+    ("expand", "Toggle full or collapsed tool output (Ctrl+O)"),
 ];
 
 #[derive(Debug, Clone)]
@@ -260,7 +261,7 @@ fn read_line_with_slash_popup(candidates: &[Candidate], history: &[String]) -> O
         return None;
     }
     let _ = term.hide_cursor();
-    let prompt = Ui::stdio().style("> ", &[Style::BgBlue, Style::White]);
+    let prompt = Ui::stdio().style("> ", &[Style::Cyan, Style::Bold]);
     let mut buf = String::new();
     let mut history_idx = history.len();
     let mut saved_buf = String::new();
@@ -270,7 +271,7 @@ fn read_line_with_slash_popup(candidates: &[Candidate], history: &[String]) -> O
     let render = |buf: &str, selected: usize, last_lines: &mut usize, term: &Term| {
         let is_slash = buf.trim_start().starts_with('/') && !buf.trim_start().contains(' ');
         let mut out = String::new();
-        let styled_buf = Ui::stdio().style(buf, &[Style::BgBlue, Style::White]);
+        let styled_buf = Ui::stdio().style(buf, &[Style::White]);
         out.push_str(&format!("\r\x1b[J{prompt}{styled_buf}"));
         if is_slash {
             let needle = buf
@@ -370,11 +371,12 @@ fn read_line_with_slash_popup(candidates: &[Candidate], history: &[String]) -> O
                 }
                 let _ = term.show_cursor();
                 if last_lines > 0 {
-                    let _ = term.write_str(&format!("\x1b[{}A\x1b[J", last_lines));
-                    let styled_echo = Ui::stdio().style(&buf, &[Style::BgBlue, Style::White]);
-                    let _ = term.write_str(&format!("{prompt}{styled_echo}\n"));
-                    let _ = term.flush();
+                    let _ = term.write_str(&format!("\x1b[{}A\r\x1b[J", last_lines));
+                } else {
+                    let _ = term.write_str("\r\x1b[J");
                 }
+                let _ = term.write_str(&crate::render::render_user_prompt(&buf, Ui::stdio()));
+                let _ = term.flush();
                 return Some(buf);
             }
             Key::Escape => {
@@ -385,10 +387,11 @@ fn read_line_with_slash_popup(candidates: &[Candidate], history: &[String]) -> O
                 } else {
                     let _ = term.show_cursor();
                     if last_lines > 0 {
-                        let _ = term.write_str(&format!("\x1b[{}A\x1b[J", last_lines));
-                        let styled_echo = Ui::stdio().style(&buf, &[Style::BgBlue, Style::White]);
-                        let _ = term.write_str(&format!("{prompt}{styled_echo}\n"));
+                        let _ = term.write_str(&format!("\x1b[{}A\r\x1b[J", last_lines));
+                    } else {
+                        let _ = term.write_str("\r\x1b[J");
                     }
+                    let _ = term.flush();
                     return None;
                 }
             }
@@ -406,9 +409,23 @@ fn read_line_with_slash_popup(candidates: &[Candidate], history: &[String]) -> O
                 if c == '\x03' {
                     let _ = term.show_cursor();
                     if last_lines > 0 {
-                        let _ = term.write_str(&format!("\x1b[{}A\x1b[J", last_lines));
+                        let _ = term.write_str(&format!("\x1b[{}A\r\x1b[J", last_lines));
+                    } else {
+                        let _ = term.write_str("\r\x1b[J");
                     }
+                    let _ = term.flush();
                     return None;
+                }
+                if c == '\x0f' {
+                    // Ctrl+O: toggle tool output expand/collapse
+                    let _ = term.show_cursor();
+                    if last_lines > 0 {
+                        let _ = term.write_str(&format!("\x1b[{}A\r\x1b[J", last_lines));
+                    } else {
+                        let _ = term.write_str("\r\x1b[J");
+                    }
+                    let _ = term.flush();
+                    return Some("/expand".to_string());
                 }
                 buf.push(c);
                 selected = 0;

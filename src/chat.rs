@@ -167,6 +167,9 @@ where
     let mut always_allowed: HashSet<String> = HashSet::new();
     // `/plan` forces the next turn into Plan Mode even for a small task.
     let mut plan_requested = false;
+    let mut expand_tools = database
+        .get_setting("expand_tools")?
+        .is_some_and(|v| v == "true");
 
     'chat: loop {
         let input = if use_tui {
@@ -188,7 +191,7 @@ where
                 }
             }
         } else {
-            print!("{}", ui.style("> ", &[Style::BgBlue, Style::White]));
+            print!("{}", ui.style("> ", &[Style::Cyan, Style::Bold]));
             io::stdout().flush()?;
             let rx = input_rx.as_mut().expect("plain mode has input channel");
             let line = tokio::select! {
@@ -335,6 +338,22 @@ where
             if command == "/plan" {
                 plan_requested = true;
                 println!("Plan Mode requested — next turn will require a plan.\n");
+                continue;
+            }
+            if command == "/expand" {
+                expand_tools = !expand_tools;
+                let _ = database
+                    .set_setting("expand_tools", if expand_tools { "true" } else { "false" });
+                if expand_tools {
+                    println!(
+                        "Tool output: Expanded (showing full output · Ctrl+O or /expand to collapse).\n"
+                    );
+                } else {
+                    println!(
+                        "Tool output: Collapsed (showing compact preview · Ctrl+O or /expand to expand).\n"
+                    );
+                }
+                print_tool_history(&messages, expand_tools, ui);
                 continue;
             }
             if command == "/undo" {
@@ -668,6 +687,7 @@ where
                 ttft,
                 started.elapsed(),
                 context_window,
+                ui,
             );
             accumulate_usage(&mut final_usage, &usage);
             final_finish = finish_reason;
@@ -734,6 +754,7 @@ where
             }
             for call in &tool_calls {
                 let tool_started = Instant::now();
+                println!();
                 if call.name == tools::UPDATE_PLAN_TOOL
                     && let Some(rendered) = tools::render_plan(&call.arguments)
                 {
@@ -758,14 +779,18 @@ where
                         .as_ref()
                         .is_some_and(|s| s.status == PlanStatus::Pending)
                     {
-                        print!("    Plan ready — approve? [y/N] ");
+                        print!(
+                            "    {} {} ",
+                            ui.style("Plan ready — approve?", &[Style::Yellow, Style::Bold]),
+                            ui.style("[y/N]", &[Style::Cyan])
+                        );
                         io::stdout().flush()?;
                         let answer = tokio::select! {
                             answer = read_approval_line(&mut input_rx, use_tui) => answer,
                             signal = tokio::signal::ctrl_c() => {
                                 signal.context("failed to listen for Ctrl+C")?;
                                 revert_on_cancel(&turn_snapshot);
-                                println!("\n(interrupted — back to prompt)\n");
+                                println!("{}", ui.style("\n(interrupted — back to prompt)\n", &[Style::Dim]));
                                 continue 'chat;
                             }
                         };
@@ -782,10 +807,20 @@ where
                                     let _ = database.set_plan(&session.id, &json, "approved");
                                 }
                             }
-                            println!("    (plan approved — gate open for this session)\n");
+                            println!(
+                                "{}",
+                                ui.style(
+                                    "    (plan approved — gate open for this session)\n",
+                                    &[Style::Green]
+                                )
+                            );
                         } else {
                             println!(
-                                "    (plan not approved — still in Plan Mode, propose a revised plan)\n"
+                                "{}",
+                                ui.style(
+                                    "    (plan not approved — still in Plan Mode, propose a revised plan)\n",
+                                    &[Style::Yellow]
+                                )
                             );
                         }
                     }
@@ -804,11 +839,11 @@ where
                     "Plan Mode is active — propose a plan with update_plan and wait for approval before mutating tools.".to_string()
                 } else if call.name == tools::ASK_USER_TOOL {
                     tokio::select! {
-                        output = ask_user(&mut input_rx, use_tui, &call.arguments) => output?,
+                        output = ask_user(&mut input_rx, use_tui, &call.arguments, ui) => output?,
                         signal = tokio::signal::ctrl_c() => {
                             signal.context("failed to listen for Ctrl+C")?;
                             revert_on_cancel(&turn_snapshot);
-                            println!("\n(interrupted — back to prompt)\n");
+                            println!("{}", ui.style("\n(interrupted — back to prompt)\n", &[Style::Dim]));
                             continue 'chat;
                         }
                     }
@@ -847,16 +882,34 @@ where
                     && !always_allowed.contains(&call.name)
                 {
                     if let Some(preview) = tools.preview(call) {
-                        println!("{preview}");
+                        for line in preview.lines() {
+                            if let Some(cmd) = line.strip_prefix("    $ ") {
+                                println!(
+                                    "    {} {}",
+                                    ui.style("$", &[Style::Cyan, Style::Bold]),
+                                    ui.style(cmd, &[Style::White, Style::Bold])
+                                );
+                            } else if line.starts_with("    + ") {
+                                println!("{}", ui.style(line, &[Style::Green]));
+                            } else if line.starts_with("    - ") {
+                                println!("{}", ui.style(line, &[Style::Red]));
+                            } else {
+                                println!("{}", ui.style(line, &[Style::Dim]));
+                            }
+                        }
                     }
-                    print!("    approve? [y/N/a] ");
+                    print!(
+                        "    {} {} ",
+                        ui.style("approve?", &[Style::Yellow, Style::Bold]),
+                        ui.style("[y/N/a]", &[Style::Cyan])
+                    );
                     io::stdout().flush()?;
                     let answer = tokio::select! {
                         answer = read_approval_line(&mut input_rx, use_tui) => answer,
                         signal = tokio::signal::ctrl_c() => {
                             signal.context("failed to listen for Ctrl+C")?;
                             revert_on_cancel(&turn_snapshot);
-                            println!("\n(interrupted — back to prompt)\n");
+                            println!("{}", ui.style("\n(interrupted — back to prompt)\n", &[Style::Dim]));
                             continue 'chat;
                         }
                     };
@@ -866,8 +919,14 @@ where
                     if always {
                         always_allowed.insert(call.name.clone());
                         println!(
-                            "    (always allowing {} for the rest of this session — /new clears this)",
-                            call.name
+                            "{}",
+                            ui.style(
+                                &format!(
+                                    "    (always allowing {} for the rest of this session — /new clears this)",
+                                    call.name
+                                ),
+                                &[Style::Green, Style::Dim]
+                            )
                         );
                     }
                     if approved {
@@ -883,12 +942,15 @@ where
                             signal = tokio::signal::ctrl_c() => {
                                 signal.context("failed to listen for Ctrl+C")?;
                                 revert_on_cancel(&turn_snapshot);
-                                println!("\n    (interrupted — back to prompt)\n");
+                                println!("{}", ui.style("\n(interrupted — back to prompt)\n", &[Style::Dim]));
                                 continue 'chat;
                             }
                         }
                     } else {
-                        println!("    skipped");
+                        println!(
+                            "{}",
+                            ui.style("    (declined by user)", &[Style::Red, Style::Dim])
+                        );
                         "The user declined to run this command.".to_string()
                     }
                 } else {
@@ -916,10 +978,12 @@ where
                 if !output.starts_with("Error: ") && !output.is_empty() {
                     print!(
                         "{}",
-                        render::render_tool_output(&preview_output(&output), ui)
+                        render::render_tool_output(&preview_output(&output, expand_tools), ui)
                     );
+                    println!();
                 }
-                println!("{}", ui.tool_outcome(&output, elapsed));
+                print!("{}", render::render_tool_outcome(&output, elapsed, ui));
+                println!();
                 let result_message = Message::tool_result(&call.id, output);
                 turn_messages.push(result_message.clone());
                 tool_trail.push(result_message);
@@ -1143,6 +1207,7 @@ where
             dispatch_spawn_agents(provider.as_ref(), &active.model, project, &spawn_calls).await;
         for call in &response.tool_calls {
             let tool_started = Instant::now();
+            println!();
             if call.name == tools::UPDATE_PLAN_TOOL
                 && let Some(rendered) = tools::render_plan(&call.arguments)
             {
@@ -1205,10 +1270,12 @@ where
             if !output.starts_with("Error: ") && !output.is_empty() {
                 print!(
                     "{}",
-                    render::render_tool_output(&preview_output(&output), ui)
+                    render::render_tool_output(&preview_output(&output, false), ui)
                 );
+                println!();
             }
-            println!("{}", ui.tool_outcome(&output, elapsed));
+            print!("{}", render::render_tool_outcome(&output, elapsed, ui));
+            println!();
             let result_message = Message::tool_result(&call.id, output);
             turn_messages.push(result_message.clone());
             tool_trail.push(result_message);
@@ -1771,25 +1838,29 @@ fn print_usage(
     ttft: Option<Duration>,
     elapsed: Duration,
     context_window: Option<u64>,
+    ui: Ui,
 ) {
-    print!("Tokens: {input} input + {output} output = {total} total");
+    let mut text = format!("Tokens: {input} input + {output} output = {total} total");
     if cached > 0 {
         let percent = if input > 0 {
             (cached as f64 / input as f64 * 100.0).min(100.0)
         } else {
             0.0
         };
-        print!(" | Cached: {cached} ({percent:.0}%)");
+        text.push_str(&format!(" | Cached: {cached} ({percent:.0}%)"));
     }
     if let Some(window) = context_window {
         let percent = input as f64 / window as f64 * 100.0;
-        print!(" | Context: {percent:.1}%");
+        text.push_str(&format!(" | Context: {percent:.1}%"));
     }
     if let Some(ttft) = ttft {
-        print!(" | TTFT: {}", format_duration(ttft));
+        text.push_str(&format!(" | TTFT: {}", format_duration(ttft)));
     }
-    print!(" | Time: {}", format_duration(elapsed));
-    println!(" | Finish: {finish_reason}\n");
+    text.push_str(&format!(" | Time: {}", format_duration(elapsed)));
+    text.push_str(&format!(" | Finish: {finish_reason}"));
+    println!();
+    print!("{}", render::render_usage_stats(&text, ui));
+    println!();
 }
 
 /// Fold one agent-loop round's usage into the turn total: output tokens accumulate across every
@@ -1879,6 +1950,7 @@ async fn ask_user(
     input_rx: &mut Option<mpsc::UnboundedReceiver<String>>,
     use_tui: bool,
     arguments: &str,
+    ui: Ui,
 ) -> Result<String> {
     let arguments: AskUserArguments = match serde_json::from_str(arguments) {
         Ok(arguments) => arguments,
@@ -1888,11 +1960,21 @@ async fn ask_user(
         return Ok("Error: ask_user requires a non-empty 'question' argument".to_string());
     }
 
-    println!("  ? {}", arguments.question);
+    println!(
+        "\n{}",
+        ui.style(
+            &format!("  ? {}", arguments.question),
+            &[Style::Yellow, Style::Bold]
+        )
+    );
     for (index, option) in arguments.options.iter().enumerate() {
-        println!("    {}. {option}", index + 1);
+        println!(
+            "    {} {}",
+            ui.style(&format!("{}.", index + 1), &[Style::Cyan, Style::Bold]),
+            ui.style(option, &[Style::White])
+        );
     }
-    print!("    > ");
+    print!("{}", ui.style("    > ", &[Style::Cyan, Style::Bold]));
     io::stdout().flush()?;
 
     let answer = if use_tui {
@@ -2537,28 +2619,45 @@ fn truncate(text: &str, max: usize) -> String {
     result
 }
 
-/// Collapsed preview: head/tail trimmed, expand hint — box truncates rows to width.
-fn preview_output(text: &str) -> String {
+/// Compact collapsed preview (tail lines + hint) or full output when expanded.
+fn preview_output(text: &str, expanded: bool) -> String {
+    if expanded {
+        return text.to_string();
+    }
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len();
-    let preview = if total <= 20 {
+    if total <= 4 {
         let clipped = lines.join("\n");
-        let mut out: String = clipped.chars().take(1000).collect();
-        if clipped.chars().count() > 1000 {
-            out.push_str(" … (truncated, collapsed)");
+        let mut out: String = clipped.chars().take(300).collect();
+        if clipped.chars().count() > 300 {
+            out.push_str(" … (Ctrl+O to expand)");
         }
         out
     } else {
-        let head = lines[..10].join("\n");
-        let tail = lines[total - 10..].join("\n");
-        let hidden = total - 20;
-        format!("{head}\n… ({hidden} lines hidden, collapsed) …\n{tail}")
-    };
-    let mut out: String = preview.chars().take(1000).collect();
-    if preview.chars().count() > 1000 {
-        out.push('…');
+        let hidden = total - 3;
+        let tail = lines[total - 3..].join("\n");
+        format!("… ({hidden} earlier lines · Ctrl+O or /expand to expand)\n{tail}")
     }
-    out
+}
+
+/// Replay past tool outputs from the current session matching the active mode.
+fn print_tool_history(messages: &[Message], expanded: bool, ui: Ui) {
+    let mut count = 0;
+    for message in messages {
+        if message.role_name() == "tool" && !message.content.is_empty() {
+            count += 1;
+            print!(
+                "{}",
+                render::render_tool_output(&preview_output(&message.content, expanded), ui)
+            );
+        }
+    }
+    if count > 0 {
+        let mode = if expanded { "expanded" } else { "collapsed" };
+        println!("(Replayed {count} past tool output(s) in {mode} mode)\n");
+    } else {
+        println!("(No past tool outputs in this session yet)\n");
+    }
 }
 
 /// Build a single-line preview of `content` centered on the first match of `query`.
@@ -2623,6 +2722,7 @@ fn print_help() {
     println!("/status           Show project and connection status");
     println!("/memory           List facts Kamui remembers across sessions and projects");
     println!("/forget <text>    Forget one remembered fact, or /forget all");
+    println!("/expand           Toggle full or collapsed tool output (Ctrl+O)");
     println!("/exit             Save and quit\n");
 }
 
@@ -3090,12 +3190,13 @@ mod tests {
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let previewed = preview_output(&many_lines);
-        assert!(previewed.contains("lines hidden, collapsed"));
-        assert!(previewed.starts_with("line 0"));
+        let previewed = preview_output(&many_lines, false);
+        assert!(previewed.contains("22 earlier lines · Ctrl+O"));
         assert!(previewed.contains("line 24"));
-        assert_eq!(preview_output("short"), "short");
-        assert!(!preview_output(&"x".repeat(1200)).ends_with('x'));
+        assert_eq!(preview_output("short", false), "short");
+
+        let expanded = preview_output(&many_lines, true);
+        assert_eq!(expanded, many_lines);
     }
 
     #[test]
@@ -3189,14 +3290,16 @@ mod tests {
     #[tokio::test]
     async fn ask_user_rejects_invalid_json_arguments() {
         let mut rx = respond_with("anything");
-        let output = ask_user(&mut rx, false, "not json").await.unwrap();
+        let output = ask_user(&mut rx, false, "not json", Ui::plain())
+            .await
+            .unwrap();
         assert!(output.starts_with("Error:"));
     }
 
     #[tokio::test]
     async fn ask_user_rejects_a_blank_question() {
         let mut rx = respond_with("anything");
-        let output = ask_user(&mut rx, false, r#"{"question":"   "}"#)
+        let output = ask_user(&mut rx, false, r#"{"question":"   "}"#, Ui::plain())
             .await
             .unwrap();
         assert!(output.starts_with("Error:"));
@@ -3205,7 +3308,7 @@ mod tests {
     #[tokio::test]
     async fn ask_user_returns_free_text_when_no_options_are_offered() {
         let mut rx = respond_with("Tuesday works better");
-        let output = ask_user(&mut rx, false, r#"{"question":"When?"}"#)
+        let output = ask_user(&mut rx, false, r#"{"question":"When?"}"#, Ui::plain())
             .await
             .unwrap();
         assert_eq!(output, "Tuesday works better");
@@ -3218,6 +3321,7 @@ mod tests {
             &mut rx,
             false,
             r#"{"question":"Pick one","options":["red","green","blue"]}"#,
+            Ui::plain(),
         )
         .await
         .unwrap();
@@ -3231,6 +3335,7 @@ mod tests {
             &mut rx,
             false,
             r#"{"question":"Pick one","options":["red","green"]}"#,
+            Ui::plain(),
         )
         .await
         .unwrap();
@@ -3244,6 +3349,7 @@ mod tests {
             &mut rx,
             false,
             r#"{"question":"Pick one","options":["red","green"]}"#,
+            Ui::plain(),
         )
         .await
         .unwrap();
