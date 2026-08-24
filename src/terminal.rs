@@ -23,7 +23,6 @@ pub const BG_DARK: &str = "\x1b[48;5;236m";
 pub enum Style {
     Bold,
     Dim,
-    #[expect(dead_code)] // wired to markdown styling in a parallel change
     Cyan,
     Green,
     Red,

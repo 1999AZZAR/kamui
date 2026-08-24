@@ -75,11 +75,18 @@ where
         ),
     )?;
     let ui = Ui::stdio();
-    for warning in skill_library.warnings() {
+    // One tidy startup line instead of a wall of per-skill warnings; /skills still lists every
+    // individual reason.
+    let skill_warning_count = skill_library.warnings().len();
+    if skill_warning_count > 0 {
         if use_tui {
-            chat_ui.warning(warning)?;
+            chat_ui.notice(&format!(
+                "⚠ {skill_warning_count} skill folder(s) skipped (invalid name or frontmatter) — /skills for details"
+            ))?;
         } else {
-            eprintln!("warning: {warning}");
+            for warning in skill_library.warnings() {
+                eprintln!("warning: {warning}");
+            }
         }
     }
 
@@ -110,7 +117,7 @@ where
         chat_ui
             .warning("--auto-approve is active: commands and file edits will run without asking")?;
     }
-    chat_ui.notice("Type /help for commands or exit to quit.")?;
+    chat_ui.notice("Type / for commands · Tab completes · Ctrl+C cancels a turn")?;
 
     let (mut session, mut messages) = match resume_id {
         Some(id) => {

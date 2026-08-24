@@ -263,7 +263,7 @@ fn read_line_with_slash_popup(candidates: &[Candidate], history: &[String]) -> O
         return None;
     }
     let _ = term.hide_cursor();
-    let prompt = Ui::stdio().style("> ", &[Style::BgBlue, Style::White]);
+    let prompt = Ui::stdio().style("\u{276f} ", &[Style::Cyan, Style::Bold]);
     let mut buf = String::new();
     let mut history_idx = history.len();
     let mut saved_buf = String::new();

@@ -34,7 +34,7 @@ const NOTICE_FG: Color = Color::Rgb(150, 164, 183);
 const PROMPT_BG: Color = Color::Rgb(36, 59, 104);
 const MAX_HISTORY_LINES: usize = 4_000;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CardKind {
     User,
     Tool,
@@ -67,7 +67,9 @@ impl Default for Model {
             header: String::from("Kamui"),
             cards: Vec::new(),
             notices: Vec::new(),
-            footer: String::from("Enter submit · Ctrl+C cancel · /help commands"),
+            footer: String::from(
+                "/ commands · Tab complete · \u{2191} history · Enter send · Ctrl+C cancel",
+            ),
             scroll: 0,
             prompt_visible: true,
             thinking: None,
@@ -307,7 +309,7 @@ impl ChatUi {
                 print!(
                     "{}",
                     self.plain
-                        .style("> ", &[AnsiStyle::BgBlue, AnsiStyle::White])
+                        .style("\u{276f} ", &[AnsiStyle::Cyan, AnsiStyle::Bold])
                 );
                 io::stdout().flush()?;
                 Ok(())
@@ -438,13 +440,16 @@ fn render(frame: &mut Frame<'_>, model: &Model) {
         ])
         .split(frame.area());
 
-    let header = Paragraph::new(model.header.as_str())
-        .style(
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )
-        .block(Block::default().borders(Borders::BOTTOM).title(" Kamui "));
+    let header = Paragraph::new(header_line(&model.header)).block(
+        Block::default()
+            .borders(Borders::BOTTOM)
+            .title(" \u{25c6} Kamui ")
+            .title_style(
+                Style::default()
+                    .fg(Color::Rgb(97, 175, 239))
+                    .add_modifier(Modifier::BOLD),
+            ),
+    );
     frame.render_widget(header, areas[0]);
 
     let transcript = transcript_text(model, areas[1].width);
@@ -457,23 +462,71 @@ fn render(frame: &mut Frame<'_>, model: &Model) {
         .block(Block::default().borders(Borders::LEFT | Borders::RIGHT));
     frame.render_widget(body, areas[1]);
 
-    let footer_text = match (model.prompt_visible, model.thinking) {
-        (true, None) => format!("{}\n{}", model.footer, "> "),
-        // While the model thinks, the prompt line becomes the frea-style loading indicator.
-        (_, Some((frame, label))) => {
-            format!(
-                "{}\n{} {}",
-                model.footer,
-                SPINNER_FRAMES[frame % SPINNER_FRAMES.len()],
-                label
-            )
-        }
-        (false, None) => model.footer.clone(),
-    };
-    let footer = Paragraph::new(footer_text)
-        .style(Style::default().fg(Color::White).bg(PROMPT_BG))
-        .block(Block::default().borders(Borders::TOP));
+    let footer = footer_widget(model);
     frame.render_widget(footer, areas[2]);
+}
+
+/// "Kamui v… · model · path" with the meta half dimmed so the brand reads first.
+fn header_line(header: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    if let Some((brand, rest)) = header.split_once(" \u{b7} ") {
+        spans.push(Span::styled(
+            format!("{brand} "),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!("\u{b7} {rest}"),
+            Style::default().fg(NOTICE_FG),
+        ));
+    } else {
+        spans.push(Span::styled(
+            header.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Hint line plus the prompt row: the frea spinner takes over while thinking, otherwise the
+/// cyan `❯` marks where typing lands.
+fn footer_widget(model: &Model) -> Paragraph<'static> {
+    let hints = Line::styled(model.footer.clone(), Style::default().fg(NOTICE_FG));
+    let prompt_line = match model.thinking {
+        Some((frame, label)) => Line::from(vec![
+            Span::styled(
+                format!("{} ", SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]),
+                Style::default()
+                    .fg(Color::Rgb(97, 175, 239))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(label.to_string(), Style::default().fg(NOTICE_FG)),
+        ]),
+        None => {
+            if model.prompt_visible {
+                Line::from(vec![
+                    Span::styled(
+                        "\u{276f} ".to_string(),
+                        Style::default()
+                            .fg(Color::Rgb(97, 175, 239))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "type a message, or / for commands",
+                        Style::default().add_modifier(Modifier::DIM),
+                    ),
+                ])
+            } else {
+                Line::from("")
+            }
+        }
+    };
+    Paragraph::new(Text::from(vec![hints, prompt_line]))
+        .style(Style::default().bg(PROMPT_BG))
+        .block(Block::default().borders(Borders::TOP))
 }
 
 fn transcript_text(model: &Model, width: u16) -> Text<'static> {
@@ -493,6 +546,22 @@ fn transcript_text(model: &Model, width: u16) -> Text<'static> {
 }
 
 fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
+    // OpenCode-style transcript: only input, tool calls, and errors get blocks; streamed answers
+    // read as clean markdown with a slim accent bar, and raw tool output stays dim and quiet.
+    if card.title == "Assistant" {
+        return assistant_lines(card, width);
+    }
+    if card.kind == CardKind::Output {
+        let mut out = Vec::new();
+        for line in wrap_display(&card.body, width.saturating_sub(4)) {
+            out.push(filled_line(
+                format!("  \u{b7} {line}"),
+                width,
+                Style::default().fg(NOTICE_FG),
+            ));
+        }
+        return out;
+    }
     let style = match card.kind {
         CardKind::User => Style::default().bg(USER_BG).fg(Color::White),
         CardKind::Tool => Style::default().bg(TOOL_BG).fg(Color::White),
@@ -501,40 +570,57 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
     };
     let title_style = style.add_modifier(Modifier::BOLD);
     let mut out = Vec::new();
-    let title = format!("┌─ {} ", card.title);
+    let title = format!(
+        "{} {} ",
+        match card.kind {
+            CardKind::User => "\u{25cf}",
+            CardKind::Tool => "\u{25b8}",
+            _ => "",
+        },
+        card.title
+    );
     let top = format!(
-        "{title}{}┐",
-        "─".repeat(width.saturating_sub(UnicodeWidthStr::width(title.as_str()) + 1))
+        "{title}{}",
+        "\u{2500}".repeat(width.saturating_sub(UnicodeWidthStr::width(title.as_str())))
     );
     out.push(filled_line(top, width, title_style));
     if card.collapsed {
         out.push(filled_line(
-            "│ … (collapsed; press Enter to expand)".to_string(),
+            "  \u{2026} (collapsed; press Enter to expand)".to_string(),
             width,
             style,
         ));
-    } else if card.title == "Assistant" {
-        let text = crate::markdown::render_ratatui(&card.body);
-        for line in text.lines {
-            let mut spans = vec![Span::styled("│ ".to_string(), style)];
-            spans.extend(
-                line.spans
-                    .into_iter()
-                    .map(|span| Span::styled(span.content.to_string(), span.style.bg(OUTPUT_BG))),
-            );
-            spans.push(Span::styled(" │".to_string(), style));
-            out.push(filled_spans(spans, width, style));
-        }
     } else {
         for line in wrap_display(&card.body, width.saturating_sub(4)) {
-            out.push(filled_line(format!("│ {line} │"), width, style));
+            out.push(filled_line(format!("  {line}"), width, style));
         }
     }
-    out.push(filled_line(
-        format!("└{}┘", "─".repeat(width.saturating_sub(1))),
-        width,
-        style,
-    ));
+    out.push(filled_line("\u{2500}".repeat(width), width, style));
+    out
+}
+
+/// Assistant messages render as plain markdown behind a slim accent bar — no full-width
+/// background box, so long answers stay comfortable to read.
+fn assistant_lines(card: &Card, _width: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    if card.collapsed {
+        out.push(Line::styled(
+            "  \u{2026} (collapsed; press Enter to expand)".to_string(),
+            Style::default().fg(NOTICE_FG),
+        ));
+        return out;
+    }
+    let accent = Style::default().fg(Color::Rgb(97, 175, 239));
+    let text = crate::markdown::render_ratatui(&card.body);
+    for line in text.lines {
+        let mut spans = vec![Span::styled("\u{258d} ".to_string(), accent)];
+        spans.extend(
+            line.spans
+                .into_iter()
+                .map(|span| Span::styled(span.content.to_string(), span.style)),
+        );
+        out.push(Line::from(spans));
+    }
     out
 }
 
@@ -603,5 +689,23 @@ mod tests {
             .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
             .sum();
         assert_eq!(width, 20);
+    }
+
+    #[test]
+    fn assistant_cards_render_unboxed() {
+        let card = Card {
+            kind: CardKind::Output,
+            title: "Assistant".into(),
+            body: "hello **world**".into(),
+            collapsed: false,
+        };
+        let lines = card_lines(&card, 40);
+        assert!(!lines.is_empty());
+        // No full-width background fill: lines end where the text ends, and each starts with
+        // the accent bar instead of a box border.
+        for line in &lines {
+            assert_eq!(line.spans[0].content, "\u{258d} ");
+            assert!(line.spans[0].style.bg.is_none());
+        }
     }
 }
