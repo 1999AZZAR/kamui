@@ -6,7 +6,7 @@ use crate::markdown;
 use crate::mcp::ConnectionStatus;
 use crate::pricing::Prices;
 use crate::prompt;
-use crate::provider::{ChatRequest, Message, Provider, StreamEvent, ToolCall, Usage};
+use crate::provider::{ChatRequest, Message, Provider, Role, StreamEvent, ToolCall, Usage};
 use crate::render;
 use crate::storage;
 use crate::storage::{Database, Session};
@@ -293,7 +293,11 @@ where
             chat_ui.tool_output(&output)?;
             continue;
         }
-        chat_ui.user(input)?;
+        // Slash commands are UI operations, not conversation turns — opencode hides them
+        // from the transcript too.
+        if !input.starts_with('/') {
+            chat_ui.user(input)?;
+        }
 
         // A custom command (`/review`, ...) or skill (`/my-skill`, `/skill:my-skill`) expands
         // into this turn's prompt and then takes the ordinary path below. Built-in commands and
@@ -587,6 +591,18 @@ where
                         ui.style(&format!("Command failed: {error:#}\n"), &[Style::Red])
                     );
                 }
+            }
+            // Sidebar follows /new //resume: session title, id, and context reset.
+            if use_tui {
+                update_sidebar(
+                    &mut chat_ui,
+                    session.as_ref(),
+                    &active.model,
+                    project,
+                    None,
+                    context_window,
+                    None,
+                );
             }
             // Sync Plan Mode with session changes from /new /resume /delete.
             let new_session_id = session.as_ref().map(|s| s.id.clone());
@@ -1685,7 +1701,7 @@ fn handle_command(
     always_allowed: &mut HashSet<String>,
     last_turn_snapshot: &mut Option<HashMap<PathBuf, Option<String>>>,
     prices: &Prices,
-    tui: Option<&mut ChatUi>,
+    mut tui: Option<&mut ChatUi>,
 ) -> Result<()> {
     let (command, argument) = input.split_once(' ').unwrap_or((input, ""));
     let argument = argument.trim();
@@ -1748,7 +1764,22 @@ fn handle_command(
             // /resume via handle_command is not the startup resume path, so we don't
             // rehydrate here — the caller would need &mut plan_mode.
             *session = Some(resumed);
-            print_history_preview(messages);
+            if let Some(ui) = tui.as_deref_mut() {
+                // Replay the last few user/assistant turns as transcript cards; raw text
+                // would print straight into the frame the TUI owns.
+                let skip = messages.len().saturating_sub(10);
+                for message in &messages[skip..] {
+                    match message.role {
+                        Role::User => ui.user(&message.content)?,
+                        Role::Assistant if !message.content.is_empty() => {
+                            ui.assistant_update(&message.content)?
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                print_history_preview(messages);
+            }
         }
         "/delete" => {
             let target = resolve_session(database, argument)?;
