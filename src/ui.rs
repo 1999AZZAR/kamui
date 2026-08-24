@@ -53,7 +53,6 @@ const BORDER: Color = Color::Rgb(0x48, 0x48, 0x48);
 const BG_ELEMENT: Color = Color::Rgb(0x1e, 0x1e, 0x1e);
 const BG_PANEL: Color = Color::Rgb(0x14, 0x14, 0x14);
 const BLUE: Color = Color::Rgb(0x5c, 0x9c, 0xf5);
-const INFO: Color = Color::Rgb(0x56, 0xb6, 0xc2);
 const GREEN: Color = Color::Rgb(0x7f, 0xd8, 0x8f);
 const RED: Color = Color::Rgb(0xe0, 0x6c, 0x75);
 /// Kept from the earlier blue scheme; NOTICE_FG aliases it for readability everywhere.
@@ -851,128 +850,111 @@ fn footer_widget(model: &Model) -> Paragraph<'static> {
 }
 
 fn transcript_text(model: &Model, width: u16) -> Text<'static> {
-    let inner_width = width.saturating_sub(2).max(20) as usize;
+    let inner_width = width.max(20) as usize;
     let mut lines = Vec::new();
     for card in &model.cards {
         lines.extend(card_lines(card, inner_width));
         lines.push(Line::from(""));
     }
+    // Status notes render as quiet plain lines, opencode-style.
     for notice in &model.notices {
-        lines.push(Line::styled(
-            format!("─── {notice} "),
-            Style::default().fg(NOTICE_FG),
-        ));
+        lines.push(Line::styled(notice.clone(), Style::default().fg(MUTED)));
     }
     Text::from(lines)
 }
 
+/// OpenCode's chat grammar (internal/tui/components/chat/message.go): every message is a thick
+/// left border with no background fill — user borders secondary-blue, assistant the brand
+/// accent, tool calls muted — and raw output truncates to a head window with an expand hint.
+const THICK_BORDER: &str = "\u{258c} ";
+const MAX_RESULT_HEIGHT: usize = 10;
+
 fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
-    // OpenCode-style transcript: only input, tool calls, and errors get blocks; streamed answers
-    // read as clean markdown with a slim accent bar, and raw tool output stays dim and quiet.
-    if card.title == "Assistant" {
-        return assistant_lines(card, width);
-    }
-    if card.kind == CardKind::Output {
-        let mut out = Vec::new();
-        for line in wrap_display(&card.body, width.saturating_sub(4)) {
-            out.push(filled_line(
-                format!("  \u{b7} {line}"),
-                width,
-                Style::default().fg(NOTICE_FG),
-            ));
+    let (border, body_style) = if card.title == "Assistant" {
+        (BLUE, Style::default().fg(TEXT))
+    } else {
+        match card.kind {
+            CardKind::User => (BLUE, Style::default().fg(TEXT)),
+            CardKind::Tool => (MUTED, Style::default().fg(MUTED)),
+            CardKind::Output => (MUTED, Style::default().fg(MUTED)),
+            CardKind::Error => (RED, Style::default().fg(RED)),
+        }
+    };
+
+    let mut out = Vec::new();
+    let push_bordered = |out: &mut Vec<Line<'static>>, spans: Vec<Span<'static>>| {
+        let mut line = vec![Span::styled(
+            THICK_BORDER.to_string(),
+            Style::default().fg(border),
+        )];
+        line.extend(spans);
+        out.push(Line::from(line));
+    };
+
+    if card.title == "Assistant" && !card.collapsed {
+        let text = crate::markdown::render_ratatui(&card.body);
+        for line in text.lines {
+            let spans: Vec<Span<'static>> = line
+                .spans
+                .into_iter()
+                .map(|span| Span::styled(span.content.to_string(), span.style.patch(body_style)))
+                .collect();
+            push_bordered(&mut out, spans);
         }
         return out;
     }
-    let style = match card.kind {
-        CardKind::User => Style::default().bg(BG_ELEMENT).fg(TEXT),
-        CardKind::Tool => Style::default().bg(BG_PANEL).fg(INFO),
-        CardKind::Output => Style::default().bg(BG_PANEL).fg(TEXT),
-        CardKind::Error => Style::default().bg(BG_ELEMENT).fg(RED),
-    };
-    let title_style = style.add_modifier(Modifier::BOLD);
-    let mut out = Vec::new();
-    let title = format!(
-        "{} {} ",
-        match card.kind {
-            CardKind::User => "\u{25cf}",
-            CardKind::Tool => "\u{25b8}",
-            _ => "",
-        },
-        card.title
-    );
-    let top = format!(
-        "{title}{}",
-        "\u{2500}".repeat(width.saturating_sub(UnicodeWidthStr::width(title.as_str())))
-    );
-    out.push(filled_line(top, width, title_style));
+
+    // First line carries the role label, opencode-style ("Bash: cmd", user just speaks).
     let total_lines = card.body.lines().count();
     if card.collapsed {
-        // Head preview plus the tail count, so a collapsed card still says what's inside.
-        for line in wrap_display(
-            card.body.lines().next().unwrap_or(""),
-            width.saturating_sub(4),
-        )
-        .into_iter()
-        .take(1)
-        {
-            out.push(filled_line(format!("  {line}"), width, style));
+        for source in card.body.lines().take(MAX_RESULT_HEIGHT) {
+            for row in wrap_display(source, width.saturating_sub(4)) {
+                push_bordered(&mut out, vec![Span::styled(row, body_style)]);
+            }
         }
-        let _ = style;
-        out.push(filled_line(
-            format!(
-                "  \u{2026} {} more line(s) — /expand to show",
-                total_lines.saturating_sub(1)
-            ),
-            width,
-            Style::default().bg(BG_PANEL).fg(GREEN),
-        ));
-    } else {
-        for line in wrap_display(&card.body, width.saturating_sub(4)) {
-            out.push(filled_line(format!("  {line}"), width, style));
-        }
-    }
-    out.push(filled_line("\u{2500}".repeat(width), width, style));
-    out
-}
-
-/// Assistant messages render as plain markdown behind a slim accent bar — no full-width
-/// background box, so long answers stay comfortable to read.
-fn assistant_lines(card: &Card, _width: usize) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    if card.collapsed {
-        out.push(Line::styled(
-            "  \u{2026} (collapsed; press Enter to expand)".to_string(),
-            Style::default().fg(NOTICE_FG),
-        ));
+        push_bordered(
+            &mut out,
+            vec![Span::styled(
+                format!(
+                    "\u{2026} {} more line(s) \u{b7} /expand",
+                    total_lines.saturating_sub(MAX_RESULT_HEIGHT)
+                ),
+                Style::default().fg(GREEN),
+            )],
+        );
         return out;
     }
-    let accent = Style::default().fg(BLUE);
-    let text = crate::markdown::render_ratatui(&card.body);
-    for line in text.lines {
-        let mut spans = vec![Span::styled("\u{258d} ".to_string(), accent)];
-        spans.extend(
-            line.spans
-                .into_iter()
-                .map(|span| Span::styled(span.content.to_string(), span.style)),
-        );
-        out.push(Line::from(spans));
+
+    match card.kind {
+        CardKind::User => {
+            for line in wrap_display(&card.body, width.saturating_sub(4)) {
+                push_bordered(&mut out, vec![Span::styled(line, body_style)]);
+            }
+        }
+        CardKind::Error => {
+            for line in wrap_display(&card.body, width.saturating_sub(4)) {
+                push_bordered(&mut out, vec![Span::styled(line, body_style)]);
+            }
+        }
+        _ => {
+            // Tool call: "Name: args", then its output beneath, all under one muted rail.
+            for (i, source) in card.body.lines().enumerate() {
+                let styled = if i == 0 {
+                    Span::styled(source.to_string(), Style::default().fg(TEXT))
+                } else {
+                    Span::styled(source.to_string(), body_style)
+                };
+                for row in wrap_display(styled.content.as_ref(), width.saturating_sub(4)) {
+                    if i == 0 {
+                        push_bordered(&mut out, vec![Span::styled(row, Style::default().fg(TEXT))]);
+                    } else {
+                        push_bordered(&mut out, vec![Span::styled(row, body_style)]);
+                    }
+                }
+            }
+        }
     }
     out
-}
-
-fn filled_line(text: String, width: usize, style: Style) -> Line<'static> {
-    filled_spans(vec![Span::styled(text, style)], width, style)
-}
-
-fn filled_spans(mut spans: Vec<Span<'static>>, width: usize, style: Style) -> Line<'static> {
-    let current: usize = spans
-        .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .sum();
-    if current < width {
-        spans.push(Span::styled(" ".repeat(width - current), style));
-    }
-    Line::from(spans)
 }
 
 fn wrap_display(text: &str, width: usize) -> Vec<String> {
@@ -1010,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn card_lines_have_a_box_shape() {
+    fn user_cards_use_thick_left_border() {
         let card = Card {
             kind: CardKind::User,
             title: "User".into(),
@@ -1018,13 +1000,9 @@ mod tests {
             collapsed: false,
         };
         let lines = card_lines(&card, 20);
-        assert_eq!(lines.len(), 3);
-        let width: usize = lines[0]
-            .spans
-            .iter()
-            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-            .sum();
-        assert_eq!(width, 20);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans[0].content, "\u{258c} ");
+        assert_eq!(lines[0].spans[0].style.fg, Some(BLUE));
     }
 
     #[test]
@@ -1037,11 +1015,30 @@ mod tests {
         };
         let lines = card_lines(&card, 40);
         assert!(!lines.is_empty());
-        // No full-width background fill: lines end where the text ends, and each starts with
-        // the accent bar instead of a box border.
+        // Every line starts with the accent bar and carries no background fill.
         for line in &lines {
-            assert_eq!(line.spans[0].content, "\u{258d} ");
+            assert_eq!(line.spans[0].content, "\u{258c} ");
+            assert_eq!(line.spans[0].style.fg, Some(BLUE));
             assert!(line.spans[0].style.bg.is_none());
         }
+    }
+
+    #[test]
+    fn collapsed_tool_output_shows_head_window_and_hint() {
+        let card = Card {
+            kind: CardKind::Output,
+            title: "Tool Output".into(),
+            body: (1..=15)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            collapsed: true,
+        };
+        let lines = card_lines(&card, 60);
+        assert_eq!(lines.len(), MAX_RESULT_HEIGHT + 1);
+        let last = lines.last().unwrap();
+        let text: String = last.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("5 more line(s)"));
+        assert!(text.contains("/expand"));
     }
 }
