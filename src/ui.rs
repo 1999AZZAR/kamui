@@ -10,7 +10,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph},
 };
 use std::{
     io::{self, Stdout, Write},
@@ -81,7 +81,9 @@ struct Model {
     cards: Vec<Card>,
     notices: Vec<String>,
     footer: String,
-    scroll: u16,
+    /// Transcript viewport offset in wrapped rows counted from the bottom; 0 means "follow
+    /// the tail". PageUp/PageDown/Home/End move it, typing snaps back.
+    scroll_from_bottom: usize,
     prompt_visible: bool,
     thinking: Option<(usize, &'static str)>,
     /// True until the first message lands: the home screen shows the centered logo.
@@ -105,7 +107,7 @@ impl Default for Model {
             footer: String::from(
                 "/ commands · Tab complete · \u{2191} history · Enter send · Ctrl+C cancel",
             ),
-            scroll: 0,
+            scroll_from_bottom: 0,
             prompt_visible: true,
             thinking: None,
             intro: true,
@@ -120,6 +122,9 @@ impl Default for Model {
 struct FullScreen {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     model: Model,
+    /// Transcript viewport height from the most recent draw; PageUp/PageDown use it as the
+    /// scroll page size.
+    last_viewport_rows: usize,
 }
 
 impl FullScreen {
@@ -144,14 +149,22 @@ impl FullScreen {
             header,
             ..Model::default()
         };
-        let mut screen = Self { terminal, model };
+        let mut screen = Self {
+            terminal,
+            model,
+            last_viewport_rows: 0,
+        };
         screen.draw()?;
         Ok(screen)
     }
 
     fn draw(&mut self) -> Result<()> {
         let model = self.model.clone();
-        self.terminal.draw(|frame| render(frame, &model))?;
+        let mut viewport = 0usize;
+        self.terminal.draw(|frame| {
+            viewport = render(frame, &model);
+        })?;
+        self.last_viewport_rows = viewport;
         Ok(())
     }
 
@@ -523,6 +536,27 @@ impl ScreenHandle {
             let _ = screen.draw();
         };
         let _ = term.hide_cursor();
+        // Page through the transcript; `page` is roughly one viewport of rows.
+        let scroll_by = |rows: i64| {
+            let mut screen = lock_screen(&self.0);
+            let page = screen.last_viewport_rows.max(1) as i64;
+            let rows = if rows.abs() > 50_000 {
+                rows
+            } else {
+                rows * page
+            };
+            let next = screen.model.scroll_from_bottom as i64 + rows;
+            screen.model.scroll_from_bottom = next.clamp(0, 100_000) as usize;
+            let _ = screen.draw();
+        };
+        let snap_to_tail = |buf: &str, selected: usize, items: Vec<(String, String)>| {
+            let mut screen = lock_screen(&self.0);
+            screen.model.scroll_from_bottom = 0;
+            screen.model.input = buf.to_string();
+            screen.model.ac_selected = selected;
+            screen.model.ac_items = items;
+            let _ = screen.draw();
+        };
         let mut buf = String::new();
         let mut selected = 0usize;
         let mut history_idx = history.len();
@@ -606,6 +640,10 @@ impl ScreenHandle {
                         break;
                     }
                 }
+                Key::PageUp => scroll_by(1),
+                Key::PageDown => scroll_by(-1),
+                Key::Home => scroll_by(100_000),
+                Key::End => scroll_by(-100_000),
                 Key::Backspace => {
                     buf.pop();
                     selected = 0;
@@ -620,6 +658,8 @@ impl ScreenHandle {
                     if history_idx == history.len() {
                         saved_buf = buf.clone();
                     }
+                    snap_to_tail(&buf, selected, items(&filtered));
+                    continue;
                 }
                 _ => {}
             }
@@ -630,7 +670,9 @@ impl ScreenHandle {
     }
 }
 
-fn render(frame: &mut Frame<'_>, model: &Model) {
+/// Returns how many transcript rows are visible, so the input loop can page by a real
+/// viewport.
+fn render(frame: &mut Frame<'_>, model: &Model) -> usize {
     // OpenCode layout: transcript on top, autocomplete menu above the bordered editor, a
     // one-line footer, and the sidebar rail splitting the body horizontally.
     let popup_height: u16 = if model.ac_items.is_empty() {
@@ -667,14 +709,21 @@ fn render(frame: &mut Frame<'_>, model: &Model) {
     if model.intro && model.cards.is_empty() {
         frame.render_widget(intro_paragraph(model, body_area), body_area);
     } else {
+        // Wrap every row ourselves so viewport math is exact (Paragraph's own wrap happens
+        // after scroll offsets, which makes bottom-follow drift on long wrapped lines).
         let transcript = transcript_text(model, transcript_area.width);
-        let transcript_height = transcript.lines.len().saturating_add(1) as u16;
-        let visible = transcript_area.height.saturating_sub(2);
-        let scroll = transcript_height.saturating_sub(visible);
-        let body = Paragraph::new(transcript)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll.max(model.scroll), 0));
-        frame.render_widget(body, transcript_area);
+        let mut rows: Vec<Line<'static>> = Vec::with_capacity(transcript.lines.len());
+        for line in &transcript.lines {
+            for row in wrap_spans(&line.spans, transcript_area.width.max(1) as usize) {
+                rows.push(Line::from(row));
+            }
+        }
+        let visible = transcript_area.height as usize;
+        let start = rows
+            .len()
+            .saturating_sub(visible.saturating_add(model.scroll_from_bottom));
+        let window: Vec<Line<'static>> = rows.into_iter().skip(start).take(visible).collect();
+        frame.render_widget(Paragraph::new(Text::from(window)), transcript_area);
     }
     if let Some(area) = sidebar_area {
         frame.render_widget(sidebar_paragraph(model, area), area);
@@ -697,6 +746,11 @@ fn render(frame: &mut Frame<'_>, model: &Model) {
     }
 
     frame.render_widget(footer_widget(model), footer_area);
+    if model.intro && model.cards.is_empty() {
+        0
+    } else {
+        body_area.height as usize
+    }
 }
 
 /// The opencode-style prompt: left accent border, element background, `❯` glyph with the live
@@ -955,6 +1009,35 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
         }
     }
     out
+}
+
+/// Char-greedy wrap of styled spans to `width` columns. Carries each source span's style into
+/// the produced rows; soft-wrap only (newlines already split upstream).
+fn wrap_spans(spans: &[Span<'_>], width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut used = 0usize;
+    for span in spans {
+        let style = span.style;
+        let content = span.content.as_ref();
+        let mut chunk = String::new();
+        for ch in content.chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+            if used + cw > width && used > 0 {
+                rows.last_mut()
+                    .unwrap()
+                    .push(Span::styled(std::mem::take(&mut chunk), style));
+                rows.push(Vec::new());
+                used = 0;
+            }
+            chunk.push(ch);
+            used += cw;
+        }
+        if !chunk.is_empty() {
+            rows.last_mut().unwrap().push(Span::styled(chunk, style));
+        }
+    }
+    rows
 }
 
 fn wrap_display(text: &str, width: usize) -> Vec<String> {
