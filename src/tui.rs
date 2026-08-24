@@ -245,6 +245,16 @@ fn slash_candidates(
     out
 }
 
+/// Cut to at most `max` characters (never bytes), appending an ellipsis when trimmed. Byte
+/// slicing here would panic mid-UTF-8 for descriptions with non-ASCII text.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{cut}\u{2026}")
+}
+
 fn filter_candidates<'a>(candidates: &'a [Candidate], needle: &str) -> Vec<&'a Candidate> {
     if needle.is_empty() {
         return candidates.iter().collect();
@@ -271,10 +281,13 @@ fn read_line_with_slash_popup(candidates: &[Candidate], history: &[String]) -> O
     let mut last_lines: usize = 0;
 
     let render = |buf: &str, selected: usize, last_lines: &mut usize, term: &Term| {
+        const DIM: &str = "\x1b[2m";
+        const CYAN: &str = "\x1b[36m";
+        const RESET: &str = "\x1b[0m";
         let is_slash = buf.trim_start().starts_with('/') && !buf.trim_start().contains(' ');
         let mut out = String::new();
-        let styled_buf = Ui::stdio().style(buf, &[Style::BgBlue, Style::White]);
-        out.push_str(&format!("\r\x1b[J{prompt}{styled_buf}"));
+        // Plain text on the terminal's own colors — readable first, decorated second.
+        out.push_str(&format!("\r\x1b[J{prompt}{buf}"));
         if is_slash {
             let needle = buf
                 .trim_start()
@@ -289,25 +302,29 @@ fn read_line_with_slash_popup(candidates: &[Candidate], history: &[String]) -> O
                 let s = selected.saturating_sub(visible / 2);
                 s.min(total - visible)
             };
-            out.push_str("\n\x1b[2m─\x1b[0m");
+            out.push_str(&format!("\n{DIM}\u{2500}\x1b[0m"));
             let term_w = term.size().1 as usize;
             let max_desc = term_w.saturating_sub(26).clamp(20, 60);
             for (i, c) in filtered.iter().skip(start).take(visible).enumerate() {
                 let idx = start + i;
                 let is_on = idx == selected;
-                let prefix = if is_on { "→ " } else { "  " };
-                let hl_on = if is_on { "\x1b[7m" } else { "" };
-                let desc = if c.description.len() > max_desc {
-                    format!("{}…", &c.description[..max_desc.saturating_sub(1)])
+                // Selection is a cyan marker + brightened name, not reverse video; the
+                // description stays dim so the eye lands on the command name first.
+                let (prefix, name_style, desc_style) = if is_on {
+                    (format!("{CYAN}\u{276f}{RESET} "), CYAN, "")
                 } else {
-                    c.description.clone()
+                    ("  ".to_string(), DIM, DIM)
                 };
-                out.push_str(&format!("\n{hl_on}{prefix}{:<20}  {}\x1b[0m", c.name, desc));
+                let desc = truncate_chars(&c.description, max_desc);
+                out.push_str(&format!(
+                    "\n{prefix}{name_style}{:<20}{RESET}  {desc_style}{desc}{RESET}",
+                    c.name
+                ));
             }
             if total > 0 {
-                out.push_str(&format!("\n\x1b[2m  ({}/{}) \x1b[0m", selected + 1, total));
+                out.push_str(&format!("\n{DIM}  ({}/{}) \x1b[0m", selected + 1, total));
             } else {
-                out.push_str("\n\x1b[2m  (no match)\x1b[0m");
+                out.push_str(&format!("\n{DIM}  (no match)\x1b[0m"));
             }
         }
         let rows_below = out.matches('\n').count();
@@ -374,8 +391,7 @@ fn read_line_with_slash_popup(candidates: &[Candidate], history: &[String]) -> O
                 let _ = term.show_cursor();
                 if last_lines > 0 {
                     let _ = term.write_str(&format!("\x1b[{}A\x1b[J", last_lines));
-                    let styled_echo = Ui::stdio().style(&buf, &[Style::BgBlue, Style::White]);
-                    let _ = term.write_str(&format!("{prompt}{styled_echo}\n"));
+                    let _ = term.write_str(&format!("{prompt}{buf}\n"));
                     let _ = term.flush();
                 }
                 return Some(buf);
@@ -389,8 +405,7 @@ fn read_line_with_slash_popup(candidates: &[Candidate], history: &[String]) -> O
                     let _ = term.show_cursor();
                     if last_lines > 0 {
                         let _ = term.write_str(&format!("\x1b[{}A\x1b[J", last_lines));
-                        let styled_echo = Ui::stdio().style(&buf, &[Style::BgBlue, Style::White]);
-                        let _ = term.write_str(&format!("{prompt}{styled_echo}\n"));
+                        let _ = term.write_str(&format!("{prompt}{buf}\n"));
                     }
                     return None;
                 }

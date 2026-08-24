@@ -212,7 +212,7 @@ where
                 }
             }
         } else {
-            print!("{}", ui.style("> ", &[Style::BgBlue, Style::White]));
+            print!("{}", ui.style("\u{276f} ", &[Style::Cyan, Style::Bold]));
             io::stdout().flush()?;
             let rx = input_rx.as_mut().expect("plain mode has input channel");
             let line = tokio::select! {
