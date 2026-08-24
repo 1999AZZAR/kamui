@@ -58,6 +58,8 @@ const BORDER: Color = Color::Rgb(0x48, 0x48, 0x48);
 const BG_ELEMENT: Color = Color::Rgb(0x1e, 0x1e, 0x1e);
 const BG_PANEL: Color = Color::Rgb(0x14, 0x14, 0x14);
 const BLUE: Color = Color::Rgb(0x5c, 0x9c, 0xf5);
+/// Opaque near-black for every overlay so nothing bleeds through.
+const POPUP_BG: Color = Color::Rgb(0x0a, 0x0a, 0x0a);
 /// Warm accent marking the user's own words (opencode primary tone).
 const ACCENT: Color = Color::Rgb(0xfa, 0xb2, 0x83);
 const GREEN: Color = Color::Rgb(0x7f, 0xd8, 0x8f);
@@ -1011,13 +1013,15 @@ fn render_dialog(frame: &mut Frame<'_>, dialog: &DialogState, area: Rect) {
         }
     }
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(BLUE))
-                .title(format!(" {} ", dialog.title))
-                .title_style(Style::default().fg(BLUE).add_modifier(Modifier::BOLD)),
-        ),
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().bg(POPUP_BG))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(BLUE))
+                    .title(format!(" {} ", dialog.title))
+                    .title_style(Style::default().fg(BLUE).add_modifier(Modifier::BOLD)),
+            ),
         box_area,
     );
 }
@@ -1077,19 +1081,32 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
         Style::default().fg(BORDER),
     )));
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(WARN))
-                .title(format!(" {} ", perm.title))
-                .title_style(Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
-        ),
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().bg(POPUP_BG))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(WARN))
+                    .title(format!(" {} ", perm.title))
+                    .title_style(Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
+            ),
         box_area,
     );
 }
 
 /// `?` overlay: the keybinding sheet.
-fn help_overlay() -> Paragraph<'static> {
+fn render_help(frame: &mut Frame<'_>, area: Rect) {
+    let width = 64.min(area.width.saturating_sub(4));
+    let height = 18.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, box_area);
     let rows: [(&str, &str); 12] = [
         ("Enter", "send message"),
         ("Ctrl+K", "switch model"),
@@ -1117,11 +1134,16 @@ fn help_overlay() -> Paragraph<'static> {
             Span::styled(desc.to_string(), Style::default().fg(MUTED)),
         ]));
     }
-    Paragraph::new(Text::from(lines)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(BLUE)),
-    )
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().bg(POPUP_BG))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(BORDER)),
+            ),
+        box_area,
+    );
 }
 
 /// The single keyboard reader for TUI mode.
@@ -1616,7 +1638,7 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> usize {
         render_permission(frame, perm, frame.area());
     }
     if model.help_visible {
-        frame.render_widget(help_overlay(), frame.area());
+        render_help(frame, frame.area());
     }
     if let Some(dialog) = &model.dialog {
         render_dialog(frame, dialog, frame.area());
@@ -1745,7 +1767,7 @@ fn popup_widget(model: &Model) -> Paragraph<'static> {
             ),
         ]));
     }
-    Paragraph::new(Text::from(lines)).style(Style::default().bg(BG_PANEL))
+    Paragraph::new(Text::from(lines)).style(Style::default().bg(POPUP_BG))
 }
 
 fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
