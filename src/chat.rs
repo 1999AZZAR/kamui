@@ -78,6 +78,21 @@ where
     // while the agent runs, Esc interrupts.
     let mut hub = chat_ui.screen_handle().map(InputHub::spawn);
     let interrupt = hub.as_ref().map(|h| h.interrupt.clone());
+    if let Some(hub) = hub.as_ref() {
+        hub.set_models(
+            config
+                .profiles
+                .iter()
+                .map(|profile| {
+                    (
+                        profile.name.clone(),
+                        format!("{} · {}", profile.name, profile.model),
+                    )
+                })
+                .collect(),
+        );
+        refresh_session_source(database, hub);
+    }
     let ui = Ui::stdio();
     // One tidy startup line instead of a wall of per-skill warnings; /skills still lists every
     // individual reason.
@@ -2115,6 +2130,19 @@ fn print_history_preview(messages: &[Message]) {
 /// Refresh the fullscreen sidebar rail (opencode-style): session identity on top, model and
 /// context usage beneath. Called at startup and after every completed round so the context
 /// figure tracks the live conversation.
+/// Pushes recent sessions into the Ctrl+S switcher (id -> title labels).
+fn refresh_session_source(database: &Database, hub: &InputHub) {
+    if let Ok(sessions) = database.list_sessions() {
+        hub.set_sessions(
+            sessions
+                .into_iter()
+                .take(15)
+                .map(|session| (session.id.clone(), session.title))
+                .collect(),
+        );
+    }
+}
+
 fn update_sidebar(
     chat_ui: &mut ChatUi,
     session: Option<&Session>,
@@ -2150,6 +2178,23 @@ fn update_sidebar(
         (None, _) => "\u{2014}".to_string(),
     };
     entries.push(("Context".to_string(), context_line));
+    // Status-bar badge: compact token count with context pressure for the amber threshold.
+    match last_input_tokens {
+        Some(tokens) => {
+            let pct: u8 = context_window
+                .map(|window| ((tokens as f64 / window as f64) * 100.0).min(100.0).round() as u8)
+                .unwrap_or(0);
+            let text = if tokens >= 1000 {
+                format!("{:.1}k tok", tokens as f64 / 1000.0)
+            } else {
+                format!("{tokens} tok")
+            };
+            let _ = chat_ui.set_token_badge(Some((text, pct)));
+        }
+        None => {
+            let _ = chat_ui.set_token_badge(None);
+        }
+    }
     if let Some(last_turn) = last_turn {
         // One metric per line reads better in the narrow rail than a pipe-separated row.
         entries.push(("Last turn".to_string(), last_turn.replace(" | ", "\n")));

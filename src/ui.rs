@@ -2,8 +2,8 @@ use crate::terminal::{Style as AnsiStyle, Ui};
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
-        KeyModifiers, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -14,7 +14,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 use std::{
     collections::VecDeque,
@@ -107,6 +107,46 @@ struct Model {
     warnings_visible: bool,
     /// Lines typed while the agent runs; shown in the footer until consumed.
     queued_count: usize,
+    /// Open modal (model picker / session switcher), opencode-style.
+    dialog: Option<DialogState>,
+    /// `?` overlay with keybindings.
+    help_visible: bool,
+    /// Right-side status-bar badge ("5.9k tok 41%", amber past 80%).
+    token_badge: Option<(String, u8)>,
+}
+
+/// A modal picker that submits an existing slash command on Enter — pure UI sugar over
+/// `/model <name>` and `/resume <id>`, exactly like opencode's model/session dialogs.
+#[derive(Debug, Clone)]
+pub struct DialogState {
+    pub title: String,
+    pub prefix: String,
+    pub items: Vec<(String, String)>,
+    pub query: String,
+    pub selected: usize,
+}
+
+impl DialogState {
+    pub fn new(title: &str, prefix: &str, items: Vec<(String, String)>) -> Self {
+        Self {
+            title: title.to_string(),
+            prefix: prefix.to_string(),
+            items,
+            query: String::new(),
+            selected: 0,
+        }
+    }
+
+    pub fn filtered(&self) -> Vec<&(String, String)> {
+        let needle = self.query.to_ascii_lowercase();
+        self.items
+            .iter()
+            .filter(|(value, label)| {
+                value.to_ascii_lowercase().contains(&needle)
+                    || label.to_ascii_lowercase().contains(&needle)
+            })
+            .collect()
+    }
 }
 
 impl Default for Model {
@@ -129,6 +169,9 @@ impl Default for Model {
             warnings: Vec::new(),
             warnings_visible: true,
             queued_count: 0,
+            dialog: None,
+            help_visible: false,
+            token_badge: None,
         }
     }
 }
@@ -507,6 +550,18 @@ impl ChatUi {
     }
 
     /// Show or hide warning messages in the transcript (`/warnings`).
+    /// Status-bar badge: text plus context percent (amber at/above 80%).
+    pub fn set_token_badge(&mut self, badge: Option<(String, u8)>) -> Result<()> {
+        match self.fullscreen.as_ref() {
+            Some(screen) => {
+                let mut screen = lock_screen(screen);
+                screen.model.token_badge = badge;
+                screen.draw()
+            }
+            None => Ok(()),
+        }
+    }
+
     pub fn set_warnings_visible(&mut self, visible: bool) -> Result<()> {
         match self.fullscreen.as_ref() {
             Some(screen) => {
@@ -586,6 +641,8 @@ pub struct InputHub {
     requester: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     candidates: Arc<std::sync::RwLock<Vec<crate::tui::Candidate>>>,
     screen: ScreenHandle,
+    models_src: Arc<std::sync::RwLock<Vec<(String, String)>>>,
+    sessions_src: Arc<std::sync::RwLock<Vec<(String, String)>>>,
 }
 
 impl InputHub {
@@ -599,21 +656,27 @@ impl InputHub {
         let requester: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>> =
             Arc::new(Mutex::new(None));
         let candidates = Arc::new(std::sync::RwLock::new(Vec::new()));
+        let models_src = Arc::new(std::sync::RwLock::new(Vec::new()));
+        let sessions_src = Arc::new(std::sync::RwLock::new(Vec::new()));
         std::thread::spawn({
             let interrupt = interrupt.clone();
             let busy = busy.clone();
             let queue = queue.clone();
             let requester = requester.clone();
             let candidates = candidates.clone();
+            let models_src = models_src.clone();
+            let sessions_src = sessions_src.clone();
             move || {
                 input_thread(
-                    screen.clone(),
+                    screen,
                     tx,
                     interrupt,
                     busy,
                     queue,
                     requester,
                     candidates,
+                    models_src,
+                    sessions_src,
                 )
             }
         });
@@ -625,6 +688,8 @@ impl InputHub {
             requester,
             candidates,
             screen: hub_screen,
+            models_src,
+            sessions_src,
         }
     }
 
@@ -634,6 +699,22 @@ impl InputHub {
             .candidates
             .write()
             .unwrap_or_else(PoisonError::into_inner) = candidates;
+    }
+
+    /// Sources for the Ctrl+K model picker: (submit value, display label).
+    pub fn set_models(&self, items: Vec<(String, String)>) {
+        *self
+            .models_src
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = items;
+    }
+
+    /// Sources for the Ctrl+S session switcher.
+    pub fn set_sessions(&self, items: Vec<(String, String)>) {
+        *self
+            .sessions_src
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = items;
     }
 
     /// Marks the agent busy while the guard lives; Drop returns the prompt to idle.
@@ -704,7 +785,114 @@ fn scroll_screen(screen: &ScreenHandle, rows: i64) {
     let _ = s.draw();
 }
 
+/// Centered modal with border, opencode PlaceOverlay style.
+fn render_dialog(frame: &mut Frame<'_>, dialog: &DialogState, area: Rect) {
+    let filtered = dialog.filtered();
+    let selected = dialog.selected.min(filtered.len().saturating_sub(1));
+    let width = 56.min(area.width.saturating_sub(4));
+    let list_rows = filtered.len() as u16 + 2;
+    let height = (list_rows + 3).min(area.height.saturating_sub(2)).max(5);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, box_area);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "\u{276f} ".to_string(),
+                Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(dialog.query.clone(), Style::default().fg(TEXT)),
+            Span::styled("  (Esc closes)".to_string(), Style::default().fg(BORDER)),
+        ]),
+        Line::from(""),
+    ];
+    if filtered.is_empty() {
+        lines.push(Line::styled(
+            "(no match)".to_string(),
+            Style::default().fg(MUTED),
+        ));
+    }
+    for (idx, (value, label)) in filtered.iter().enumerate() {
+        if idx >= selected.saturating_sub(7) && idx < selected.saturating_sub(7) + 8 {
+            let is_on = idx == selected;
+            let prefix = if is_on { "\u{276f} " } else { "  " };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    prefix.to_string(),
+                    Style::default().fg(if is_on { BLUE } else { BORDER }),
+                ),
+                Span::styled(
+                    label.clone(),
+                    Style::default()
+                        .fg(if is_on { TEXT } else { MUTED })
+                        .add_modifier(if is_on {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::raw("  "),
+                Span::styled(value.clone(), Style::default().fg(BORDER)),
+            ]));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(BLUE))
+                .title(format!(" {} ", dialog.title))
+                .title_style(Style::default().fg(BLUE).add_modifier(Modifier::BOLD)),
+        ),
+        box_area,
+    );
+}
+
+/// `?` overlay: the keybinding sheet.
+fn help_overlay() -> Paragraph<'static> {
+    let rows: [(&str, &str); 12] = [
+        ("Enter", "send message"),
+        ("Ctrl+K", "switch model"),
+        ("Ctrl+S", "resume a session"),
+        ("?", "toggle this help"),
+        ("Tab", "accept slash completion"),
+        ("\u{2191}/\u{2193}", "history / menu navigation"),
+        ("PgUp/PgDn", "scroll transcript"),
+        ("Home/End", "jump to top/bottom"),
+        ("!<command>", "run a shell command"),
+        ("/warnings", "hide or show warnings"),
+        ("Esc", "interrupt the agent"),
+        ("Ctrl+C x 2", "quit"),
+    ];
+    let mut lines = vec![Line::from(Span::styled(
+        "Keybindings",
+        Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+    ))];
+    for (key, desc) in rows {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {key:<12} "),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(desc.to_string(), Style::default().fg(MUTED)),
+        ]));
+    }
+    Paragraph::new(Text::from(lines)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(BLUE)),
+    )
+}
+
 /// The single keyboard reader for TUI mode.
+#[allow(clippy::too_many_arguments)]
 fn input_thread(
     screen: ScreenHandle,
     tx: tokio::sync::mpsc::UnboundedSender<HubEvent>,
@@ -713,6 +901,8 @@ fn input_thread(
     queue: Arc<Mutex<VecDeque<String>>>,
     requester: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     candidates: Arc<std::sync::RwLock<Vec<crate::tui::Candidate>>>,
+    models_src: Arc<std::sync::RwLock<Vec<(String, String)>>>,
+    sessions_src: Arc<std::sync::RwLock<Vec<(String, String)>>>,
 ) {
     let mut buf = String::new();
     let mut selected = 0usize;
@@ -765,6 +955,98 @@ fn input_thread(
         };
         let Some(key) = key else { break };
         feed_errors = 0;
+
+        // --- Modal overlays own the keys while open (opencode dialogs) ---
+        {
+            let mut s = lock_screen(&screen.0);
+            if s.model.help_visible {
+                match key.code {
+                    KeyCode::Char('?') | KeyCode::Esc => s.model.help_visible = false,
+                    _ => {}
+                }
+                drop(s);
+                let _ = screen.draw_now();
+                continue;
+            }
+            if let Some(dialog) = s.model.dialog.as_mut() {
+                match key.code {
+                    KeyCode::Up => {
+                        let total = dialog.filtered().len();
+                        if total > 0 {
+                            dialog.selected = dialog.selected.checked_sub(1).unwrap_or(total - 1);
+                        }
+                    }
+                    KeyCode::Down => {
+                        let total = dialog.filtered().len();
+                        if total > 0 {
+                            dialog.selected = (dialog.selected + 1) % total;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let picked = dialog
+                            .filtered()
+                            .get(dialog.selected)
+                            .map(|(value, _)| (*value).clone());
+                        if let Some(value) = picked {
+                            let line = format!("{}{}", dialog.prefix, value);
+                            s.model.dialog = None;
+                            drop(s);
+                            submit_line(&screen, &tx, &requester, &busy, &queue, line);
+                            continue;
+                        }
+                    }
+                    KeyCode::Esc => s.model.dialog = None,
+                    KeyCode::Backspace => {
+                        dialog.query.pop();
+                        dialog.selected = 0;
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        dialog.query.push(c);
+                        dialog.selected = 0;
+                    }
+                    _ => {}
+                }
+                drop(s);
+                let _ = screen.draw_now();
+                continue;
+            }
+            drop(s);
+        }
+
+        // Openers.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
+            let items = models_src
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if !items.is_empty() {
+                let mut sc = lock_screen(&screen.0);
+                sc.model.dialog = Some(DialogState::new("Select Model", "/model ", items));
+                drop(sc);
+                let _ = screen.draw_now();
+            }
+            continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            let items = sessions_src
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if !items.is_empty() {
+                let mut sc = lock_screen(&screen.0);
+                sc.model.dialog = Some(DialogState::new("Resume Session", "/resume ", items));
+                drop(sc);
+                let _ = screen.draw_now();
+            }
+            continue;
+        }
+        if key.code == KeyCode::Char('?') && buf.is_empty() {
+            let mut sc = lock_screen(&screen.0);
+            sc.model.help_visible = !sc.model.help_visible;
+            drop(sc);
+            let _ = screen.draw_now();
+            continue;
+        }
 
         let is_slash = buf.trim_start().starts_with('/') && !buf.trim_start().contains(' ');
         let needle = buf
@@ -828,28 +1110,7 @@ fn input_thread(
                     }
                     history_idx = history.len();
                 }
-                // A waiting approval/ask_user takes the answer before anything else.
-                let answer_tx = requester
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take();
-                if let Some(tx) = answer_tx {
-                    let _ = tx.send(line);
-                } else if line.is_empty() {
-                    // nothing to do
-                } else if is_busy {
-                    queue
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .push_back(line.clone());
-                    let mut s = lock_screen(&screen.0);
-                    s.model.queued_count =
-                        queue.lock().unwrap_or_else(PoisonError::into_inner).len();
-                    s.model.notices.push(format!("queued: {line}"));
-                    let _ = s.draw();
-                } else {
-                    let _ = tx.send(HubEvent::Line(line));
-                }
+                submit_line(&screen, &tx, &requester, &busy, &queue, line);
             }
             KeyCode::Esc => {
                 if is_busy {
@@ -903,6 +1164,40 @@ fn input_thread(
             _ => {}
         }
         sync(&screen, &buf, selected, items_for(&needle));
+    }
+}
+
+/// Shared submit path for the editor and modal dialogs: a waiting approval/ask_user takes
+/// the answer, busy queues it, idle sends it straight to the chat loop.
+fn submit_line(
+    screen: &ScreenHandle,
+    tx: &tokio::sync::mpsc::UnboundedSender<HubEvent>,
+    requester: &Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+    busy: &Arc<std::sync::atomic::AtomicBool>,
+    queue: &Arc<Mutex<VecDeque<String>>>,
+    line: String,
+) {
+    if line.is_empty() {
+        return;
+    }
+    let answer_tx = requester
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    if let Some(tx) = answer_tx {
+        let _ = tx.send(line);
+    } else if busy.load(std::sync::atomic::Ordering::SeqCst) {
+        queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(line.clone());
+        let mut s = lock_screen(&screen.0);
+        s.model.queued_count = queue.lock().unwrap_or_else(PoisonError::into_inner).len();
+        s.model.notices.push(format!("queued: {line}"));
+        drop(s);
+        let _ = screen.draw_now();
+    } else {
+        let _ = tx.send(HubEvent::Line(line));
     }
 }
 
@@ -999,6 +1294,14 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> usize {
     }
 
     frame.render_widget(footer_widget(model), footer_area);
+
+    if model.help_visible {
+        frame.render_widget(help_overlay(), frame.area());
+    }
+    if let Some(dialog) = &model.dialog {
+        render_dialog(frame, dialog, frame.area());
+    }
+
     if model.intro && model.cards.is_empty() {
         0
     } else {
@@ -1190,11 +1493,23 @@ fn footer_widget(model: &Model) -> Paragraph<'static> {
     if model.queued_count > 0 {
         let plural = if model.queued_count == 1 { "" } else { "s" };
         text.push_str(&format!(
-            " \u{b7} {} message{} queued",
+            " · {} message{} queued",
             model.queued_count, plural
         ));
     }
-    Paragraph::new(Line::styled(text, Style::default().fg(BORDER)))
+    // opencode status bar: a filled token badge that turns amber past 80% context.
+    let mut spans = vec![Span::styled(text, Style::default().fg(BORDER))];
+    if let Some((badge_text, pct)) = &model.token_badge {
+        spans.push(Span::raw("    "));
+        spans.push(Span::styled(
+            format!(" {badge_text} "),
+            Style::default()
+                .bg(if *pct >= 80 { WARN } else { TEXT })
+                .fg(BG_PANEL)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Paragraph::new(Line::from(spans))
 }
 
 fn transcript_text(model: &Model, width: u16) -> Text<'static> {
