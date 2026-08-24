@@ -1674,13 +1674,7 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
             Line::from(spans)
         }
     };
-    // Session info only; keybind hints live in the footer so long paths
-    // never collide with them.
-    let meta = Line::styled(
-        crate::tui::truncate_chars(&model.header, 72),
-        Style::default().fg(MUTED),
-    );
-    Paragraph::new(Text::from(vec![thinking, meta]))
+    Paragraph::new(Text::from(vec![thinking]))
         .style(Style::default().bg(BG_ELEMENT))
         .block(
             Block::default()
@@ -1760,10 +1754,14 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
                 format!("{key} "),
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             )));
-            lines.push(Line::styled(
-                crate::tui::truncate_chars(value, area.width.saturating_sub(4) as usize),
-                Style::default().fg(NOTICE_FG),
-            ));
+            // Values may carry newlines (Last turn metrics); ratatui strips them inside
+            // spans, so split before styling.
+            for value_line in value.split('\n') {
+                lines.push(Line::styled(
+                    crate::tui::truncate_chars(value_line, area.width.saturating_sub(4) as usize),
+                    Style::default().fg(NOTICE_FG),
+                ));
+            }
             lines.push(Line::from(""));
         }
     }

@@ -172,6 +172,7 @@ where
         &mut chat_ui,
         session.as_ref(),
         &active.model,
+        env!("CARGO_PKG_VERSION"),
         project,
         None,
         context_window,
@@ -394,6 +395,7 @@ where
                         &mut chat_ui,
                         session.as_ref(),
                         &active.model,
+                        env!("CARGO_PKG_VERSION"),
                         project,
                         None,
                         context_window,
@@ -720,6 +722,7 @@ where
                     &mut chat_ui,
                     session.as_ref(),
                     &active.model,
+                    env!("CARGO_PKG_VERSION"),
                     project,
                     None,
                     context_window,
@@ -1059,15 +1062,26 @@ where
                 context_window,
             );
             if chat_ui.is_fullscreen() {
-                // The usage report lives in the sidebar rail; the transcript stays readable.
+                // Structured per-metric lines read better in the narrow rail.
+                let mut lt = format!("Token : {}", usage.total_tokens);
+                lt.push_str(&format!("\n  in : {}", usage.prompt_tokens));
+                lt.push_str(&format!("\n  out : {}", usage.completion_tokens));
+                if let Some(t) = ttft {
+                    lt.push_str(&format!("\n  lat : {}", format_duration(t)));
+                }
+                lt.push_str(&format!(
+                    "\n  time : {}",
+                    format_duration(started.elapsed())
+                ));
                 update_sidebar(
                     &mut chat_ui,
                     session.as_ref(),
                     &active.model,
+                    env!("CARGO_PKG_VERSION"),
                     project,
                     Some(usage.prompt_tokens),
                     context_window,
-                    Some(usage_line),
+                    Some(lt),
                 );
             } else {
                 println!("{usage_line}");
@@ -1075,6 +1089,7 @@ where
                     &mut chat_ui,
                     session.as_ref(),
                     &active.model,
+                    env!("CARGO_PKG_VERSION"),
                     project,
                     Some(usage.prompt_tokens),
                     context_window,
@@ -2425,10 +2440,12 @@ fn refresh_session_source(database: &Database, hub: &InputHub) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_sidebar(
     chat_ui: &mut ChatUi,
     session: Option<&Session>,
     model: &str,
+    version: &str,
     project: &ProjectContext,
     last_input_tokens: Option<u64>,
     context_window: Option<u64>,
@@ -2447,6 +2464,7 @@ fn update_sidebar(
     if let Some(session) = session {
         entries.push(("Id".to_string(), short_id(&session.id).to_string()));
     }
+    entries.push(("Version".to_string(), format!("v{version}")));
     entries.push(("Model".to_string(), model.to_string()));
     entries.push(("Project".to_string(), display_path(project.root())));
     let context_line = match (last_input_tokens, context_window) {
@@ -2478,8 +2496,7 @@ fn update_sidebar(
         }
     }
     if let Some(last_turn) = last_turn {
-        // One metric per line reads better in the narrow rail than a pipe-separated row.
-        entries.push(("Last turn".to_string(), last_turn.replace(" | ", "\n")));
+        entries.push(("Last turn".to_string(), last_turn));
     }
     let _ = chat_ui.set_sidebar(entries);
 }
