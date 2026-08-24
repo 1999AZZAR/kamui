@@ -314,6 +314,30 @@ where
         }
         if expanded.is_none() && input.starts_with('/') {
             let (command, argument) = input.split_once(' ').unwrap_or((input, ""));
+            if command == "/help" && use_tui {
+                chat_ui.toggle_help()?;
+                continue;
+            }
+            if command == "/sessions" && use_tui {
+                let opened = hub
+                    .as_ref()
+                    .map(|h| h.open_sessions_dialog())
+                    .unwrap_or(false);
+                if !opened {
+                    chat_ui.notice("No saved sessions yet.")?;
+                }
+                continue;
+            }
+            if command == "/models" && use_tui {
+                let opened = hub
+                    .as_ref()
+                    .map(|h| h.open_models_dialog())
+                    .unwrap_or(false);
+                if !opened {
+                    chat_ui.notice("No provider profiles configured.")?;
+                }
+                continue;
+            }
             if command == "/commands" {
                 {
                     let mut buf = String::new();

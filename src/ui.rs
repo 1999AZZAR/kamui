@@ -567,6 +567,18 @@ impl ChatUi {
     }
 
     /// Show or hide warning messages in the transcript (`/warnings`).
+    /// Toggles the keybinding sheet overlay (`?` and `/help` in TUI mode).
+    pub fn toggle_help(&mut self) -> Result<()> {
+        match self.fullscreen.as_ref() {
+            Some(screen_arc) => {
+                let mut s = lock_screen(screen_arc);
+                s.model.help_visible = !s.model.help_visible;
+                s.draw()
+            }
+            None => Ok(()),
+        }
+    }
+
     /// Leaves the logo home screen (any command output means real UI begins).
     pub fn leave_intro(&mut self) -> Result<()> {
         match self.fullscreen.as_ref() {
@@ -736,6 +748,41 @@ impl InputHub {
             .models_src
             .write()
             .unwrap_or_else(PoisonError::into_inner) = items;
+    }
+
+    /// Opens the session switcher (Ctrl+S path shares this).
+    pub fn open_sessions_dialog(&self) -> bool {
+        let items = self
+            .sessions_src
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if items.is_empty() {
+            return false;
+        }
+        {
+            let mut s = lock_screen(&self.screen.0);
+            s.model.dialog = Some(DialogState::new("Resume Session", "/resume ", items));
+        }
+        let _ = self.screen.draw_now();
+        true
+    }
+
+    pub fn open_models_dialog(&self) -> bool {
+        let items = self
+            .models_src
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if items.is_empty() {
+            return false;
+        }
+        {
+            let mut s = lock_screen(&self.screen.0);
+            s.model.dialog = Some(DialogState::new("Select Model", "/model ", items));
+        }
+        let _ = self.screen.draw_now();
+        true
     }
 
     /// Sources for the Ctrl+S session switcher.
@@ -1888,37 +1935,129 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
 
 /// Char-greedy wrap of styled spans to `width` columns. Carries each source span's style into
 /// the produced rows; soft-wrap only (newlines already split upstream).
+/// Word-aware greedy wrap of styled spans to `width` columns. Breaks at spaces when a word
+/// fits on the next row; hard-splits only words longer than the whole width. Styles carry
+/// through every produced row.
 fn wrap_spans(spans: &[Span<'_>], width: usize) -> Vec<Vec<Span<'static>>> {
     let width = width.max(1);
-    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
-    let mut used = 0usize;
+    #[derive(Clone)]
+    enum Tok {
+        Word(String, Style),
+        Space(String, Style),
+        Break,
+    }
+    let mut toks: Vec<Tok> = Vec::new();
     for span in spans {
         let style = span.style;
-        let content = span.content.as_ref();
-        let mut chunk = String::new();
-        for ch in content.chars() {
-            // Hard breaks: embedded newlines end the current row.
+        let mut cur = String::new();
+        let mut cur_is_space = false;
+        for ch in span.content.chars() {
             if ch == '\n' {
-                rows.last_mut()
-                    .unwrap()
-                    .push(Span::styled(std::mem::take(&mut chunk), style));
-                rows.push(Vec::new());
-                used = 0;
+                if !cur.is_empty() {
+                    let done = std::mem::take(&mut cur);
+                    toks.push(if cur_is_space {
+                        Tok::Space(done, style)
+                    } else {
+                        Tok::Word(done, style)
+                    });
+                }
+                toks.push(Tok::Break);
+                cur_is_space = false;
                 continue;
+            } else {
+                let is_sp = ch == ' ';
+                if !cur.is_empty() && is_sp != cur_is_space {
+                    let done = std::mem::take(&mut cur);
+                    toks.push(if cur_is_space {
+                        Tok::Space(done, style)
+                    } else {
+                        Tok::Word(done, style)
+                    });
+                }
+                cur_is_space = is_sp;
             }
-            let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
-            if used + cw > width && used > 0 {
-                rows.last_mut()
-                    .unwrap()
-                    .push(Span::styled(std::mem::take(&mut chunk), style));
+            cur.push(ch);
+        }
+        if !cur.is_empty() {
+            toks.push(if cur_is_space {
+                Tok::Space(cur, style)
+            } else {
+                Tok::Word(cur, style)
+            });
+        }
+    }
+
+    fn tok_width(t: &str) -> usize {
+        t.chars()
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum()
+    }
+
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let push_row_text = |rows: &mut Vec<Vec<Span<'static>>>, text: String, style: Style| {
+        rows.last_mut().unwrap().push(Span::styled(text, style));
+    };
+
+    let mut used = 0usize;
+    for tok in &toks {
+        match tok {
+            Tok::Break => {
                 rows.push(Vec::new());
                 used = 0;
             }
-            chunk.push(ch);
-            used += cw;
-        }
-        if !chunk.is_empty() {
-            rows.last_mut().unwrap().push(Span::styled(chunk, style));
+            Tok::Space(text, style) => {
+                if used == 0 {
+                    continue; // no leading spaces after a wrap
+                }
+                let w = tok_width(text);
+                if used + w > width {
+                    continue; // spaces vanish at end of row
+                }
+                used += w;
+                push_row_text(&mut rows, text.clone(), *style);
+            }
+            Tok::Word(text, style) => {
+                let w = tok_width(text);
+                if w > width {
+                    // Hard-split oversized words by display width.
+                    let mut rest = text.as_str();
+                    loop {
+                        if used >= width {
+                            rows.push(Vec::new());
+                            used = 0;
+                        }
+                        let avail = width - used;
+                        let mut take_w = 0usize;
+                        let mut take_end = 0usize;
+                        for (i, ch) in rest.char_indices() {
+                            let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+                            if take_w + cw > avail {
+                                take_end = i;
+                                break;
+                            }
+                            take_w += cw;
+                            take_end = i + ch.len_utf8();
+                        }
+                        if take_end == 0 {
+                            take_end = rest.ceil_char_boundary(1.min(rest.len()));
+                        }
+                        let piece = &rest[..take_end];
+                        push_row_text(&mut rows, piece.to_string(), *style);
+                        used += take_w;
+                        rest = &rest[take_end..];
+                        if rest.is_empty() {
+                            break;
+                        }
+                    }
+                } else {
+                    if used + w > width && used > 0 {
+                        rows.push(Vec::new());
+                        used = 0;
+                    }
+                    used += w;
+                    push_row_text(&mut rows, text.clone(), *style);
+                }
+            }
         }
     }
     rows
