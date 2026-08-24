@@ -567,6 +567,18 @@ impl ChatUi {
     }
 
     /// Show or hide warning messages in the transcript (`/warnings`).
+    /// Leaves the logo home screen (any command output means real UI begins).
+    pub fn leave_intro(&mut self) -> Result<()> {
+        match self.fullscreen.as_ref() {
+            Some(screen_arc) => {
+                let mut s = lock_screen(screen_arc);
+                s.model.intro = false;
+                s.draw()
+            }
+            None => Ok(()),
+        }
+    }
+
     /// Status-bar badge: text plus context percent (amber at/above 80%).
     pub fn set_token_badge(&mut self, badge: Option<(String, u8)>) -> Result<()> {
         match self.fullscreen.as_ref() {
@@ -1707,8 +1719,10 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
     ]));
     // Startup notices still belong on the home screen — the logo must never hide them.
     for notice in &model.notices {
-        lines.push(Line::from(""));
-        lines.push(Line::styled(notice.clone(), Style::default().fg(MUTED)));
+        for row in notice.split('\n') {
+            lines.push(Line::from(""));
+            lines.push(Line::styled(row.to_string(), Style::default().fg(MUTED)));
+        }
     }
     if model.warnings_visible {
         for warning in &model.warnings {
@@ -1758,9 +1772,13 @@ fn transcript_text(model: &Model, width: u16) -> Text<'static> {
         lines.extend(card_lines(card, inner_width));
         lines.push(Line::from(""));
     }
-    // Status notes render as quiet plain lines, opencode-style.
+    // Status notes render as quiet plain lines, opencode-style. Split on newlines here:
+    // ratatui Span content silently drops embedded newlines, so they must become
+    // separate Lines before construction.
     for notice in &model.notices {
-        lines.push(Line::styled(notice.clone(), Style::default().fg(MUTED)));
+        for row in notice.split('\n') {
+            lines.push(Line::styled(row.to_string(), Style::default().fg(MUTED)));
+        }
     }
     if model.warnings_visible {
         for warning in &model.warnings {
@@ -1879,6 +1897,15 @@ fn wrap_spans(spans: &[Span<'_>], width: usize) -> Vec<Vec<Span<'static>>> {
         let content = span.content.as_ref();
         let mut chunk = String::new();
         for ch in content.chars() {
+            // Hard breaks: embedded newlines end the current row.
+            if ch == '\n' {
+                rows.last_mut()
+                    .unwrap()
+                    .push(Span::styled(std::mem::take(&mut chunk), style));
+                rows.push(Vec::new());
+                used = 0;
+                continue;
+            }
             let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
             if used + cw > width && used > 0 {
                 rows.last_mut()
@@ -1980,5 +2007,47 @@ mod tests {
         let text: String = last.spans.iter().map(|s| s.content.to_string()).collect();
         assert!(text.contains("13 more line(s)"));
         assert!(text.contains("/expand"));
+    }
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::*;
+
+    #[test]
+    fn wrap_spans_splits_on_newline() {
+        let spans = vec![Span::raw("aaa\nbbb\nccc")];
+        let rows = wrap_spans(&spans, 20);
+        assert_eq!(rows.len(), 3, "rows: {rows:?}");
+    }
+}
+
+#[cfg(test)]
+mod line_tests {
+    use super::*;
+
+    /// ratatui 0.30 strips embedded newlines from Span content at construction. This is WHY
+    /// multi-line notices are split into separate Lines in transcript_text.
+    #[test]
+    fn line_styled_strips_embedded_newlines() {
+        let line = Line::styled("a\nb\nc".to_string(), Style::default());
+        let txt: String = line.spans.iter().map(|sp| sp.content.as_ref()).collect();
+        assert_eq!(txt.matches('\n').count(), 0);
+    }
+
+    #[test]
+    fn multiline_notices_become_separate_lines() {
+        let model = Model {
+            notices: vec!["line one\nline two".to_string()],
+            ..Model::default()
+        };
+        let text = transcript_text(&model, 80);
+        let rendered: Vec<String> = text
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+            .collect();
+        assert!(rendered.contains(&"line one".to_string()));
+        assert!(rendered.contains(&"line two".to_string()));
     }
 }

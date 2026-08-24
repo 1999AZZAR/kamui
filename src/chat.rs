@@ -19,6 +19,7 @@ use chrono::{Local, TimeZone};
 use dialoguer::console::{Key, Term};
 use futures_util::future::join_all;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -308,15 +309,33 @@ where
         let title_source = input;
         let input: &str = expanded.unwrap_or(input);
 
+        if expanded.is_none() && input.starts_with('/') && use_tui {
+            chat_ui.leave_intro()?;
+        }
         if expanded.is_none() && input.starts_with('/') {
             let (command, argument) = input.split_once(' ').unwrap_or((input, ""));
             if command == "/commands" {
-                if chat_ui.is_fullscreen() {
-                    chat_ui.notice(
-                        "Custom commands are listed in .kamui/commands and global kamui/commands.",
-                    )?;
-                } else {
-                    print_commands(&command_library);
+                {
+                    let mut buf = String::new();
+                    if chat_ui.is_fullscreen() && command_library.is_empty() {
+                        chat_ui.notice(
+                            "Custom commands are listed in .kamui/commands and global kamui/commands.",
+                        )?;
+                        continue;
+                    }
+                    if chat_ui.is_fullscreen() {
+                        // Fullscreen: list through the sink so it lands in the transcript.
+                        let mut out_buf2 = String::new();
+                        print_commands(&command_library, &mut out_buf2);
+                        chat_ui.notice(out_buf2.trim_end())?;
+                    } else if !command_library.is_empty() {
+                        print_commands(&command_library, &mut buf);
+                        print!("{buf}");
+                    } else {
+                        let mut out_buf2 = String::new();
+                        print_commands(&command_library, &mut out_buf2);
+                        print!("{out_buf2}");
+                    }
                 }
                 continue;
             }
@@ -353,12 +372,16 @@ where
             if command == "/skills" {
                 // Non-interactive (piped) fallback: plain list.
                 if !Ui::stdio().interactive() {
-                    print_skills(&skill_library, &disabled_skills);
+                    let mut buf = String::new();
+                    print_skills(&skill_library, &disabled_skills, &mut buf);
+                    print!("{buf}");
                     continue;
                 }
                 let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
                 if !is_tty {
-                    print_skills(&skill_library, &disabled_skills);
+                    let mut buf = String::new();
+                    print_skills(&skill_library, &disabled_skills, &mut buf);
+                    print!("{buf}");
                     continue;
                 }
                 // Run popup on a blocking thread so the tokio runtime is not blocked.
@@ -516,6 +539,9 @@ where
             }
             let prev_session_id = session.as_ref().map(|s| s.id.clone());
             let messages_before = messages.len();
+            if use_tui {
+                chat_ui.leave_intro()?;
+            }
             let tui_sink = if use_tui { Some(&mut chat_ui) } else { None };
             if let Err(error) = handle_command(
                 input,
@@ -1635,24 +1661,21 @@ fn handle_command(
     always_allowed: &mut HashSet<String>,
     last_turn_snapshot: &mut Option<HashMap<PathBuf, Option<String>>>,
     prices: &Prices,
-    mut tui: Option<&mut ChatUi>,
+    tui: Option<&mut ChatUi>,
 ) -> Result<()> {
     let (command, argument) = input.split_once(' ').unwrap_or((input, ""));
     let argument = argument.trim();
-    // Command output must land inside the fullscreen transcript instead of printing raw to a
-    // terminal the ratatui frame owns; plain mode keeps direct stdout.
+    // Command output is buffered and flushed once at the end: fullscreen mode renders it as
+    // a single transcript notice, plain mode keeps direct stdout. Helpers append to the same
+    // buffer so nothing ever prints raw into a frame ratatui owns.
+    let mut out_buf = String::new();
     macro_rules! out {
-        ($($arg:tt)*) => {
-            if let Some(ui) = tui.as_deref_mut() {
-                ui.notice(&format!($($arg)*))?;
-            } else {
-                println!($($arg)*);
-            }
-        };
+        () => { out_buf.push('\n') };
+        ($($arg:tt)*) => { out_buf.push_str(&format!($($arg)*)) };
     }
 
     match command {
-        "/help" => print_help(),
+        "/help" => print_help(&mut out_buf),
         "/new" => {
             *session = None;
             messages.clear();
@@ -1683,7 +1706,7 @@ fn handle_command(
                         item.total_tokens
                     );
                 }
-                println!();
+                out!();
             }
         }
         "/resume" => {
@@ -1761,10 +1784,10 @@ fn handle_command(
             }
         }
         "/stats" => match session.as_ref() {
-            Some(session) => print_stats(database, session, context_window, prices)?,
+            Some(session) => print_stats(database, session, context_window, prices, &mut out_buf)?,
             None => out!("This chat has no saved messages yet.\n"),
         },
-        "/usage" => print_usage_report(database, prices)?,
+        "/usage" => print_usage_report(database, prices, &mut out_buf)?,
         "/memory" => {
             let entries = database.list_memory()?;
             if entries.is_empty() {
@@ -1796,6 +1819,23 @@ fn handle_command(
         _ => out!("Unknown command. Type /help for available commands.\n"),
     }
 
+    if !out_buf.is_empty() {
+        std::fs::write(
+            "/tmp/opencode/flush_debug.txt",
+            format!(
+                "len={} nl={} tui={}",
+                out_buf.len(),
+                out_buf.matches('\n').count(),
+                tui.is_some()
+            ),
+        )
+        .ok();
+        match tui {
+            Some(ui) => ui.notice(out_buf.trim_end())?,
+            None => print!("{out_buf}"),
+        }
+    }
+
     Ok(())
 }
 
@@ -1813,19 +1853,20 @@ fn print_stats(
     session: &Session,
     context_window: Option<u64>,
     prices: &Prices,
+    out: &mut String,
 ) -> Result<()> {
     let stats = database.session_stats(&session.id)?;
-    println!("\nSession:       {}", session.title);
-    println!("Requests:      {}", stats.request_count);
-    println!("Input tokens:  {}", stats.input_tokens);
-    println!("Output tokens: {}", stats.output_tokens);
-    println!("Total tokens:  {}", stats.total_tokens);
+    let _ = writeln!(out, "\nSession:       {}", session.title);
+    let _ = writeln!(out, "Requests:      {}", stats.request_count);
+    let _ = writeln!(out, "Input tokens:  {}", stats.input_tokens);
+    let _ = writeln!(out, "Output tokens: {}", stats.output_tokens);
+    let _ = writeln!(out, "Total tokens:  {}", stats.total_tokens);
     // Cost is opt-in end to end: with no `[pricing]` configured there is no line, no zero, and not
     // even an extra query — the report stays exactly what it has always been.
     let mut unpriced = false;
     if let Some((cost, has_unpriced)) = session_cost(database, &session.id, prices)? {
         unpriced |= has_unpriced;
-        println!("Cost:          {cost}");
+        let _ = writeln!(out, "Cost:          {cost}");
     }
     if stats.cached_tokens > 0 {
         let percent = if stats.input_tokens > 0 {
@@ -1833,7 +1874,11 @@ fn print_stats(
         } else {
             0.0
         };
-        println!("Cached tokens: {} ({percent:.0}%)", stats.cached_tokens);
+        let _ = writeln!(
+            out,
+            "Cached tokens: {} ({percent:.0}%)",
+            stats.cached_tokens
+        );
     }
     if let (Some(last_input), Some(window)) = (stats.last_input_tokens, context_window) {
         let percent = last_input as f64 / window as f64 * 100.0;
@@ -1842,11 +1887,11 @@ fn print_stats(
             let cached_percent = (cached as f64 / last_input as f64 * 100.0).min(100.0);
             print!(" | Cached: {cached} ({cached_percent:.0}%)");
         }
-        println!();
+        let _ = writeln!(out,);
     }
     let by_model = database.model_stats(&session.id)?;
     if by_model.len() > 1 {
-        println!("\n--- Per model ---");
+        let _ = writeln!(out, "\n--- Per model ---");
         for m in &by_model {
             // Priced from this row's own (chat-only) tokens, so each line is honest about exactly
             // the numbers standing beside it.
@@ -1857,16 +1902,17 @@ fn print_stats(
             if let Some((_, has_unpriced)) = &cell {
                 unpriced |= has_unpriced;
             }
-            println!(
+            let _ = writeln!(
+                out,
                 "{}",
                 model_row(m, cell.as_ref().map(|(cost, _)| cost.as_str()))
             );
         }
     }
     if unpriced {
-        println!("\n{UNPRICED_NOTE}");
+        let _ = writeln!(out, "\n{UNPRICED_NOTE}");
     }
-    println!();
+    let _ = writeln!(out,);
     Ok(())
 }
 
@@ -2054,11 +2100,18 @@ fn shutdown(
     // Nothing should outlive the process: a still-running background job has no way to be
     // checked on or stopped once Kamui exits.
     tools::kill_all_jobs(jobs);
+    let mut buf = String::new();
     if let Some(session) = session {
-        print_stats(database, session, context_window, prices)?;
-        println!("To resume this session: kamui -r {}", short_id(&session.id));
+        print_stats(database, session, context_window, prices, &mut buf)?;
+        buf.push_str(&format!(
+            "To resume this session: kamui -r {}\n",
+            short_id(&session.id)
+        ));
     }
-    println!("Goodbye");
+    buf.push_str("Goodbye\n");
+    // In fullscreen this is the final frame teardown companion; printing raw after leaving
+    // the alt screen is correct here because shutdown drops the TUI before returning.
+    print!("{buf}");
     Ok(())
 }
 
@@ -3090,29 +3143,59 @@ fn format_timestamp(timestamp: i64) -> String {
         .unwrap_or_else(|| "unknown time".to_string())
 }
 
-fn print_help() {
-    println!("!<command>        Run a shell command directly (no model involvement)");
-    println!("/plan             Enter Plan Mode (gate mutating tools until plan approved)");
-    println!("/skills           List discovered skills");
-    println!("/warnings         Hide or show warning messages");
-    println!("/new              Start a new session");
-    println!("/sessions         List saved sessions");
-    println!("/resume <id>      Resume a session");
-    println!("/model [name]     List provider profiles, or switch to one");
-    println!("/rename <id> <t>  Rename a session");
-    println!("/search <text>    Search saved messages");
-    println!("/compact          Summarize older messages to free up context");
-    println!("/undo             Revert the files patched by the last turn");
-    println!("/jobs             List session and persistent scheduled jobs");
-    println!("/index            Rebuild the semantic-search index (needs embedding_model)");
-    println!("/commands         List your own prompt commands");
-    println!("/delete <id>      Delete a session");
-    println!("/stats            Show current session usage");
-    println!("/usage            Show token usage by day and month, across all sessions");
-    println!("/status           Show project and connection status");
-    println!("/memory           List facts Kamui remembers across sessions and projects");
-    println!("/forget <text>    Forget one remembered fact, or /forget all");
-    println!("/exit             Save and quit\n");
+pub(crate) fn print_help(out: &mut String) {
+    let _ = writeln!(
+        out,
+        "!<command>        Run a shell command directly (no model involvement)"
+    );
+    let _ = writeln!(
+        out,
+        "/plan             Enter Plan Mode (gate mutating tools until plan approved)"
+    );
+    let _ = writeln!(out, "/skills           List discovered skills");
+    let _ = writeln!(out, "/warnings         Hide or show warning messages");
+    let _ = writeln!(out, "/new              Start a new session");
+    let _ = writeln!(out, "/sessions         List saved sessions");
+    let _ = writeln!(out, "/resume <id>      Resume a session");
+    let _ = writeln!(
+        out,
+        "/model [name]     List provider profiles, or switch to one"
+    );
+    let _ = writeln!(out, "/rename <id> <t>  Rename a session");
+    let _ = writeln!(out, "/search <text>    Search saved messages");
+    let _ = writeln!(
+        out,
+        "/compact          Summarize older messages to free up context"
+    );
+    let _ = writeln!(
+        out,
+        "/undo             Revert the files patched by the last turn"
+    );
+    let _ = writeln!(
+        out,
+        "/jobs             List session and persistent scheduled jobs"
+    );
+    let _ = writeln!(
+        out,
+        "/index            Rebuild the semantic-search index (needs embedding_model)"
+    );
+    let _ = writeln!(out, "/commands         List your own prompt commands");
+    let _ = writeln!(out, "/delete <id>      Delete a session");
+    let _ = writeln!(out, "/stats            Show current session usage");
+    let _ = writeln!(
+        out,
+        "/usage            Show token usage by day and month, across all sessions"
+    );
+    let _ = writeln!(out, "/status           Show project and connection status");
+    let _ = writeln!(
+        out,
+        "/memory           List facts Kamui remembers across sessions and projects"
+    );
+    let _ = writeln!(
+        out,
+        "/forget <text>    Forget one remembered fact, or /forget all"
+    );
+    let _ = writeln!(out, "/exit             Save and quit\n");
 }
 
 /// How much history `/usage` reports before summarizing everything into the lifetime total.
@@ -3121,10 +3204,10 @@ const USAGE_REPORT_MONTHS: usize = 6;
 
 /// Token usage across every session, by day and by month. Unlike `/stats`, which is scoped to the
 /// active session, this answers "how much have I spent lately" over the whole database.
-fn print_usage_report(database: &Database, prices: &Prices) -> Result<()> {
+fn print_usage_report(database: &Database, prices: &Prices, out: &mut String) -> Result<()> {
     let daily = database.usage_by_day(USAGE_REPORT_DAYS)?;
     if daily.is_empty() {
-        println!("No usage recorded yet.\n");
+        let _ = writeln!(out, "No usage recorded yet.\n");
         return Ok(());
     }
 
@@ -3143,27 +3226,47 @@ fn print_usage_report(database: &Database, prices: &Prices) -> Result<()> {
     };
 
     let mut unpriced = false;
-    let mut row = |period: &storage::UsagePeriod, tokens: &[storage::ModelTokens]| {
+    #[allow(clippy::too_many_arguments)]
+    fn row(
+        out: &mut String,
+        unpriced: &mut bool,
+        prices: &Prices,
+        period: &storage::UsagePeriod,
+        tokens: &[storage::ModelTokens],
+    ) {
         let cell = cost_cell(prices, model_token_rows(tokens));
         if let Some((_, has_unpriced)) = &cell {
-            unpriced |= has_unpriced;
+            *unpriced |= has_unpriced;
         }
-        println!(
+        let _ = writeln!(
+            out,
             "{}",
             usage_row(period, cell.as_ref().map(|(cost, _)| cost.as_str()))
         );
-    };
+    }
 
-    println!("\nLast {USAGE_REPORT_DAYS} days");
+    let _ = writeln!(out, "\nLast {USAGE_REPORT_DAYS} days");
     for period in &daily {
-        row(period, tokens_for(&daily_models, &period.period));
+        row(
+            out,
+            &mut unpriced,
+            prices,
+            period,
+            tokens_for(&daily_models, &period.period),
+        );
     }
 
     let monthly = database.usage_by_month(USAGE_REPORT_MONTHS)?;
     if monthly.len() > 1 {
-        println!("\nBy month");
+        let _ = writeln!(out, "\nBy month");
         for period in &monthly {
-            row(period, tokens_for(&monthly_models, &period.period));
+            row(
+                out,
+                &mut unpriced,
+                prices,
+                period,
+                tokens_for(&monthly_models, &period.period),
+            );
         }
     }
 
@@ -3173,37 +3276,51 @@ fn print_usage_report(database: &Database, prices: &Prices) -> Result<()> {
     } else {
         Vec::new()
     };
-    println!("\nAll time");
-    row(&total, &total_models);
-    println!("\nRequests count chat turns only; tokens include title generation.");
+    let _ = writeln!(out, "\nAll time");
+    row(out, &mut unpriced, prices, &total, &total_models);
+    let _ = writeln!(
+        out,
+        "\nRequests count chat turns only; tokens include title generation."
+    );
     if unpriced {
-        println!("{UNPRICED_NOTE}");
+        let _ = writeln!(out, "{UNPRICED_NOTE}");
     }
-    println!();
+    let _ = writeln!(out,);
     Ok(())
 }
 
 fn print_skills(
     library: &crate::skills::SkillLibrary,
     disabled: &std::collections::HashSet<String>,
+    out: &mut String,
 ) {
     if library.list().is_empty() {
-        println!("No skills discovered.");
-        println!("Create a skill as a folder with SKILL.md:");
-        println!("  <project>/.kamui/skills/my-skill/SKILL.md  ->  /my-skill  (project)");
-        println!("  <config dir>/kamui/skills/my-skill/SKILL.md ->  /my-skill  (global)");
-        println!(
+        let _ = writeln!(out, "No skills discovered.");
+        let _ = writeln!(out, "Create a skill as a folder with SKILL.md:");
+        let _ = writeln!(
+            out,
+            "  <project>/.kamui/skills/my-skill/SKILL.md  ->  /my-skill  (project)"
+        );
+        let _ = writeln!(
+            out,
+            "  <config dir>/kamui/skills/my-skill/SKILL.md ->  /my-skill  (global)"
+        );
+        let _ = writeln!(
+            out,
             "Compat: .agents/skills is also scanned. Use /skill:<name> if a skill collides with a built-in or command.\n"
         );
         for warning in library.warnings() {
-            println!("  warning: {warning}");
+            let _ = writeln!(out, "  warning: {warning}");
         }
         if !library.warnings().is_empty() {
-            println!();
+            let _ = writeln!(out,);
         }
         return;
     }
-    println!("Skills (eager: name+description in prompt, body on /<skill> or /skill:<name>):");
+    let _ = writeln!(
+        out,
+        "Skills (eager: name+description in prompt, body on /<skill> or /skill:<name>):"
+    );
     let term_w = Term::stdout().size().1 as usize;
     let max_desc = term_w.saturating_sub(40).clamp(20, 60);
     for skill in library.list() {
@@ -3217,7 +3334,8 @@ fn print_skills(
             .as_deref()
             .map(|tools| format!(" [tools: {tools}]"))
             .unwrap_or_default();
-        println!(
+        let _ = writeln!(
+            out,
             "  {state} /{:<18} {:<18} {}{tools_hint}",
             skill.name,
             skill.source.badge(),
@@ -3225,12 +3343,15 @@ fn print_skills(
         );
     }
     if !library.warnings().is_empty() {
-        println!("\nWarnings (invalid skills skipped):");
+        let _ = writeln!(out, "\nWarnings (invalid skills skipped):");
         for warning in library.warnings() {
-            println!("  - {warning}");
+            let _ = writeln!(out, "  - {warning}");
         }
     }
-    println!("\nInvoke with /<skill-name> or /skill:<name> (namespaced, wins over collisions).\n");
+    let _ = writeln!(
+        out,
+        "\nInvoke with /<skill-name> or /skill:<name> (namespaced, wins over collisions).\n"
+    );
 }
 
 /// Interactive popup for `/skills`: grouped by location, arrow keys navigate, Enter toggles
@@ -3260,7 +3381,9 @@ fn run_skills_popup(
     disabled: &mut std::collections::HashSet<String>,
 ) -> anyhow::Result<bool> {
     if library.list().is_empty() {
-        print_skills(library, disabled);
+        let mut buf = String::new();
+        print_skills(library, disabled, &mut buf);
+        print!("{buf}");
         return Ok(false);
     }
 
@@ -3277,7 +3400,9 @@ fn run_skills_popup(
 
     // Fall back to a plain list when not a TTY or NO_COLOR is set (no ANSI).
     if !Ui::stdio().interactive() || std::env::var_os("NO_COLOR").is_some() {
-        print_skills(library, disabled);
+        let mut buf = String::new();
+        print_skills(library, disabled, &mut buf);
+        print!("{buf}");
         return Ok(false);
     }
 
@@ -3406,24 +3531,34 @@ fn run_skills_popup(
 }
 
 /// List the user's own prompt commands, or explain where to put one when there are none yet.
-fn print_commands(library: &commands::CommandLibrary) {
+fn print_commands(library: &commands::CommandLibrary, out: &mut String) {
     if library.is_empty() {
-        println!("No custom commands yet.");
-        println!("Add a markdown file to create one:");
-        println!("  <project>/.kamui/commands/review.md  ->  /review   (this project only)");
-        println!("  <config dir>/kamui/commands/review.md ->  /review   (every project)\n");
+        let _ = writeln!(out, "No custom commands yet.");
+        let _ = writeln!(out, "Add a markdown file to create one:");
+        let _ = writeln!(
+            out,
+            "  <project>/.kamui/commands/review.md  ->  /review   (this project only)"
+        );
+        let _ = writeln!(
+            out,
+            "  <config dir>/kamui/commands/review.md ->  /review   (every project)\n"
+        );
         return;
     }
-    println!("Your commands:");
+    let _ = writeln!(out, "Your commands:");
     for command in library.list() {
         let description = command.description.as_deref().unwrap_or("");
-        println!(
+        let _ = writeln!(
+            out,
             "  /{:<18} {:<9} {description}",
             command.name,
             command.source.label()
         );
     }
-    println!("\nInvoke one with /<name>; anything after it is appended to the prompt.\n");
+    let _ = writeln!(
+        out,
+        "\nInvoke one with /<name>; anything after it is appended to the prompt.\n"
+    );
 }
 
 struct GitStatus {
