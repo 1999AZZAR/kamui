@@ -113,6 +113,30 @@ impl ToolRegistry {
         }
     }
 
+    /// Plan Mode gate (ticket #9): read-only tools plus `update_plan` only.
+    /// Used while a plan is pending approval — mutating tools are held.
+    pub fn plan_mode(project_root: PathBuf) -> Self {
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ReadFileTool {
+                root: project_root.clone(),
+            }),
+            Box::new(ListDirectoryTool {
+                root: project_root.clone(),
+            }),
+            Box::new(GrepTool {
+                root: project_root.clone(),
+            }),
+            Box::new(GlobTool {
+                root: project_root.clone(),
+            }),
+            Box::new(UpdatePlanTool),
+        ];
+        Self {
+            tools,
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
     /// The shared background-job registry, so callers that aren't going through the tool-call
     /// protocol (the chat loop's `/jobs` command, killing jobs on shutdown) can reach it directly.
     pub fn jobs(&self) -> JobRegistry {
@@ -792,6 +816,11 @@ fn parse_plan(arguments: &str) -> Result<Vec<PlanStep>> {
     Ok(arguments.plan)
 }
 
+/// Number of steps in an `update_plan` call, or `None` if it doesn't parse.
+pub fn plan_step_count(arguments: &str) -> Option<usize> {
+    parse_plan(arguments).ok().map(|plan| plan.len())
+}
+
 /// Render an `update_plan` call's raw arguments as a checklist for the chat trace, matching the
 /// existing 4-space-indent trace convention. Returns `None` if the arguments don't parse, so the
 /// caller can fall back to the generic `  → name(args)` trace line.
@@ -1099,7 +1128,7 @@ const CMD_BUILTINS: &[&str] = &[
 const SH_BUILTINS: &[&str] = &[
     ".", ":", "alias", "bg", "break", "cd", "command", "continue", "eval", "exec", "exit",
     "export", "fg", "getopts", "hash", "jobs", "local", "read", "readonly", "return", "set",
-    "shift", "source", "times", "trap", "type", "ulimit", "umask", "unalias", "unset", "wait",
+    "shift", "source", "times", "trap", "ulimit", "umask", "unalias", "unset", "wait",
 ];
 
 /// Decide whether to route a command through `rtk`. Only simple commands are routed: with shell

@@ -11,9 +11,14 @@ mod onboarding;
 mod pricing;
 mod prompt;
 mod provider;
+mod render;
+mod settings;
+mod skills;
 mod storage;
 mod terminal;
 mod tools;
+mod tui;
+mod ui;
 
 use anyhow::{Context, Result};
 use config::Config;
@@ -645,7 +650,7 @@ mod tests {
         assert!(matches!(
             command,
             Command::Benchmark { suite, profile: Some(profile), runs: 3 }
-                if suite == std::path::Path::new("suite.json") && profile == "fast"
+                if *suite == *"suite.json" && profile == "fast"
         ));
     }
 

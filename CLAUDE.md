@@ -39,6 +39,9 @@ effort or operational risk is disproportionate to their immediate value.
 - Streaming deltas are printed immediately. Usage and finish reason are shown after completion. On
   a real interactive TTY, a braille spinner runs until the first token and tool outcomes report
   status, duration, and output size. Pipes and `-p` remain plain and free of cursor-control output.
+  The fullscreen Ratatui transcript animates the same braille spinner in its footer (a background
+  ticker task redraws through the shared terminal mutex) so the wait never looks frozen there
+  either; the plain-mode inline spinner is suppressed in fullscreen to avoid double indicators.
 - `Ctrl+C` while a turn is in flight (waiting for the model, streaming, at an approval prompt, or
   running a command) interrupts that turn and returns to the prompt; the partial turn is discarded
   and not saved, and an interrupted command is killed via `kill_on_drop`. `Ctrl+C` at the idle
