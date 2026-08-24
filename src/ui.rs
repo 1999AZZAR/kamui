@@ -23,23 +23,23 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Welcome logo, opencode-style: block-letter art split into a muted left half and a bright,
-/// bold right half so the brand pops without shouting. Rendered centered while the transcript
-/// is still empty; the chat view takes over on the first message.
+/// bold right half (KAM | UI) so the brand pops without shouting. Rendered centered while the
+/// transcript has no messages yet; the chat view takes over on the first message.
 const LOGO_LEFT: [&str; 6] = [
-    " █████╗ ",
-    "██╔══██╗",
-    "███████║",
-    "██╔══██║",
-    "██║  ██║",
-    "╚═╝  ╚═╝",
+    "██╗  ██╗  █████╗  ███╗   ███╗",
+    "██║ ██╔╝ ██╔══██╗ ████╗ ████║",
+    "█████╔╝  ███████║ ██╔████╔██║",
+    "██╔═██╗  ██╔══██║ ██║╚██╔╝██║",
+    "██║  ██╗ ██║  ██║ ██║ ╚═╝ ██║",
+    "╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝     ╚═╝",
 ];
 const LOGO_RIGHT: [&str; 6] = [
-    "███╗   ███╗██╗   ██╗██╗   ██╗██╗",
-    "████╗ ████║██║   ██║██║   ██║██║",
-    "██╔████╔██║██║   ██║██║   ██║██║",
-    "██║╚██╔╝██║╚██╗ ██╔╝██║   ██║██║",
-    "██║ ╚═╝ ██║ ╚████╔╝ ╚██████╔╝██║",
-    "╚═╝     ╚═╝  ╚═══╝   ╚═════╝ ╚═╝",
+    "██╗   ██╗██╗",
+    "██║   ██║██║",
+    "██║   ██║██║",
+    "██║   ██║██║",
+    "╚██████╔╝██║",
+    " ╚═════╝ ╚═╝",
 ];
 
 fn lock_screen(screen: &Mutex<FullScreen>) -> MutexGuard<'_, FullScreen> {
@@ -150,11 +150,17 @@ impl FullScreen {
         body: impl Into<String>,
     ) -> Result<()> {
         self.model.intro = false;
+        let title = title.into();
+        let body = body.into();
+        // Long tool output starts collapsed so a 20k-char dump never floods the transcript;
+        // `/expand` opens it. Assistant answers and errors always show.
+        let collapsed =
+            kind == CardKind::Output && title != "Assistant" && body.lines().count() > 5;
         self.model.cards.push(Card {
             kind,
-            title: title.into(),
-            body: body.into(),
-            collapsed: false,
+            title,
+            body,
+            collapsed,
         });
         self.trim_history();
         self.draw()
@@ -535,6 +541,15 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
             Style::default().add_modifier(Modifier::DIM),
         ),
     ]));
+    // Startup notices (warnings, hints) still belong on the home screen — the logo must never
+    // hide them.
+    for notice in &model.notices {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            format!("\u{2500}\u{2500}\u{2500} {notice} "),
+            Style::default().fg(NOTICE_FG),
+        ));
+    }
     Paragraph::new(Text::from(lines))
 }
 
@@ -656,9 +671,23 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
         "\u{2500}".repeat(width.saturating_sub(UnicodeWidthStr::width(title.as_str())))
     );
     out.push(filled_line(top, width, title_style));
+    let total_lines = card.body.lines().count();
     if card.collapsed {
+        // Head preview plus the tail count, so a collapsed card still says what's inside.
+        for line in wrap_display(
+            card.body.lines().next().unwrap_or(""),
+            width.saturating_sub(4),
+        )
+        .into_iter()
+        .take(1)
+        {
+            out.push(filled_line(format!("  {line}"), width, style));
+        }
         out.push(filled_line(
-            "  \u{2026} (collapsed; press Enter to expand)".to_string(),
+            format!(
+                "  \u{2026} {} more line(s) — /expand to show",
+                total_lines.saturating_sub(1)
+            ),
             width,
             style,
         ));
