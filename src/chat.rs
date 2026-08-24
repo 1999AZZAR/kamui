@@ -6,16 +6,18 @@ use crate::markdown;
 use crate::mcp::ConnectionStatus;
 use crate::prompt;
 use crate::provider::{ChatRequest, Message, Provider, StreamEvent, ToolCall, Usage};
+use crate::render;
 use crate::storage;
 use crate::storage::{Database, Session};
-use crate::terminal::Ui;
+use crate::terminal::{Style, Ui};
 use crate::tools;
 use crate::tools::ToolRegistry;
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
+use dialoguer::console::{Key, Term};
 use futures_util::future::join_all;
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -59,6 +61,11 @@ where
     let mut context_window = active.context_window;
     let job_registry = tools.jobs();
     let command_library = commands::CommandLibrary::load(project.root());
+    let skill_library = crate::skills::SkillLibrary::load(project.root());
+    for warning in skill_library.warnings() {
+        eprintln!("warning: {warning}");
+    }
+    let ui = Ui::stdio();
 
     print_status(
         project,
@@ -82,8 +89,12 @@ where
         );
     }
     if auto_approve {
-        println!(
-            "\u{26a0} --auto-approve is active: commands and file edits will run without asking."
+        print!(
+            "{}",
+            render::render_warning(
+                "--auto-approve is active: commands and file edits will run without asking",
+                ui
+            )
         );
     }
     println!("Type /help for commands or exit to quit.\n");
@@ -99,17 +110,49 @@ where
                 );
             }
             let messages = database.load_messages(&session.id)?;
-            println!("Resuming: {} ({})\n", session.title, short_id(&session.id));
+            print!(
+                "{}",
+                render::render_system(
+                    &format!("Resuming: {} ({})", session.title, short_id(&session.id)),
+                    ui
+                )
+            );
+            println!();
             print_history_preview(&messages);
             (Some(session), messages)
         }
         None => {
-            println!("New chat\n");
+            print!("{}", render::render_system("New chat", ui));
+            println!();
             (None, Vec::new())
         }
     };
-    let mut input_rx = input_channel();
-    let ui = Ui::stdio();
+    // Restore pending plan on resume/startup.
+    let mut plan_mode: Option<PlanModeState> = session
+        .as_ref()
+        .and_then(|s| database.get_plan(&s.id).ok().flatten())
+        .and_then(|(json, status)| {
+            let status = match status.as_str() {
+                "pending" => PlanStatus::Pending,
+                "approved" => PlanStatus::Approved,
+                _ => return None,
+            };
+            Some(PlanModeState {
+                status,
+                plan_json: Some(json),
+            })
+        });
+    if let Some(state) = plan_mode.as_ref()
+        && state.status == PlanStatus::Pending
+        && let Some(json) = state.plan_json.as_deref()
+        && let Some(rendered) = tools::render_plan(json)
+    {
+        println!("(Plan Mode — pending plan)\n{rendered}\n");
+    }
+    let use_tui = crate::tui::is_interactive();
+    let mut input_rx = if use_tui { None } else { Some(input_channel()) };
+    let mut tui_history: Vec<String> = Vec::new();
+    let mut disabled_skills = crate::settings::load_disabled_skills(project.root());
 
     // Rolling context compaction: `summary` folds in messages before `summarized_upto`; the rest of
     // `messages` is sent verbatim. Both reset whenever a command replaces the loaded history.
@@ -122,26 +165,59 @@ where
     // Kumo's "Always allow" approval button). Session-scoped: cleared whenever a chat effectively
     // restarts (`/new`, or `/delete` of the active session), same as `last_turn_snapshot`.
     let mut always_allowed: HashSet<String> = HashSet::new();
+    // `/plan` forces the next turn into Plan Mode even for a small task.
+    let mut plan_requested = false;
+    let mut expand_tools = database
+        .get_setting("expand_tools")?
+        .is_some_and(|v| v == "true");
 
     'chat: loop {
-        print!("> ");
-        io::stdout().flush()?;
-
-        let input = tokio::select! {
-            input = input_rx.recv() => match input {
-                Some(input) => input,
+        let input = if use_tui {
+            // Snapshot completer data for this prompt (commands/skills + disabled set).
+            let cmds: Vec<crate::commands::CustomCommand> = command_library.list().to_vec();
+            let sks: Vec<crate::skills::Skill> = skill_library.list().to_vec();
+            let dis = disabled_skills.clone();
+            let hist = tui_history.clone();
+            let line = tokio::task::spawn_blocking(move || {
+                crate::tui::read_line_blocking(&cmds, &sks, &dis, &hist)
+            })
+            .await
+            .unwrap_or(None);
+            match line {
+                Some(s) => s,
                 None => {
                     shutdown(database, session.as_ref(), context_window, &job_registry)?;
                     break;
                 }
-            },
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("failed to listen for Ctrl+C")?;
-                println!();
-                shutdown(database, session.as_ref(), context_window, &job_registry)?;
-                break;
             }
+        } else {
+            print!("{}", ui.style("> ", &[Style::Cyan, Style::Bold]));
+            io::stdout().flush()?;
+            let rx = input_rx.as_mut().expect("plain mode has input channel");
+            let line = tokio::select! {
+                input = rx.recv() => match input {
+                    Some(input) => input,
+                    None => {
+                        shutdown(database, session.as_ref(), context_window, &job_registry)?;
+                        break;
+                    }
+                },
+                signal = tokio::signal::ctrl_c() => {
+                    signal.context("failed to listen for Ctrl+C")?;
+                    println!();
+                    shutdown(database, session.as_ref(), context_window, &job_registry)?;
+                    break;
+                }
+            };
+            line
         };
+        // Keep TUI history in sync when in TUI mode (plain mode history is via input channel).
+        if use_tui && !input.trim().is_empty() {
+            tui_history.push(input.clone());
+            if tui_history.len() > 1000 {
+                tui_history.remove(0);
+            }
+        }
         let input = input.trim();
 
         if input.eq_ignore_ascii_case("exit") || input == "/exit" {
@@ -151,18 +227,60 @@ where
         if input.is_empty() {
             continue;
         }
+        // Boxed prompt echo only in plain mode — the TUI already echoes input with a background.
+        if !use_tui {
+            print!("{}", render::render_user_prompt(input, ui));
+        }
 
-        // A custom command (`/review`, `/test`, ...) expands into this turn's prompt and then
-        // takes the ordinary path below; built-in commands are handled in the block after it. The
-        // original line is kept for titling, since an expanded body can be hundreds of lines.
+        // A custom command (`/review`, ...) or skill (`/my-skill`, `/skill:my-skill`) expands
+        // into this turn's prompt and then takes the ordinary path below. Built-in commands and
+        // custom commands win over a same-named skill on bare `/<name>`; use `/skill:<name>` to
+        // force the skill. The original line is kept for titling.
         let expanded_command = command_library.expand(input);
+        let expanded_skill = if expanded_command.is_none() {
+            skill_library.expand_filtered(input, &disabled_skills)
+        } else {
+            None
+        };
+        let expanded = expanded_command.as_deref().or(expanded_skill.as_deref());
         let title_source = input;
-        let input: &str = expanded_command.as_deref().unwrap_or(input);
+        let input: &str = expanded.unwrap_or(input);
 
-        if expanded_command.is_none() && input.starts_with('/') {
+        if expanded.is_none() && input.starts_with('/') {
             let (command, argument) = input.split_once(' ').unwrap_or((input, ""));
             if command == "/commands" {
                 print_commands(&command_library);
+                continue;
+            }
+            if command == "/skills" {
+                // Non-interactive (piped) fallback: plain list.
+                if !Ui::stdio().interactive() {
+                    print_skills(&skill_library, &disabled_skills);
+                    continue;
+                }
+                let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+                if !is_tty {
+                    print_skills(&skill_library, &disabled_skills);
+                    continue;
+                }
+                // Run popup on a blocking thread so the tokio runtime is not blocked.
+                // Clone the library's data for 'static; the popup needs no live borrow.
+                let skills_snapshot = skill_library.list().to_vec();
+                let warnings_snapshot = skill_library.warnings().to_vec();
+                let root = project.root().to_path_buf();
+                let root2 = root.clone();
+                let mut ds = disabled_skills.clone();
+                let changed = tokio::task::spawn_blocking(move || {
+                    let lib =
+                        crate::skills::SkillLibrary::from_parts(skills_snapshot, warnings_snapshot);
+                    run_skills_popup(&lib, &root, &mut ds)
+                })
+                .await
+                .unwrap_or(Ok(false))
+                .unwrap_or(false);
+                if changed {
+                    disabled_skills = crate::settings::load_disabled_skills(&root2);
+                }
                 continue;
             }
             if command == "/model" {
@@ -175,7 +293,10 @@ where
                     database,
                     &build_provider,
                 ) {
-                    eprintln!("Command failed: {error:#}\n");
+                    eprintln!(
+                        "{}",
+                        ui.style(&format!("Command failed: {error:#}\n"), &[Style::Red])
+                    );
                 }
                 continue;
             }
@@ -207,8 +328,32 @@ where
                         println!("Compacted {count} earlier messages into the summary.\n");
                     }
                     Ok(None) => println!("Not enough history to compact yet.\n"),
-                    Err(error) => eprintln!("Compaction failed: {error:#}\n"),
+                    Err(error) => eprintln!(
+                        "{}",
+                        ui.style(&format!("Compaction failed: {error:#}\n"), &[Style::Red])
+                    ),
                 }
+                continue;
+            }
+            if command == "/plan" {
+                plan_requested = true;
+                println!("Plan Mode requested — next turn will require a plan.\n");
+                continue;
+            }
+            if command == "/expand" {
+                expand_tools = !expand_tools;
+                let _ = database
+                    .set_setting("expand_tools", if expand_tools { "true" } else { "false" });
+                if expand_tools {
+                    println!(
+                        "Tool output: Expanded (showing full output · Ctrl+O or /expand to collapse).\n"
+                    );
+                } else {
+                    println!(
+                        "Tool output: Collapsed (showing compact preview · Ctrl+O or /expand to expand).\n"
+                    );
+                }
+                print_tool_history(&messages, expand_tools, ui);
                 continue;
             }
             if command == "/undo" {
@@ -240,10 +385,14 @@ where
                 };
                 match outcome {
                     Ok(summary) => println!("{summary}\n"),
-                    Err(error) => eprintln!("Index failed: {error:#}\n"),
+                    Err(error) => eprintln!(
+                        "{}",
+                        ui.style(&format!("Index failed: {error:#}\n"), &[Style::Red])
+                    ),
                 }
                 continue;
             }
+            let prev_session_id = session.as_ref().map(|s| s.id.clone());
             let messages_before = messages.len();
             if let Err(error) = handle_command(
                 input,
@@ -255,7 +404,41 @@ where
                 &mut always_allowed,
                 &mut last_turn_snapshot,
             ) {
-                eprintln!("Command failed: {error:#}\n");
+                eprintln!(
+                    "{}",
+                    ui.style(&format!("Command failed: {error:#}\n"), &[Style::Red])
+                );
+            }
+            // Sync Plan Mode with session changes from /new /resume /delete.
+            let new_session_id = session.as_ref().map(|s| s.id.clone());
+            if prev_session_id != new_session_id {
+                if let Some(id) = new_session_id {
+                    plan_mode = database
+                        .get_plan(&id)
+                        .ok()
+                        .flatten()
+                        .and_then(|(json, status)| {
+                            let status = match status.as_str() {
+                                "pending" => PlanStatus::Pending,
+                                "approved" => PlanStatus::Approved,
+                                _ => return None,
+                            };
+                            Some(PlanModeState {
+                                status,
+                                plan_json: Some(json),
+                            })
+                        });
+                    if let Some(state) = plan_mode.as_ref()
+                        && state.status == PlanStatus::Pending
+                        && let Some(json) = state.plan_json.as_deref()
+                        && let Some(rendered) = tools::render_plan(json)
+                    {
+                        println!("(Plan Mode — pending plan)\n{rendered}\n");
+                    }
+                } else {
+                    plan_mode = None;
+                    plan_requested = false;
+                }
             }
             // Compaction state is tied to the current history; reset it if a command replaced it.
             if messages.len() != messages_before {
@@ -269,22 +452,54 @@ where
         let expanded = match project.expand_file_references(input) {
             Ok(expanded) => expanded,
             Err(error) => {
-                eprintln!("\nCould not attach file: {error:#}\n");
+                eprintln!(
+                    "{}",
+                    ui.style(
+                        &format!("\nCould not attach file: {error:#}\n"),
+                        &[Style::Red]
+                    )
+                );
                 continue;
             }
         };
 
         let model = active.model.clone();
+        // Plan Mode: auto-enter for ≥3-step tasks (heuristic on prompt) or manual /plan.
+        // Also auto-enter when model first calls update_plan with ≥3 steps (prompt heuristic
+        // is not the only signal — Q1=B covers both).
+        let should_enter_plan =
+            plan_requested || (plan_mode.is_none() && looks_like_multi_step(input));
+        if should_enter_plan && active.tools {
+            plan_mode = Some(PlanModeState {
+                status: PlanStatus::Pending,
+                plan_json: None,
+            });
+            plan_requested = false;
+            if let Some(session) = session.as_ref() {
+                let _ = database.set_plan(&session.id, "{}", "pending");
+            }
+            println!("(Plan Mode — only read-only tools + update_plan until approved)\n");
+        } else if plan_requested {
+            plan_requested = false;
+        }
         // Some models/endpoints reject the `tools` field; a profile can opt out so plain chat works.
-        let mut tool_definitions = if active.tools {
-            tools.definitions()
+        // In Plan Mode (pending), only read-only + update_plan + ask_user/search_code/spawn_agent.
+        let is_plan_pending = plan_mode
+            .as_ref()
+            .is_some_and(|s| s.status == PlanStatus::Pending);
+        let tool_definitions = if active.tools {
+            if is_plan_pending {
+                plan_mode_definitions(project.root(), active.embedding_model.is_some())
+            } else {
+                let mut defs = tools.definitions();
+                if active.embedding_model.is_some() {
+                    defs.push(tools::search_code_definition());
+                }
+                defs
+            }
         } else {
             Vec::new()
         };
-        // search_code is only offered when this profile has somewhere to embed a query against.
-        if active.tools && active.embedding_model.is_some() {
-            tool_definitions.push(tools::search_code_definition());
-        }
 
         // Auto-compact older history once the recent portion grows past the threshold.
         summarized_upto = summarized_upto.min(messages.len());
@@ -308,7 +523,13 @@ where
                     println!("(compacted {count} earlier messages into a running summary)\n");
                 }
                 Ok(None) => {}
-                Err(error) => eprintln!("(could not compact history: {error:#})\n"),
+                Err(error) => eprintln!(
+                    "{}",
+                    ui.style(
+                        &format!("(could not compact history: {error:#})\n"),
+                        &[Style::Red]
+                    )
+                ),
             }
         }
 
@@ -318,7 +539,12 @@ where
         // every turn (unlike Kumo's frozen-at-startup snapshot): Kamui is a single interactive
         // process, not a server shared across many chats, so a fact remembered in this turn should
         // be visible on the very next one without needing a restart.
-        let mut system = prompt::build(active.tools, project.system_message().as_deref());
+        let skills_eager = skill_library.eager_block_filtered(&disabled_skills);
+        let mut system = prompt::build(
+            active.tools,
+            project.system_message().as_deref(),
+            skills_eager.as_deref(),
+        );
         let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
         if !memory_snapshot.is_empty() {
             system.push_str("\n\n");
@@ -372,7 +598,10 @@ where
                     Ok(stream) => stream,
                     Err(error) => {
                         stop_spinner(&mut spinner).await;
-                        eprintln!("\nRequest failed: {error:#}\n");
+                        eprintln!(
+                            "\n{}",
+                            render::render_error(&format!("Request failed: {error:#}"), ui)
+                        );
                         revert_on_cancel(&turn_snapshot);
                         continue 'chat;
                     }
@@ -427,14 +656,23 @@ where
                     Some(Err(error)) => {
                         stop_spinner(&mut spinner).await;
                         print!("{}", renderer.finish());
-                        eprintln!("\n\nRequest failed: {error:#}\n");
+                        eprintln!(
+                            "\n{}",
+                            render::render_error(&format!("Request failed: {error:#}"), ui)
+                        );
                         revert_on_cancel(&turn_snapshot);
                         continue 'chat;
                     }
                     None => {
                         stop_spinner(&mut spinner).await;
                         print!("{}", renderer.finish());
-                        eprintln!("\n\nRequest failed: provider stream closed unexpectedly\n");
+                        eprintln!(
+                            "\n{}",
+                            render::render_error(
+                                "Request failed: provider stream closed unexpectedly",
+                                ui
+                            )
+                        );
                         revert_on_cancel(&turn_snapshot);
                         continue 'chat;
                     }
@@ -444,10 +682,12 @@ where
                 usage.prompt_tokens,
                 usage.completion_tokens,
                 usage.total_tokens,
+                usage.cached_tokens,
                 &finish_reason,
                 ttft,
                 started.elapsed(),
                 context_window,
+                ui,
             );
             accumulate_usage(&mut final_usage, &usage);
             final_finish = finish_reason;
@@ -468,10 +708,17 @@ where
             let spawned_outputs = if spawn_calls.is_empty() {
                 HashMap::new()
             } else {
-                println!(
-                    "  \u{2192} running {} sub-agent(s), up to {MAX_CONCURRENT_SUB_AGENTS} concurrently",
-                    spawn_calls.len()
+                print!(
+                    "{}",
+                    render::render_progress(
+                        &format!(
+                            "running {} sub-agent(s), up to {MAX_CONCURRENT_SUB_AGENTS} concurrently",
+                            spawn_calls.len()
+                        ),
+                        ui
+                    )
                 );
+                println!();
                 tokio::select! {
                     output = dispatch_spawn_agents(
                         provider.as_ref(), &active.model, project, &spawn_calls,
@@ -484,23 +731,119 @@ where
                     }
                 }
             };
+            // Plan Mode: auto-enter on first update_plan with ≥3 steps (Q1=B).
+            if plan_mode.is_none() {
+                for call in &tool_calls {
+                    if call.name == tools::UPDATE_PLAN_TOOL
+                        && let Some(count) = tools::plan_step_count(&call.arguments)
+                        && count >= 3
+                    {
+                        plan_mode = Some(PlanModeState {
+                            status: PlanStatus::Pending,
+                            plan_json: None,
+                        });
+                        if let Some(session) = session.as_ref() {
+                            let _ = database.set_plan(&session.id, "{}", "pending");
+                        }
+                        println!(
+                            "(Plan Mode — only read-only tools + update_plan until approved)\n"
+                        );
+                        break;
+                    }
+                }
+            }
             for call in &tool_calls {
                 let tool_started = Instant::now();
+                println!();
                 if call.name == tools::UPDATE_PLAN_TOOL
                     && let Some(rendered) = tools::render_plan(&call.arguments)
                 {
-                    println!("  \u{2192} plan");
+                    print!(
+                        "{}",
+                        render::render_tool_call(&call.name, &call.arguments, ui)
+                    );
                     println!("{rendered}");
+                    // Persist plan: pending stays pending, approved stays tracker.
+                    if let Some(state) = plan_mode.as_mut() {
+                        state.plan_json = Some(call.arguments.clone());
+                        let status = match state.status {
+                            PlanStatus::Pending => "pending",
+                            PlanStatus::Approved => "approved",
+                        };
+                        if let Some(session) = session.as_ref() {
+                            let _ = database.set_plan(&session.id, &call.arguments, status);
+                        }
+                    }
+                    // Inline approval prompt when a plan is pending and this is the plan call.
+                    if plan_mode
+                        .as_ref()
+                        .is_some_and(|s| s.status == PlanStatus::Pending)
+                    {
+                        print!(
+                            "    {} {} ",
+                            ui.style("Plan ready — approve?", &[Style::Yellow, Style::Bold]),
+                            ui.style("[y/N]", &[Style::Cyan])
+                        );
+                        io::stdout().flush()?;
+                        let answer = tokio::select! {
+                            answer = read_approval_line(&mut input_rx, use_tui) => answer,
+                            signal = tokio::signal::ctrl_c() => {
+                                signal.context("failed to listen for Ctrl+C")?;
+                                revert_on_cancel(&turn_snapshot);
+                                println!("{}", ui.style("\n(interrupted — back to prompt)\n", &[Style::Dim]));
+                                continue 'chat;
+                            }
+                        };
+                        let approved = matches!(
+                            answer.as_deref().map(str::trim),
+                            Some("y" | "Y" | "yes" | "Yes")
+                        );
+                        if approved {
+                            if let Some(state) = plan_mode.as_mut() {
+                                state.status = PlanStatus::Approved;
+                                if let Some(session) = session.as_ref()
+                                    && let Some(json) = state.plan_json.clone()
+                                {
+                                    let _ = database.set_plan(&session.id, &json, "approved");
+                                }
+                            }
+                            println!(
+                                "{}",
+                                ui.style(
+                                    "    (plan approved — gate open for this session)\n",
+                                    &[Style::Green]
+                                )
+                            );
+                        } else {
+                            println!(
+                                "{}",
+                                ui.style(
+                                    "    (plan not approved — still in Plan Mode, propose a revised plan)\n",
+                                    &[Style::Yellow]
+                                )
+                            );
+                        }
+                    }
                 } else {
-                    println!("  \u{2192} {}", render_tool_call(call));
+                    print!(
+                        "{}",
+                        render::render_tool_call(&call.name, &call.arguments, ui)
+                    );
                 }
-                let output = if call.name == tools::ASK_USER_TOOL {
+                // In pending Plan Mode, hold mutating tools.
+                let is_mutating_held = plan_mode
+                    .as_ref()
+                    .is_some_and(|s| s.status == PlanStatus::Pending)
+                    && is_mutating_tool(&call.name);
+                let output = if is_mutating_held {
+                    "Plan Mode is active — propose a plan with update_plan and wait for approval before mutating tools.".to_string()
+                } else if call.name == tools::ASK_USER_TOOL {
                     tokio::select! {
-                        output = ask_user(&mut input_rx, &call.arguments) => output?,
+                        output = ask_user(&mut input_rx, use_tui, &call.arguments, ui) => output?,
                         signal = tokio::signal::ctrl_c() => {
                             signal.context("failed to listen for Ctrl+C")?;
                             revert_on_cancel(&turn_snapshot);
-                            println!("\n(interrupted — back to prompt)\n");
+                            println!("{}", ui.style("\n(interrupted — back to prompt)\n", &[Style::Dim]));
                             continue 'chat;
                         }
                     }
@@ -539,16 +882,34 @@ where
                     && !always_allowed.contains(&call.name)
                 {
                     if let Some(preview) = tools.preview(call) {
-                        println!("{preview}");
+                        for line in preview.lines() {
+                            if let Some(cmd) = line.strip_prefix("    $ ") {
+                                println!(
+                                    "    {} {}",
+                                    ui.style("$", &[Style::Cyan, Style::Bold]),
+                                    ui.style(cmd, &[Style::White, Style::Bold])
+                                );
+                            } else if line.starts_with("    + ") {
+                                println!("{}", ui.style(line, &[Style::Green]));
+                            } else if line.starts_with("    - ") {
+                                println!("{}", ui.style(line, &[Style::Red]));
+                            } else {
+                                println!("{}", ui.style(line, &[Style::Dim]));
+                            }
+                        }
                     }
-                    print!("    approve? [y/N/a] ");
+                    print!(
+                        "    {} {} ",
+                        ui.style("approve?", &[Style::Yellow, Style::Bold]),
+                        ui.style("[y/N/a]", &[Style::Cyan])
+                    );
                     io::stdout().flush()?;
                     let answer = tokio::select! {
-                        answer = input_rx.recv() => answer,
+                        answer = read_approval_line(&mut input_rx, use_tui) => answer,
                         signal = tokio::signal::ctrl_c() => {
                             signal.context("failed to listen for Ctrl+C")?;
                             revert_on_cancel(&turn_snapshot);
-                            println!("\n(interrupted — back to prompt)\n");
+                            println!("{}", ui.style("\n(interrupted — back to prompt)\n", &[Style::Dim]));
                             continue 'chat;
                         }
                     };
@@ -558,8 +919,14 @@ where
                     if always {
                         always_allowed.insert(call.name.clone());
                         println!(
-                            "    (always allowing {} for the rest of this session — /new clears this)",
-                            call.name
+                            "{}",
+                            ui.style(
+                                &format!(
+                                    "    (always allowing {} for the rest of this session — /new clears this)",
+                                    call.name
+                                ),
+                                &[Style::Green, Style::Dim]
+                            )
                         );
                     }
                     if approved {
@@ -575,12 +942,15 @@ where
                             signal = tokio::signal::ctrl_c() => {
                                 signal.context("failed to listen for Ctrl+C")?;
                                 revert_on_cancel(&turn_snapshot);
-                                println!("\n    (interrupted — back to prompt)\n");
+                                println!("{}", ui.style("\n(interrupted — back to prompt)\n", &[Style::Dim]));
                                 continue 'chat;
                             }
                         }
                     } else {
-                        println!("    skipped");
+                        println!(
+                            "{}",
+                            ui.style("    (declined by user)", &[Style::Red, Style::Dim])
+                        );
                         "The user declined to run this command.".to_string()
                     }
                 } else {
@@ -605,7 +975,15 @@ where
                     .get(&call.id)
                     .map(|(_, elapsed)| *elapsed)
                     .unwrap_or_else(|| tool_started.elapsed());
-                println!("{}", ui.tool_outcome(&output, elapsed));
+                if !output.starts_with("Error: ") && !output.is_empty() {
+                    print!(
+                        "{}",
+                        render::render_tool_output(&preview_output(&output, expand_tools), ui)
+                    );
+                    println!();
+                }
+                print!("{}", render::render_tool_outcome(&output, elapsed, ui));
+                println!();
                 let result_message = Message::tool_result(&call.id, output);
                 turn_messages.push(result_message.clone());
                 tool_trail.push(result_message);
@@ -634,6 +1012,21 @@ where
             &active.model,
             &final_finish,
         )?;
+        // Persist plan state after save (session now exists). Approved clears pending.
+        if let Some(state) = plan_mode.as_ref() {
+            match state.status {
+                PlanStatus::Approved => {
+                    if let Some(json) = state.plan_json.as_deref() {
+                        let _ = database.set_plan(&active_session.id, json, "approved");
+                    }
+                }
+                PlanStatus::Pending => {
+                    if let Some(json) = state.plan_json.as_deref() {
+                        let _ = database.set_plan(&active_session.id, json, "pending");
+                    }
+                }
+            }
+        }
         if active_session.title == "New chat" {
             active_session.title = make_title(title_source);
         }
@@ -690,7 +1083,13 @@ where
                         session.title = title;
                     }
                 }
-                Err(error) => eprintln!("Could not generate session title: {error:#}\n"),
+                Err(error) => eprintln!(
+                    "{}",
+                    ui.style(
+                        &format!("Could not generate session title: {error:#}\n"),
+                        &[Style::Red]
+                    )
+                ),
             }
         }
     }
@@ -724,12 +1123,22 @@ where
         .unwrap_or_else(|| config.default().clone());
     let provider = build_provider(&active);
 
-    // `kamui -p /review` expands the same custom command interactive chat would, so a command is
-    // scriptable too. The original line is kept for titling, as in `start_chat`.
+    // `kamui -p /review` or `/skill:my-skill` expands the same way interactive chat does.
     let command_library = commands::CommandLibrary::load(project.root());
+    let skill_library = crate::skills::SkillLibrary::load(project.root());
+    for warning in skill_library.warnings() {
+        eprintln!("warning: {warning}");
+    }
+    let disabled_skills = crate::settings::load_disabled_skills(project.root());
     let expanded_command = command_library.expand(prompt);
+    let expanded_skill = if expanded_command.is_none() {
+        skill_library.expand_filtered(prompt, &disabled_skills)
+    } else {
+        None
+    };
+    let expanded = expanded_command.as_deref().or(expanded_skill.as_deref());
     let title_source = prompt;
-    let prompt: &str = expanded_command.as_deref().unwrap_or(prompt);
+    let prompt: &str = expanded.unwrap_or(prompt);
 
     let expanded = project
         .expand_file_references(prompt)
@@ -743,7 +1152,12 @@ where
         tool_definitions.push(tools::search_code_definition());
     }
 
-    let mut system = prompt::build(active.tools, project.system_message().as_deref());
+    let skills_eager = skill_library.eager_block_filtered(&disabled_skills);
+    let mut system = prompt::build(
+        active.tools,
+        project.system_message().as_deref(),
+        skills_eager.as_deref(),
+    );
     let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
     if !memory_snapshot.is_empty() {
         system.push_str("\n\n");
@@ -793,13 +1207,20 @@ where
             dispatch_spawn_agents(provider.as_ref(), &active.model, project, &spawn_calls).await;
         for call in &response.tool_calls {
             let tool_started = Instant::now();
+            println!();
             if call.name == tools::UPDATE_PLAN_TOOL
                 && let Some(rendered) = tools::render_plan(&call.arguments)
             {
-                println!("  \u{2192} plan");
+                print!(
+                    "{}",
+                    render::render_tool_call(&call.name, &call.arguments, ui)
+                );
                 println!("{rendered}");
             } else {
-                println!("  \u{2192} {}", render_tool_call(call));
+                print!(
+                    "{}",
+                    render::render_tool_call(&call.name, &call.arguments, ui)
+                );
             }
             let output = if call.name == tools::ASK_USER_TOOL {
                 println!("    skipped: ask_user is not available in non-interactive mode");
@@ -846,7 +1267,15 @@ where
                 .get(&call.id)
                 .map(|(_, elapsed)| *elapsed)
                 .unwrap_or_else(|| tool_started.elapsed());
-            println!("{}", ui.tool_outcome(&output, elapsed));
+            if !output.starts_with("Error: ") && !output.is_empty() {
+                print!(
+                    "{}",
+                    render::render_tool_output(&preview_output(&output, false), ui)
+                );
+                println!();
+            }
+            print!("{}", render::render_tool_outcome(&output, elapsed, ui));
+            println!();
             let result_message = Message::tool_result(&call.id, output);
             turn_messages.push(result_message.clone());
             tool_trail.push(result_message);
@@ -906,7 +1335,13 @@ where
                 )?;
             }
         }
-        Err(error) => eprintln!("Could not generate session title: {error:#}"),
+        Err(error) => eprintln!(
+            "{}",
+            ui.style(
+                &format!("Could not generate session title: {error:#}"),
+                &[Style::Red]
+            )
+        ),
     }
 
     eprintln!(
@@ -942,7 +1377,11 @@ fn start_spinner(label: &'static str, ui: Ui) -> Option<Spinner> {
             tokio::select! {
                 _ = stop_task.notified() => break,
                 _ = interval.tick() => {
-                    print!("\r{} {label}", FRAMES[frame % FRAMES.len()]);
+                    print!(
+                        "\r{} {}",
+                        FRAMES[frame % FRAMES.len()],
+                        ui.style(label, &[Style::Dim])
+                    );
                     let _ = io::stdout().flush();
                     frame += 1;
                 }
@@ -970,6 +1409,15 @@ impl Spinner {
 async fn stop_spinner(spinner: &mut Option<Spinner>) {
     if let Some(spinner) = spinner.take() {
         spinner.finish().await;
+    }
+}
+
+fn read_plain_line() -> Option<String> {
+    let mut input = String::new();
+    match std::io::stdin().read_line(&mut input) {
+        Ok(0) => None,
+        Ok(_) => Some(input),
+        Err(_) => None,
     }
 }
 
@@ -1048,6 +1496,9 @@ fn handle_command(
             }
             *messages = database.load_messages(&resumed.id)?;
             println!("Resumed: {} ({})\n", resumed.title, short_id(&resumed.id));
+            // Note: Plan Mode restore is handled by the main loop's plan_mode state;
+            // /resume via handle_command is not the startup resume path, so we don't
+            // rehydrate here — the caller would need &mut plan_mode.
             *session = Some(resumed);
             print_history_preview(messages);
         }
@@ -1163,17 +1614,35 @@ fn print_stats(database: &Database, session: &Session, context_window: Option<u6
     println!("Input tokens:  {}", stats.input_tokens);
     println!("Output tokens: {}", stats.output_tokens);
     println!("Total tokens:  {}", stats.total_tokens);
+    if stats.cached_tokens > 0 {
+        let percent = if stats.input_tokens > 0 {
+            (stats.cached_tokens as f64 / stats.input_tokens as f64 * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        println!("Cached tokens: {} ({percent:.0}%)", stats.cached_tokens);
+    }
     if let (Some(last_input), Some(window)) = (stats.last_input_tokens, context_window) {
         let percent = last_input as f64 / window as f64 * 100.0;
-        println!("Last context:  {last_input}/{window} ({percent:.1}%)");
+        print!("Last context:  {last_input}/{window} ({percent:.1}%)");
+        if let Some(cached) = stats.last_cached_tokens.filter(|cached| *cached > 0) {
+            let cached_percent = (cached as f64 / last_input as f64 * 100.0).min(100.0);
+            print!(" | Cached: {cached} ({cached_percent:.0}%)");
+        }
+        println!();
     }
     let by_model = database.model_stats(&session.id)?;
     if by_model.len() > 1 {
         println!("\n--- Per model ---");
         for m in &by_model {
             println!(
-                "  {:<24} {:>3} req  {:>8} in  {:>8} out  {:>8} total",
-                m.model, m.request_count, m.input_tokens, m.output_tokens, m.total_tokens
+                "  {:<24} {:>3} req  {:>8} in  {:>8} out  {:>8} total  {:>8} cached",
+                m.model,
+                m.request_count,
+                m.input_tokens,
+                m.output_tokens,
+                m.total_tokens,
+                m.cached_tokens
             );
         }
     }
@@ -1364,21 +1833,34 @@ fn print_usage(
     input: u64,
     output: u64,
     total: u64,
+    cached: u64,
     finish_reason: &str,
     ttft: Option<Duration>,
     elapsed: Duration,
     context_window: Option<u64>,
+    ui: Ui,
 ) {
-    print!("Tokens: {input} input + {output} output = {total} total");
+    let mut text = format!("Tokens: {input} input + {output} output = {total} total");
+    if cached > 0 {
+        let percent = if input > 0 {
+            (cached as f64 / input as f64 * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        text.push_str(&format!(" | Cached: {cached} ({percent:.0}%)"));
+    }
     if let Some(window) = context_window {
         let percent = input as f64 / window as f64 * 100.0;
-        print!(" | Context: {percent:.1}%");
+        text.push_str(&format!(" | Context: {percent:.1}%"));
     }
     if let Some(ttft) = ttft {
-        print!(" | TTFT: {}", format_duration(ttft));
+        text.push_str(&format!(" | TTFT: {}", format_duration(ttft)));
     }
-    print!(" | Time: {}", format_duration(elapsed));
-    println!(" | Finish: {finish_reason}\n");
+    text.push_str(&format!(" | Time: {}", format_duration(elapsed)));
+    text.push_str(&format!(" | Finish: {finish_reason}"));
+    println!();
+    print!("{}", render::render_usage_stats(&text, ui));
+    println!();
 }
 
 /// Fold one agent-loop round's usage into the turn total: output tokens accumulate across every
@@ -1387,6 +1869,7 @@ fn print_usage(
 fn accumulate_usage(total: &mut Usage, round: &Usage) {
     total.completion_tokens += round.completion_tokens;
     total.prompt_tokens = round.prompt_tokens;
+    total.cached_tokens = round.cached_tokens;
     total.total_tokens = total.prompt_tokens + total.completion_tokens;
 }
 
@@ -1450,9 +1933,24 @@ struct AskUserArguments {
 /// text (a number out of range, or free-form text when no options were offered) is returned as
 /// typed. Returns an `Error: ...` string, not an `Err`, for bad JSON — same convention as
 /// `ToolRegistry::dispatch` — so the model can recover on the next round.
+async fn read_approval_line(
+    input_rx: &mut Option<mpsc::UnboundedReceiver<String>>,
+    use_tui: bool,
+) -> Option<String> {
+    if use_tui {
+        tokio::task::spawn_blocking(read_plain_line)
+            .await
+            .unwrap_or(None)
+    } else {
+        input_rx.as_mut().unwrap().recv().await
+    }
+}
+
 async fn ask_user(
-    input_rx: &mut mpsc::UnboundedReceiver<String>,
+    input_rx: &mut Option<mpsc::UnboundedReceiver<String>>,
+    use_tui: bool,
     arguments: &str,
+    ui: Ui,
 ) -> Result<String> {
     let arguments: AskUserArguments = match serde_json::from_str(arguments) {
         Ok(arguments) => arguments,
@@ -1462,14 +1960,31 @@ async fn ask_user(
         return Ok("Error: ask_user requires a non-empty 'question' argument".to_string());
     }
 
-    println!("  ? {}", arguments.question);
+    println!(
+        "\n{}",
+        ui.style(
+            &format!("  ? {}", arguments.question),
+            &[Style::Yellow, Style::Bold]
+        )
+    );
     for (index, option) in arguments.options.iter().enumerate() {
-        println!("    {}. {option}", index + 1);
+        println!(
+            "    {} {}",
+            ui.style(&format!("{}.", index + 1), &[Style::Cyan, Style::Bold]),
+            ui.style(option, &[Style::White])
+        );
     }
-    print!("    > ");
+    print!("{}", ui.style("    > ", &[Style::Cyan, Style::Bold]));
     io::stdout().flush()?;
 
-    let answer = input_rx.recv().await.unwrap_or_default();
+    let answer = if use_tui {
+        tokio::task::spawn_blocking(read_plain_line)
+            .await
+            .unwrap_or(None)
+            .unwrap_or_default()
+    } else {
+        input_rx.as_mut().unwrap().recv().await.unwrap_or_default()
+    };
     let answer = answer.trim();
     let resolved = answer
         .parse::<usize>()
@@ -1544,7 +2059,7 @@ async fn run_spawned_agent(
 
     let sub_tools = tools::ToolRegistry::read_only(project.root().to_path_buf());
     let tool_definitions = sub_tools.tool_definitions_only();
-    let system = prompt::build(true, project.system_message().as_deref());
+    let system = prompt::build(true, project.system_message().as_deref(), None);
     let mut messages = vec![Message::system(system), Message::user(&arguments.prompt)];
 
     let mut round = 0usize;
@@ -1961,6 +2476,60 @@ fn is_memory_tool(name: &str) -> bool {
     )
 }
 
+// --- Plan Mode (ticket #9) ---
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlanStatus {
+    Pending,
+    Approved,
+}
+
+#[derive(Debug, Clone)]
+struct PlanModeState {
+    status: PlanStatus,
+    plan_json: Option<String>,
+}
+
+fn looks_like_multi_step(input: &str) -> bool {
+    // Heuristic: ≥3 bullet/numbered lines or explicit "step" mentions.
+    let lines: Vec<&str> = input.lines().collect();
+    let mut hits = 0usize;
+    for line in &lines {
+        let t = line.trim();
+        if t.starts_with("- ")
+            || t.starts_with("* ")
+            || t.starts_with("- [")
+            || (t.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains(". "))
+        {
+            hits += 1;
+        }
+        if t.to_ascii_lowercase().contains("step") {
+            hits += 1;
+        }
+    }
+    hits >= 3
+}
+
+fn is_mutating_tool(name: &str) -> bool {
+    matches!(
+        name,
+        tools::PATCH_FILE_TOOL | "run_command" | "command_status" | "stop_command"
+    )
+}
+
+fn plan_mode_definitions(
+    root: &std::path::Path,
+    has_embedding: bool,
+) -> Vec<crate::provider::ToolDefinition> {
+    let mut defs = tools::ToolRegistry::plan_mode(root.to_path_buf()).definitions();
+    // plan_mode() already includes update_plan; add ask_user/spawn_agent/memory via definitions()
+    // which plan_mode's definitions() already includes. Add search_code if available.
+    if has_embedding {
+        defs.push(tools::search_code_definition());
+    }
+    defs
+}
+
 #[derive(serde::Deserialize)]
 struct FactArguments {
     fact: String,
@@ -2050,65 +2619,44 @@ fn truncate(text: &str, max: usize) -> String {
     result
 }
 
-fn render_tool_call(call: &ToolCall) -> String {
-    let arguments = call.arguments.trim();
-    if arguments.is_empty() {
-        return format!("{}()", call.name);
+/// Compact collapsed preview (tail lines + hint) or full output when expanded.
+fn preview_output(text: &str, expanded: bool) -> String {
+    if expanded {
+        return text.to_string();
     }
-
-    let Ok(serde_json::Value::Object(object)) =
-        serde_json::from_str::<serde_json::Value>(arguments)
-    else {
-        return format!("{}({})", call.name, truncate(arguments, 120));
-    };
-
-    let mut keys: Vec<&str> = object
-        .keys()
-        .map(String::as_str)
-        .filter(|key| !matches!(*key, "old_text" | "new_text" | "content"))
-        .collect();
-    keys.sort_unstable_by_key(|key| tool_argument_priority(key));
-
-    let parts = keys
-        .into_iter()
-        .take(4)
-        .filter_map(|key| {
-            object
-                .get(key)
-                .map(|value| format!("{key}={}", render_tool_argument(value)))
-        })
-        .collect::<Vec<_>>();
-
-    if parts.is_empty() {
-        format!("{}({})", call.name, truncate(arguments, 120))
-    } else {
-        format!("{}({})", call.name, parts.join(", "))
-    }
-}
-
-fn tool_argument_priority(key: &str) -> (usize, &str) {
-    let priority = match key {
-        "path" => 0,
-        "command" => 1,
-        "query" | "pattern" | "glob" => 2,
-        "background" | "case_insensitive" => 3,
-        "job_id" => 4,
-        "question" | "task" => 5,
-        "fact" | "matching" | "replacement" => 6,
-        _ => 10,
-    };
-    (priority, key)
-}
-
-fn render_tool_argument(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(text) => {
-            format!("{:?}", truncate(&text.replace('\n', "\\n"), 60))
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    if total <= 4 {
+        let clipped = lines.join("\n");
+        let mut out: String = clipped.chars().take(300).collect();
+        if clipped.chars().count() > 300 {
+            out.push_str(" … (Ctrl+O to expand)");
         }
-        serde_json::Value::Bool(value) => value.to_string(),
-        serde_json::Value::Number(value) => value.to_string(),
-        serde_json::Value::Null => "null".to_string(),
-        value => truncate(&value.to_string(), 60),
+        out
+    } else {
+        let hidden = total - 3;
+        let tail = lines[total - 3..].join("\n");
+        format!("… ({hidden} earlier lines · Ctrl+O or /expand to expand)\n{tail}")
+    }
+}
+
+/// Replay past tool outputs from the current session matching the active mode.
+fn print_tool_history(messages: &[Message], expanded: bool, ui: Ui) {
+    let mut count = 0;
+    for message in messages {
+        if message.role_name() == "tool" && !message.content.is_empty() {
+            count += 1;
+            print!(
+                "{}",
+                render::render_tool_output(&preview_output(&message.content, expanded), ui)
+            );
+        }
+    }
+    if count > 0 {
+        let mode = if expanded { "expanded" } else { "collapsed" };
+        println!("(Replayed {count} past tool output(s) in {mode} mode)\n");
+    } else {
+        println!("(No past tool outputs in this session yet)\n");
     }
 }
 
@@ -2155,6 +2703,8 @@ fn format_timestamp(timestamp: i64) -> String {
 }
 
 fn print_help() {
+    println!("/plan             Enter Plan Mode (gate mutating tools until plan approved)");
+    println!("/skills           List discovered skills");
     println!("/new              Start a new session");
     println!("/sessions         List saved sessions");
     println!("/resume <id>      Resume a session");
@@ -2172,6 +2722,7 @@ fn print_help() {
     println!("/status           Show project and connection status");
     println!("/memory           List facts Kamui remembers across sessions and projects");
     println!("/forget <text>    Forget one remembered fact, or /forget all");
+    println!("/expand           Toggle full or collapsed tool output (Ctrl+O)");
     println!("/exit             Save and quit\n");
 }
 
@@ -2189,14 +2740,31 @@ fn print_usage_report(database: &Database) -> Result<()> {
     }
 
     let row = |period: &storage::UsagePeriod| {
-        println!(
-            "  {:<10} {:>4} req  {:>10} in  {:>10} out  {:>10} total",
-            period.period,
-            period.request_count,
-            period.input_tokens,
-            period.output_tokens,
-            period.total_tokens
-        );
+        if period.cached_tokens > 0 {
+            let percent = if period.input_tokens > 0 {
+                (period.cached_tokens as f64 / period.input_tokens as f64 * 100.0).min(100.0)
+            } else {
+                0.0
+            };
+            println!(
+                "  {:<10} {:>4} req  {:>10} in  {:>10} out  {:>10} total  {:>10} cached ({percent:.0}%)",
+                period.period,
+                period.request_count,
+                period.input_tokens,
+                period.output_tokens,
+                period.total_tokens,
+                period.cached_tokens
+            );
+        } else {
+            println!(
+                "  {:<10} {:>4} req  {:>10} in  {:>10} out  {:>10} total",
+                period.period,
+                period.request_count,
+                period.input_tokens,
+                period.output_tokens,
+                period.total_tokens
+            );
+        }
     };
 
     println!("\nLast {USAGE_REPORT_DAYS} days");
@@ -2217,6 +2785,228 @@ fn print_usage_report(database: &Database) -> Result<()> {
     row(&total);
     println!("\nRequests count chat turns only; tokens include title generation.\n");
     Ok(())
+}
+
+fn print_skills(
+    library: &crate::skills::SkillLibrary,
+    disabled: &std::collections::HashSet<String>,
+) {
+    if library.list().is_empty() {
+        println!("No skills discovered.");
+        println!("Create a skill as a folder with SKILL.md:");
+        println!("  <project>/.kamui/skills/my-skill/SKILL.md  ->  /my-skill  (project)");
+        println!("  <config dir>/kamui/skills/my-skill/SKILL.md ->  /my-skill  (global)");
+        println!(
+            "Compat: .agents/skills is also scanned. Use /skill:<name> if a skill collides with a built-in or command.\n"
+        );
+        for warning in library.warnings() {
+            println!("  warning: {warning}");
+        }
+        if !library.warnings().is_empty() {
+            println!();
+        }
+        return;
+    }
+    println!("Skills (eager: name+description in prompt, body on /<skill> or /skill:<name>):");
+    let term_w = Term::stdout().size().1 as usize;
+    let max_desc = term_w.saturating_sub(40).clamp(20, 60);
+    for skill in library.list() {
+        let state = if disabled.contains(&skill.name) {
+            "[disabled]"
+        } else {
+            "[enabled] "
+        };
+        let tools_hint = skill
+            .allowed_tools
+            .as_deref()
+            .map(|tools| format!(" [tools: {tools}]"))
+            .unwrap_or_default();
+        println!(
+            "  {state} /{:<18} {:<18} {}{tools_hint}",
+            skill.name,
+            skill.source.badge(),
+            truncate(&skill.description, max_desc)
+        );
+    }
+    if !library.warnings().is_empty() {
+        println!("\nWarnings (invalid skills skipped):");
+        for warning in library.warnings() {
+            println!("  - {warning}");
+        }
+    }
+    println!("\nInvoke with /<skill-name> or /skill:<name> (namespaced, wins over collisions).\n");
+}
+
+/// Interactive popup for `/skills`: grouped by location, arrow keys navigate, Enter toggles
+/// enable/disable (persisted to user vs project settings.json), Esc closes.
+/// Returns `Ok(true)` if any toggle was made (caller should reload `disabled_skills`).
+fn source_rank(source: crate::skills::SkillSource) -> u8 {
+    match source {
+        crate::skills::SkillSource::ProjectKamui => 0,
+        crate::skills::SkillSource::ProjectAgents => 1,
+        crate::skills::SkillSource::GlobalKamui => 2,
+        crate::skills::SkillSource::GlobalAgents => 3,
+    }
+}
+
+fn source_label(source: crate::skills::SkillSource) -> &'static str {
+    match source {
+        crate::skills::SkillSource::ProjectKamui => "project .kamui",
+        crate::skills::SkillSource::ProjectAgents => "project .agents",
+        crate::skills::SkillSource::GlobalKamui => "global .kamui",
+        crate::skills::SkillSource::GlobalAgents => "global .agents",
+    }
+}
+
+fn run_skills_popup(
+    library: &crate::skills::SkillLibrary,
+    project_root: &std::path::Path,
+    disabled: &mut std::collections::HashSet<String>,
+) -> anyhow::Result<bool> {
+    if library.list().is_empty() {
+        print_skills(library, disabled);
+        return Ok(false);
+    }
+
+    // Build display order: grouped by SkillSource priority, then name.
+    let mut order: Vec<usize> = (0..library.list().len()).collect();
+    order.sort_by_key(|&i| {
+        let s = &library.list()[i];
+        (source_rank(s.source), s.name.clone())
+    });
+
+    let mut selected: usize = 0;
+    let mut changed = false;
+    let term = Term::stdout();
+
+    // Fall back to a plain list when not a TTY or NO_COLOR is set (no ANSI).
+    if !Ui::stdio().interactive() || std::env::var_os("NO_COLOR").is_some() {
+        print_skills(library, disabled);
+        return Ok(false);
+    }
+
+    // Hide cursor
+    let _ = term.hide_cursor();
+
+    let (term_h, term_w) = term.size();
+    let visible = (term_h as usize).saturating_sub(6).clamp(5, 10);
+    let max_desc = (term_w as usize).saturating_sub(40).clamp(20, 60);
+
+    let render = |selected: usize, disabled: &std::collections::HashSet<String>| -> String {
+        let total = order.len();
+        let start = selected
+            .saturating_sub(visible / 2)
+            .min(total.saturating_sub(visible));
+        let mut out = String::new();
+        out.push_str(
+            "\x1b[1mSkills\x1b[0m · \x1b[2m↑/↓ navigate · Enter toggle · Esc close\x1b[0m\n",
+        );
+        let mut last_rank = if start > 0 {
+            Some(source_rank(library.list()[order[start - 1]].source))
+        } else {
+            None
+        };
+        for (row, &idx) in order.iter().skip(start).take(visible).enumerate() {
+            let pos = start + row;
+            let skill = &library.list()[idx];
+            let rank = source_rank(skill.source);
+            if last_rank != Some(rank) {
+                out.push_str(&format!(
+                    "\n\x1b[2m─ {} ─\x1b[0m\n",
+                    source_label(skill.source)
+                ));
+                last_rank = Some(rank);
+            }
+            let is_on = pos == selected;
+            let enabled = !disabled.contains(&skill.name);
+            let badge = if enabled { "●" } else { "○" };
+            let state = if enabled { "enabled" } else { "disabled" };
+            let prefix = if is_on { "\x1b[7m" } else { "" };
+            let suffix = if is_on { "\x1b[0m" } else { "" };
+            let dim = if enabled { "" } else { "\x1b[2m" };
+            let dim_off = if enabled { "" } else { "\x1b[0m" };
+            let desc = truncate(&skill.description, max_desc);
+            out.push_str(&format!(
+                "{prefix}{dim} {badge} /{:<18} {} [{state}]{dim_off}{suffix}\n",
+                skill.name, desc
+            ));
+        }
+        out
+    };
+
+    // Initial draw: clear below and print
+    let mut last_lines: usize = 0;
+    let draw =
+        |selected: usize, disabled: &std::collections::HashSet<String>, last_lines: &mut usize| {
+            let text = render(selected, disabled);
+            let lines = text.matches('\n').count() + 1;
+            if *last_lines > 0 {
+                // Move up and clear
+                let _ = term.write_str(&format!("\x1b[{}A\x1b[J", last_lines));
+            }
+            let _ = term.write_str(&text);
+            let _ = term.flush();
+            *last_lines = lines;
+        };
+
+    draw(selected, disabled, &mut last_lines);
+
+    #[allow(clippy::while_let_loop)]
+    loop {
+        let key = match term.read_key() {
+            Ok(k) => k,
+            Err(_) => break,
+        };
+        match key {
+            Key::ArrowUp => {
+                if selected > 0 {
+                    selected -= 1;
+                } else {
+                    selected = order.len() - 1;
+                }
+                draw(selected, disabled, &mut last_lines);
+            }
+            Key::ArrowDown => {
+                selected = (selected + 1) % order.len();
+                draw(selected, disabled, &mut last_lines);
+            }
+            Key::Enter => {
+                let idx = order[selected];
+                let skill = &library.list()[idx];
+                let was_disabled = disabled.contains(&skill.name);
+                let now_disabled = !was_disabled;
+                // Persist
+                if let Err(e) =
+                    crate::settings::set_skill_disabled(project_root, skill, now_disabled)
+                {
+                    // Show error inline then continue
+                    let _ = term.write_str(&format!("\n\x1b[31mFailed to save: {e}\x1b[0m\n"));
+                    let _ = term.flush();
+                } else {
+                    if now_disabled {
+                        disabled.insert(skill.name.clone());
+                    } else {
+                        disabled.remove(&skill.name);
+                    }
+                    changed = true;
+                }
+                draw(selected, disabled, &mut last_lines);
+            }
+            Key::Escape => break,
+            Key::Char('q') | Key::Char('Q') => break,
+            _ => {}
+        }
+    }
+
+    // Restore cursor and move to next line
+    let _ = term.show_cursor();
+    let _ = term.write_line("");
+    let _ = term.flush();
+
+    if changed {
+        println!("\nUpdated disabledSkills. Changes apply to the next turn.\n");
+    }
+    Ok(changed)
 }
 
 /// List the user's own prompt commands, or explain where to put one when there are none yet.
@@ -2395,28 +3185,18 @@ mod tests {
     }
 
     #[test]
-    fn render_tool_call_shows_useful_arguments() {
-        let call = ToolCall {
-            id: "c1".to_string(),
-            name: "run_command".to_string(),
-            arguments: r#"{"command":"cargo test","background":true}"#.to_string(),
-        };
+    fn preview_output_caps_lines_and_chars() {
+        let many_lines = (0..25)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let previewed = preview_output(&many_lines, false);
+        assert!(previewed.contains("22 earlier lines · Ctrl+O"));
+        assert!(previewed.contains("line 24"));
+        assert_eq!(preview_output("short", false), "short");
 
-        assert_eq!(
-            render_tool_call(&call),
-            r#"run_command(command="cargo test", background=true)"#
-        );
-    }
-
-    #[test]
-    fn render_tool_call_hides_patch_payloads() {
-        let call = ToolCall {
-            id: "c1".to_string(),
-            name: "patch_file".to_string(),
-            arguments: r#"{"path":"src/main.rs","old_text":"old","new_text":"new"}"#.to_string(),
-        };
-
-        assert_eq!(render_tool_call(&call), r#"patch_file(path="src/main.rs")"#);
+        let expanded = preview_output(&many_lines, true);
+        assert_eq!(expanded, many_lines);
     }
 
     #[test]
@@ -2451,6 +3231,7 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 20,
                 total_tokens: 120,
+                cached_tokens: 10,
             },
         );
         accumulate_usage(
@@ -2459,12 +3240,14 @@ mod tests {
                 prompt_tokens: 150,
                 completion_tokens: 30,
                 total_tokens: 180,
+                cached_tokens: 40,
             },
         );
 
         assert_eq!(total.prompt_tokens, 150); // final round's context size
         assert_eq!(total.completion_tokens, 50); // output summed across rounds
         assert_eq!(total.total_tokens, 200); // last input + all output
+        assert_eq!(total.cached_tokens, 40); // last round wins, like prompt_tokens
     }
 
     #[test]
@@ -2498,30 +3281,36 @@ mod tests {
         assert!(snippet.contains("NEEDLE"));
     }
 
-    fn respond_with(text: &str) -> mpsc::UnboundedReceiver<String> {
+    fn respond_with(text: &str) -> Option<mpsc::UnboundedReceiver<String>> {
         let (sender, receiver) = mpsc::unbounded_channel();
         sender.send(text.to_string()).unwrap();
-        receiver
+        Some(receiver)
     }
 
     #[tokio::test]
     async fn ask_user_rejects_invalid_json_arguments() {
         let mut rx = respond_with("anything");
-        let output = ask_user(&mut rx, "not json").await.unwrap();
+        let output = ask_user(&mut rx, false, "not json", Ui::plain())
+            .await
+            .unwrap();
         assert!(output.starts_with("Error:"));
     }
 
     #[tokio::test]
     async fn ask_user_rejects_a_blank_question() {
         let mut rx = respond_with("anything");
-        let output = ask_user(&mut rx, r#"{"question":"   "}"#).await.unwrap();
+        let output = ask_user(&mut rx, false, r#"{"question":"   "}"#, Ui::plain())
+            .await
+            .unwrap();
         assert!(output.starts_with("Error:"));
     }
 
     #[tokio::test]
     async fn ask_user_returns_free_text_when_no_options_are_offered() {
         let mut rx = respond_with("Tuesday works better");
-        let output = ask_user(&mut rx, r#"{"question":"When?"}"#).await.unwrap();
+        let output = ask_user(&mut rx, false, r#"{"question":"When?"}"#, Ui::plain())
+            .await
+            .unwrap();
         assert_eq!(output, "Tuesday works better");
     }
 
@@ -2530,7 +3319,9 @@ mod tests {
         let mut rx = respond_with("2");
         let output = ask_user(
             &mut rx,
+            false,
             r#"{"question":"Pick one","options":["red","green","blue"]}"#,
+            Ui::plain(),
         )
         .await
         .unwrap();
@@ -2542,7 +3333,9 @@ mod tests {
         let mut rx = respond_with("99");
         let output = ask_user(
             &mut rx,
+            false,
             r#"{"question":"Pick one","options":["red","green"]}"#,
+            Ui::plain(),
         )
         .await
         .unwrap();
@@ -2554,7 +3347,9 @@ mod tests {
         let mut rx = respond_with("actually neither");
         let output = ask_user(
             &mut rx,
+            false,
             r#"{"question":"Pick one","options":["red","green"]}"#,
+            Ui::plain(),
         )
         .await
         .unwrap();
