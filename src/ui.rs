@@ -7,7 +7,7 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -21,6 +21,26 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Braille spinner frames — the same animation the plain scrollback mode uses.
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Welcome logo, opencode-style: block-letter art split into a muted left half and a bright,
+/// bold right half so the brand pops without shouting. Rendered centered while the transcript
+/// is still empty; the chat view takes over on the first message.
+const LOGO_LEFT: [&str; 6] = [
+    " █████╗ ",
+    "██╔══██╗",
+    "███████║",
+    "██╔══██║",
+    "██║  ██║",
+    "╚═╝  ╚═╝",
+];
+const LOGO_RIGHT: [&str; 6] = [
+    "███╗   ███╗██╗   ██╗██╗   ██╗██╗",
+    "████╗ ████║██║   ██║██║   ██║██║",
+    "██╔████╔██║██║   ██║██║   ██║██║",
+    "██║╚██╔╝██║╚██╗ ██╔╝██║   ██║██║",
+    "██║ ╚═╝ ██║ ╚████╔╝ ╚██████╔╝██║",
+    "╚═╝     ╚═╝  ╚═══╝   ╚═════╝ ╚═╝",
+];
 
 fn lock_screen(screen: &Mutex<FullScreen>) -> MutexGuard<'_, FullScreen> {
     screen.lock().unwrap_or_else(PoisonError::into_inner)
@@ -59,6 +79,8 @@ struct Model {
     scroll: u16,
     prompt_visible: bool,
     thinking: Option<(usize, &'static str)>,
+    /// True until the first message lands: the home screen shows the centered logo.
+    intro: bool,
 }
 
 impl Default for Model {
@@ -73,6 +95,7 @@ impl Default for Model {
             scroll: 0,
             prompt_visible: true,
             thinking: None,
+            intro: true,
         }
     }
 }
@@ -126,6 +149,7 @@ impl FullScreen {
         title: impl Into<String>,
         body: impl Into<String>,
     ) -> Result<()> {
+        self.model.intro = false;
         self.model.cards.push(Card {
             kind,
             title: title.into(),
@@ -137,6 +161,7 @@ impl FullScreen {
     }
 
     fn update_assistant(&mut self, body: String) -> Result<()> {
+        self.model.intro = false;
         match self.model.cards.last_mut() {
             Some(card) if matches!(card.kind, CardKind::Output) && card.title == "Assistant" => {
                 card.body = body;
@@ -452,18 +477,65 @@ fn render(frame: &mut Frame<'_>, model: &Model) {
     );
     frame.render_widget(header, areas[0]);
 
-    let transcript = transcript_text(model, areas[1].width);
-    let transcript_height = transcript.lines.len().saturating_add(1) as u16;
-    let visible = areas[1].height.saturating_sub(2);
-    let scroll = transcript_height.saturating_sub(visible);
-    let body = Paragraph::new(transcript)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll.max(model.scroll), 0))
-        .block(Block::default().borders(Borders::LEFT | Borders::RIGHT));
-    frame.render_widget(body, areas[1]);
+    if model.intro && model.cards.is_empty() {
+        frame.render_widget(intro_paragraph(model, areas[1]), areas[1]);
+    } else {
+        let transcript = transcript_text(model, areas[1].width);
+        let transcript_height = transcript.lines.len().saturating_add(1) as u16;
+        let visible = areas[1].height.saturating_sub(2);
+        let scroll = transcript_height.saturating_sub(visible);
+        let body = Paragraph::new(transcript)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll.max(model.scroll), 0))
+            .block(Block::default().borders(Borders::LEFT | Borders::RIGHT));
+        frame.render_widget(body, areas[1]);
+    }
 
     let footer = footer_widget(model);
     frame.render_widget(footer, areas[2]);
+}
+
+/// The home screen: two-tone block-letter logo centered above the version/model line and the
+/// getting-started hint. Mirrors opencode's muted-left / bright-right treatment.
+fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
+    let width = area.width.max(20) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let total_height = LOGO_LEFT.len() + 4; // gap above + logo + blank + info + hint
+    let top_pad = area.height.saturating_sub(total_height as u16 + 4) as usize / 3;
+    for _ in 0..top_pad {
+        lines.push(Line::from(""));
+    }
+    for (left, right) in LOGO_LEFT.iter().zip(LOGO_RIGHT.iter()) {
+        let combined = format!("{left}{right}");
+        let pad = width.saturating_sub(combined.chars().count()) / 2;
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(pad)),
+            Span::styled((*left).to_string(), Style::default().fg(NOTICE_FG)),
+            Span::styled(
+                (*right).to_string(),
+                Style::default()
+                    .fg(Color::Rgb(97, 175, 239))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    let info = model.header.clone();
+    let pad = width.saturating_sub(UnicodeWidthStr::width(info.as_str())) / 2;
+    lines.push(Line::from(vec![
+        Span::raw(" ".repeat(pad)),
+        Span::styled(info, Style::default().fg(NOTICE_FG)),
+    ]));
+    let hint = "type a message, or / for commands";
+    let pad = width.saturating_sub(hint.len()) / 2;
+    lines.push(Line::from(vec![
+        Span::raw(" ".repeat(pad)),
+        Span::styled(
+            hint.to_string(),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ]));
+    Paragraph::new(Text::from(lines))
 }
 
 /// "Kamui v… · model · path" with the meta half dimmed so the brand reads first.
