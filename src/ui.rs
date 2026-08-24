@@ -2,7 +2,7 @@ use crate::terminal::{Style as AnsiStyle, Ui};
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
         KeyModifiers, MouseEventKind,
     },
     execute,
@@ -143,6 +143,13 @@ struct FullScreen {
 
 impl FullScreen {
     fn new(header: String) -> Result<Self> {
+        // If anything panics mid-draw, still restore the terminal instead of leaving it raw.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+            previous_hook(info);
+        }));
         let mut stdout = io::stdout();
         enable_raw_mode().context("could not enable raw mode")?;
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
@@ -684,15 +691,15 @@ impl Drop for BusyGuard {
     }
 }
 
+/// Viewport height from the last draw; one page for PageUp/PageDown.
+fn page_rows(screen: &ScreenHandle) -> i64 {
+    let s = lock_screen(&screen.0);
+    s.last_viewport_rows.max(1) as i64
+}
+
 fn scroll_screen(screen: &ScreenHandle, rows: i64) {
     let mut s = lock_screen(&screen.0);
-    let page = s.last_viewport_rows.max(1) as i64;
-    let delta = if rows.abs() > 50_000 {
-        rows
-    } else {
-        rows * page
-    };
-    let next = s.model.scroll_from_bottom as i64 + delta;
+    let next = s.model.scroll_from_bottom as i64 + rows;
     s.model.scroll_from_bottom = next.clamp(0, 100_000) as usize;
     let _ = s.draw();
 }
@@ -707,26 +714,6 @@ fn input_thread(
     requester: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     candidates: Arc<std::sync::RwLock<Vec<crate::tui::Candidate>>>,
 ) {
-    // Crossterm reads the same raw-mode terminal ratatui draws to, so escape sequences and
-    // mouse wheel arrive as structured events (dialoguer's per-call raw mode leaked ^[[A).
-    let read_key = || -> Option<KeyEvent> {
-        match event::read() {
-            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => Some(key),
-            Ok(Event::Mouse(mouse)) => {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => scroll_screen(&screen, 100_000),
-                    MouseEventKind::ScrollDown => scroll_screen(&screen, -100_000),
-                    _ => {}
-                }
-                None
-            }
-            Ok(_) => None,
-            Err(_) => {
-                let _ = tx.send(HubEvent::Quit);
-                std::process::exit(0);
-            }
-        }
-    };
     let mut buf = String::new();
     let mut selected = 0usize;
     let mut history: Vec<String> = Vec::new();
@@ -752,7 +739,33 @@ fn input_thread(
     };
 
     sync(&screen, "", 0, Vec::new());
-    while let Some(key) = read_key() {
+    // Feed loop: the wheel scrolls right here; only key presses fall through to the editor.
+    // Read errors are tolerated briefly, then quit gracefully (never process::exit - that
+    // would skip FullScreen's Drop and leave raw mode + mouse capture enabled).
+    let mut feed_errors = 0u32;
+    'keys: loop {
+        let key = 'feed: {
+            match event::read() {
+                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => break 'feed Some(key),
+                Ok(Event::Mouse(mouse)) => match mouse.kind {
+                    MouseEventKind::ScrollUp => scroll_screen(&screen, 3),
+                    MouseEventKind::ScrollDown => scroll_screen(&screen, -3),
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(_) => {
+                    feed_errors += 1;
+                    if feed_errors >= 5 {
+                        let _ = tx.send(HubEvent::Quit);
+                        break 'feed None;
+                    }
+                }
+            }
+            continue 'keys;
+        };
+        let Some(key) = key else { break };
+        feed_errors = 0;
+
         let is_slash = buf.trim_start().starts_with('/') && !buf.trim_start().contains(' ');
         let needle = buf
             .trim_start()
@@ -851,8 +864,8 @@ fn input_thread(
                     selected = 0;
                 }
             }
-            KeyCode::PageUp => scroll_screen(&screen, 1),
-            KeyCode::PageDown => scroll_screen(&screen, -1),
+            KeyCode::PageUp => scroll_screen(&screen, page_rows(&screen)),
+            KeyCode::PageDown => scroll_screen(&screen, -page_rows(&screen)),
             KeyCode::Home => scroll_screen(&screen, 100_000),
             KeyCode::End => scroll_screen(&screen, -100_000),
             KeyCode::Backspace => {
