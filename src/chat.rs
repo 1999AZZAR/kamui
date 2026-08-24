@@ -201,8 +201,10 @@ where
             let sks: Vec<crate::skills::Skill> = skill_library.list().to_vec();
             let dis = disabled_skills.clone();
             let hist = tui_history.clone();
+            let candidates = crate::tui::slash_candidates(&cmds, &sks, &dis);
+            let handle = chat_ui.screen_handle();
             let line = tokio::task::spawn_blocking(move || {
-                crate::tui::read_line_blocking(&cmds, &sks, &dis, &hist)
+                handle.and_then(|h| h.read_line_interactive(&candidates, &hist))
             })
             .await
             .unwrap_or(None);

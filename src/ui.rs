@@ -46,12 +46,18 @@ fn lock_screen(screen: &Mutex<FullScreen>) -> MutexGuard<'_, FullScreen> {
     screen.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-const USER_BG: Color = Color::Rgb(36, 59, 104);
-const TOOL_BG: Color = Color::Rgb(49, 58, 77);
-const OUTPUT_BG: Color = Color::Rgb(35, 45, 61);
-const ERROR_BG: Color = Color::Rgb(125, 39, 59);
-const NOTICE_FG: Color = Color::Rgb(150, 164, 183);
-const PROMPT_BG: Color = Color::Rgb(36, 59, 104);
+// OpenCode dark palette (theme/assets/opencode.json) with kamui's blue as the brand accent.
+const TEXT: Color = Color::Rgb(0xee, 0xee, 0xee);
+const MUTED: Color = Color::Rgb(0x80, 0x80, 0x80);
+const BORDER: Color = Color::Rgb(0x48, 0x48, 0x48);
+const BG_ELEMENT: Color = Color::Rgb(0x1e, 0x1e, 0x1e);
+const BG_PANEL: Color = Color::Rgb(0x14, 0x14, 0x14);
+const BLUE: Color = Color::Rgb(0x5c, 0x9c, 0xf5);
+const INFO: Color = Color::Rgb(0x56, 0xb6, 0xc2);
+const GREEN: Color = Color::Rgb(0x7f, 0xd8, 0x8f);
+const RED: Color = Color::Rgb(0xe0, 0x6c, 0x75);
+/// Kept from the earlier blue scheme; NOTICE_FG aliases it for readability everywhere.
+const NOTICE_FG: Color = MUTED;
 const MAX_HISTORY_LINES: usize = 4_000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -84,6 +90,11 @@ struct Model {
     /// OpenCode-style right rail: bold keys with muted values (session, model, context…).
     /// `None` hides it entirely (narrow terminals included).
     sidebar: Option<Vec<(String, String)>>,
+    /// Live typed text rendered inside the editor box; driven by `ScreenHandle`.
+    input: String,
+    /// Autocomplete menu state mirrored from the input loop each keystroke.
+    ac_items: Vec<(String, String)>,
+    ac_selected: usize,
 }
 
 impl Default for Model {
@@ -100,6 +111,9 @@ impl Default for Model {
             thinking: None,
             intro: true,
             sidebar: None,
+            input: String::new(),
+            ac_items: Vec::new(),
+            ac_selected: 0,
         }
     }
 }
@@ -476,33 +490,170 @@ impl ChatUi {
             }
         }
     }
+
+    /// Shareable key into the fullscreen terminal so a blocking input thread can render the
+    /// live editor while the async chat loop awaits.
+    pub fn screen_handle(&self) -> Option<ScreenHandle> {
+        self.fullscreen.clone().map(ScreenHandle)
+    }
+}
+
+/// Blocking editor loop, opencode-style: keystrokes update `Model::input` and redraw through
+/// ratatui, so typed text lives inside the bordered editor instead of a raw ANSI popup below
+/// the frame. Runs on a dedicated thread (see `spawn_blocking` callers).
+pub struct ScreenHandle(Arc<Mutex<FullScreen>>);
+
+impl ScreenHandle {
+    /// Read one line with history and slash-command completion.
+    /// `None` means quit (Ctrl+C / Escape / EOF).
+    pub fn read_line_interactive(
+        &self,
+        candidates: &[crate::tui::Candidate],
+        history: &[String],
+    ) -> Option<String> {
+        use dialoguer::console::{Key, Term};
+        let term = Term::stdout();
+        if !term.is_term() {
+            return None;
+        }
+        let sync = |buf: &str, selected: usize, items: Vec<(String, String)>| {
+            let mut screen = lock_screen(&self.0);
+            screen.model.input = buf.to_string();
+            screen.model.ac_selected = selected;
+            screen.model.ac_items = items;
+            let _ = screen.draw();
+        };
+        let _ = term.hide_cursor();
+        let mut buf = String::new();
+        let mut selected = 0usize;
+        let mut history_idx = history.len();
+        let mut saved_buf = String::new();
+        sync(&buf, 0, Vec::new());
+        while let Ok(key) = term.read_key() {
+            let is_slash = buf.trim_start().starts_with('/') && !buf.trim_start().contains(' ');
+            let needle = buf
+                .trim_start()
+                .trim_start_matches('/')
+                .to_ascii_lowercase();
+            let filtered: Vec<&crate::tui::Candidate> = if is_slash {
+                crate::tui::filter_candidates(candidates, &needle)
+            } else {
+                Vec::new()
+            };
+            let items = |filtered: &[&crate::tui::Candidate]| {
+                filtered
+                    .iter()
+                    .map(|c| (c.name.clone(), c.description.clone()))
+                    .collect::<Vec<_>>()
+            };
+            match key {
+                Key::ArrowUp => {
+                    if !filtered.is_empty() {
+                        selected = if selected == 0 {
+                            filtered.len() - 1
+                        } else {
+                            selected - 1
+                        };
+                    } else if history_idx > 0 {
+                        if history_idx == history.len() {
+                            saved_buf = buf.clone();
+                        }
+                        history_idx -= 1;
+                        buf = history[history_idx].clone();
+                        selected = 0;
+                    }
+                }
+                Key::ArrowDown => {
+                    if !filtered.is_empty() {
+                        selected = (selected + 1) % filtered.len();
+                    } else if history_idx < history.len() {
+                        history_idx += 1;
+                        buf = if history_idx == history.len() {
+                            saved_buf.clone()
+                        } else {
+                            history[history_idx].clone()
+                        };
+                        selected = 0;
+                    }
+                }
+                Key::Tab => {
+                    if let Some(choice) = filtered.get(selected) {
+                        buf = format!("/{} ", choice.name);
+                        selected = 0;
+                    }
+                }
+                Key::Enter => {
+                    // Submitting while the menu is open accepts the highlighted command;
+                    // otherwise the typed line goes out as-is.
+                    let submitted = if !filtered.is_empty() {
+                        filtered
+                            .get(selected)
+                            .map(|c| format!("/{} ", c.name))
+                            .unwrap_or_else(|| buf.clone())
+                    } else {
+                        buf.clone()
+                    };
+                    let trimmed = submitted.trim().to_string();
+                    buf.clear();
+                    sync(&buf, 0, Vec::new());
+                    let _ = term.show_cursor();
+                    return Some(trimmed);
+                }
+                Key::Escape => {
+                    if is_slash {
+                        buf.clear();
+                        selected = 0;
+                    } else {
+                        break;
+                    }
+                }
+                Key::Backspace => {
+                    buf.pop();
+                    selected = 0;
+                    if history_idx == history.len() {
+                        saved_buf = buf.clone();
+                    }
+                }
+                Key::Char('\u{3}') => break,
+                Key::Char(c) => {
+                    buf.push(c);
+                    selected = 0;
+                    if history_idx == history.len() {
+                        saved_buf = buf.clone();
+                    }
+                }
+                _ => {}
+            }
+            sync(&buf, selected, items(&filtered));
+        }
+        let _ = term.show_cursor();
+        None
+    }
 }
 
 fn render(frame: &mut Frame<'_>, model: &Model) {
-    let areas = Layout::default()
+    // OpenCode layout: transcript on top, autocomplete menu above the bordered editor, a
+    // one-line footer, and the sidebar rail splitting the body horizontally.
+    let popup_height: u16 = if model.ac_items.is_empty() {
+        0
+    } else {
+        (model.ac_items.len() as u16 + 2).min(12)
+    };
+    let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
             Constraint::Min(1),
-            Constraint::Length(2),
+            Constraint::Length(popup_height),
+            Constraint::Length(3),
+            Constraint::Length(1),
         ])
         .split(frame.area());
+    let body_area = rows[0];
+    let popup_area = rows[1];
+    let editor_area = rows[2];
+    let footer_area = rows[3];
 
-    let header = Paragraph::new(header_line(&model.header)).block(
-        Block::default()
-            .borders(Borders::BOTTOM)
-            .title(" \u{25c6} Kamui ")
-            .title_style(
-                Style::default()
-                    .fg(Color::Rgb(97, 175, 239))
-                    .add_modifier(Modifier::BOLD),
-            ),
-    );
-    frame.render_widget(header, areas[0]);
-
-    // OpenCode-style split: the sidebar rail takes the right side once the terminal is wide
-    // enough and a session is actually underway.
-    let body_area = areas[1];
+    // Sidebar rail takes the right side once the terminal is wide enough and chat is underway.
     let (transcript_area, sidebar_area) = match (&model.sidebar, model.intro) {
         (Some(entries), false) if !entries.is_empty() && body_area.width >= 84 => {
             let cols = Layout::default()
@@ -523,16 +674,99 @@ fn render(frame: &mut Frame<'_>, model: &Model) {
         let scroll = transcript_height.saturating_sub(visible);
         let body = Paragraph::new(transcript)
             .wrap(Wrap { trim: false })
-            .scroll((scroll.max(model.scroll), 0))
-            .block(Block::default().borders(Borders::LEFT | Borders::RIGHT));
+            .scroll((scroll.max(model.scroll), 0));
         frame.render_widget(body, transcript_area);
     }
     if let Some(area) = sidebar_area {
         frame.render_widget(sidebar_paragraph(model, area), area);
     }
+    if popup_height > 0 {
+        frame.render_widget(popup_widget(model), popup_area);
+    }
+    frame.render_widget(editor_widget(model), editor_area);
 
-    let footer = footer_widget(model);
-    frame.render_widget(footer, areas[2]);
+    // Terminal cursor sits at the end of the typed text whenever the editor owns input.
+    if model.thinking.is_none() {
+        let col = editor_area.x
+            + 2
+            + UnicodeWidthStr::width(model.input.as_str())
+                .min((editor_area.width.saturating_sub(4)) as usize) as u16;
+        frame.set_cursor_position((
+            col.min(editor_area.right().saturating_sub(1)),
+            editor_area.y + 1,
+        ));
+    }
+
+    frame.render_widget(footer_widget(model), footer_area);
+}
+
+/// The opencode-style prompt: left accent border, element background, `❯` glyph with the live
+/// buffer, and a meta line pairing session info with key hints.
+fn editor_widget(model: &Model) -> Paragraph<'static> {
+    let thinking = match model.thinking {
+        Some((frame_idx, label)) => Line::from(vec![
+            Span::styled(
+                format!("{} ", SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()]),
+                Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(label.to_string(), Style::default().fg(MUTED)),
+        ]),
+        None => Line::from(vec![
+            Span::styled(
+                "\u{276f} ".to_string(),
+                Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(model.input.clone(), Style::default().fg(TEXT)),
+        ]),
+    };
+    let hints = "/ commands · Tab complete · \u{2191} history · Ctrl+C cancel";
+    let pad = 60usize.saturating_sub(model.header.chars().count() + 2 + hints.len());
+    let meta = Line::from(vec![
+        Span::styled(model.header.clone(), Style::default().fg(MUTED)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(hints.to_string(), Style::default().fg(BORDER)),
+    ]);
+    Paragraph::new(Text::from(vec![thinking, meta]))
+        .style(Style::default().bg(BG_ELEMENT))
+        .block(
+            Block::default()
+                .borders(Borders::LEFT)
+                .border_style(Style::default().fg(BLUE)),
+        )
+}
+
+/// Slash-command menu rendered above the editor while the buffer looks like a command.
+fn popup_widget(model: &Model) -> Paragraph<'static> {
+    let mut lines: Vec<Line<'static>> = vec![Line::styled(
+        "\u{2500}".repeat(40),
+        Style::default().fg(BORDER),
+    )];
+    for (idx, (name, description)) in model.ac_items.iter().enumerate() {
+        let is_on = idx == model.ac_selected;
+        let prefix = if is_on { "\u{276f} " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(
+                prefix.to_string(),
+                Style::default().fg(if is_on { BLUE } else { BORDER }),
+            ),
+            Span::styled(
+                crate::tui::truncate_chars(name, 24),
+                Style::default()
+                    .fg(if is_on { TEXT } else { MUTED })
+                    .add_modifier(if is_on {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                crate::tui::truncate_chars(description, 48),
+                Style::default().fg(MUTED),
+            ),
+        ]));
+    }
+    Paragraph::new(Text::from(lines)).style(Style::default().bg(BG_PANEL))
 }
 
 /// Session-info rail: each entry renders its key in bold with the value muted beneath,
@@ -543,9 +777,7 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
         for (key, value) in entries {
             lines.push(Line::from(Span::styled(
                 format!("{key} "),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             )));
             for value_line in wrap_display(value, area.width.saturating_sub(4) as usize) {
                 lines.push(Line::styled(value_line, Style::default().fg(NOTICE_FG)));
@@ -553,7 +785,11 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
             lines.push(Line::from(""));
         }
     }
-    Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::LEFT))
+    Paragraph::new(Text::from(lines)).block(
+        Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(BORDER)),
+    )
 }
 
 /// The home screen: two-tone block-letter logo centered above the version/model line and the
@@ -574,9 +810,7 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
             Span::styled((*left).to_string(), Style::default().fg(NOTICE_FG)),
             Span::styled(
                 (*right).to_string(),
-                Style::default()
-                    .fg(Color::Rgb(97, 175, 239))
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
             ),
         ]));
     }
@@ -608,67 +842,12 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
     Paragraph::new(Text::from(lines))
 }
 
-/// "Kamui v… · model · path" with the meta half dimmed so the brand reads first.
-fn header_line(header: &str) -> Line<'static> {
-    let mut spans = Vec::new();
-    if let Some((brand, rest)) = header.split_once(" \u{b7} ") {
-        spans.push(Span::styled(
-            format!("{brand} "),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
-            format!("\u{b7} {rest}"),
-            Style::default().fg(NOTICE_FG),
-        ));
-    } else {
-        spans.push(Span::styled(
-            header.to_string(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    Line::from(spans)
-}
-
-/// Hint line plus the prompt row: the frea spinner takes over while thinking, otherwise the
-/// cyan `❯` marks where typing lands.
+/// One quiet status line — the editor above it carries the prompt itself.
 fn footer_widget(model: &Model) -> Paragraph<'static> {
-    let hints = Line::styled(model.footer.clone(), Style::default().fg(NOTICE_FG));
-    let prompt_line = match model.thinking {
-        Some((frame, label)) => Line::from(vec![
-            Span::styled(
-                format!("{} ", SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]),
-                Style::default()
-                    .fg(Color::Rgb(97, 175, 239))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(label.to_string(), Style::default().fg(NOTICE_FG)),
-        ]),
-        None => {
-            if model.prompt_visible {
-                Line::from(vec![
-                    Span::styled(
-                        "\u{276f} ".to_string(),
-                        Style::default()
-                            .fg(Color::Rgb(97, 175, 239))
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        "type a message, or / for commands",
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
-                ])
-            } else {
-                Line::from("")
-            }
-        }
-    };
-    Paragraph::new(Text::from(vec![hints, prompt_line]))
-        .style(Style::default().bg(PROMPT_BG))
-        .block(Block::default().borders(Borders::TOP))
+    Paragraph::new(Line::styled(
+        model.footer.clone(),
+        Style::default().fg(BORDER),
+    ))
 }
 
 fn transcript_text(model: &Model, width: u16) -> Text<'static> {
@@ -705,10 +884,10 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
         return out;
     }
     let style = match card.kind {
-        CardKind::User => Style::default().bg(USER_BG).fg(Color::White),
-        CardKind::Tool => Style::default().bg(TOOL_BG).fg(Color::White),
-        CardKind::Output => Style::default().bg(OUTPUT_BG).fg(Color::White),
-        CardKind::Error => Style::default().bg(ERROR_BG).fg(Color::White),
+        CardKind::User => Style::default().bg(BG_ELEMENT).fg(TEXT),
+        CardKind::Tool => Style::default().bg(BG_PANEL).fg(INFO),
+        CardKind::Output => Style::default().bg(BG_PANEL).fg(TEXT),
+        CardKind::Error => Style::default().bg(BG_ELEMENT).fg(RED),
     };
     let title_style = style.add_modifier(Modifier::BOLD);
     let mut out = Vec::new();
@@ -738,13 +917,14 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
         {
             out.push(filled_line(format!("  {line}"), width, style));
         }
+        let _ = style;
         out.push(filled_line(
             format!(
                 "  \u{2026} {} more line(s) — /expand to show",
                 total_lines.saturating_sub(1)
             ),
             width,
-            style,
+            Style::default().bg(BG_PANEL).fg(GREEN),
         ));
     } else {
         for line in wrap_display(&card.body, width.saturating_sub(4)) {
@@ -766,7 +946,7 @@ fn assistant_lines(card: &Card, _width: usize) -> Vec<Line<'static>> {
         ));
         return out;
     }
-    let accent = Style::default().fg(Color::Rgb(97, 175, 239));
+    let accent = Style::default().fg(BLUE);
     let text = crate::markdown::render_ratatui(&card.body);
     for line in text.lines {
         let mut spans = vec![Span::styled("\u{258d} ".to_string(), accent)];
