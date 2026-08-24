@@ -1,8 +1,12 @@
 use crate::terminal::{Style as AnsiStyle, Ui};
 use anyhow::{Context, Result};
 use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEventKind,
+    },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     Frame, Terminal,
@@ -140,19 +144,23 @@ struct FullScreen {
 impl FullScreen {
     fn new(header: String) -> Result<Self> {
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen).context("could not enter alternate screen")?;
+        enable_raw_mode().context("could not enable raw mode")?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+            .context("could not enter alternate screen")?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = match Terminal::new(backend) {
             Ok(terminal) => terminal,
             Err(error) => {
                 let mut stdout = io::stdout();
-                let _ = execute!(stdout, LeaveAlternateScreen);
+                let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+                let _ = disable_raw_mode();
                 return Err(error).context("could not create Ratatui terminal");
             }
         };
         if let Err(error) = terminal.clear() {
             let mut stdout = io::stdout();
-            let _ = execute!(stdout, LeaveAlternateScreen);
+            let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+            let _ = disable_raw_mode();
             return Err(error).context("could not clear terminal");
         }
         let model = Model {
@@ -192,10 +200,14 @@ impl FullScreen {
         self.model.intro = false;
         let title = title.into();
         let body = body.into();
-        // Long tool output starts collapsed so a 20k-char dump never floods the transcript;
-        // `/expand` opens it. Assistant answers and errors always show.
-        let collapsed =
-            kind == CardKind::Output && title != "Assistant" && body.lines().count() > 5;
+        // Agent noise starts folded: every tool call collapses to a two-line peek, and any
+        // output longer than two lines joins it. `/expand` // `/collapse` toggle the last
+        // card; answers and errors always show in full.
+        let collapsed = match kind {
+            CardKind::Tool => true,
+            CardKind::Output => title != "Assistant" && body.lines().count() > 2,
+            _ => false,
+        };
         self.model.cards.push(Card {
             kind,
             title,
@@ -271,7 +283,12 @@ impl FullScreen {
 impl Drop for FullScreen {
     fn drop(&mut self) {
         let _ = self.terminal.show_cursor();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
+        let _ = disable_raw_mode();
         let _ = self.terminal.backend_mut().flush();
     }
 }
@@ -690,17 +707,32 @@ fn input_thread(
     requester: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     candidates: Arc<std::sync::RwLock<Vec<crate::tui::Candidate>>>,
 ) {
-    use dialoguer::console::{Key, Term};
-    let term = Term::stdout();
-    if !term.is_term() {
-        return;
-    }
-    let _ = term.hide_cursor();
+    // Crossterm reads the same raw-mode terminal ratatui draws to, so escape sequences and
+    // mouse wheel arrive as structured events (dialoguer's per-call raw mode leaked ^[[A).
+    let read_key = || -> Option<KeyEvent> {
+        match event::read() {
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => Some(key),
+            Ok(Event::Mouse(mouse)) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => scroll_screen(&screen, 100_000),
+                    MouseEventKind::ScrollDown => scroll_screen(&screen, -100_000),
+                    _ => {}
+                }
+                None
+            }
+            Ok(_) => None,
+            Err(_) => {
+                let _ = tx.send(HubEvent::Quit);
+                std::process::exit(0);
+            }
+        }
+    };
     let mut buf = String::new();
     let mut selected = 0usize;
     let mut history: Vec<String> = Vec::new();
     let mut history_idx = 0usize;
     let mut saved_buf = String::new();
+    let mut last_ctrl_c: Option<std::time::Instant> = None;
 
     let sync = |screen: &ScreenHandle, buf: &str, selected: usize, items: Vec<(String, String)>| {
         let mut s = lock_screen(&screen.0);
@@ -720,15 +752,19 @@ fn input_thread(
     };
 
     sync(&screen, "", 0, Vec::new());
-    while let Ok(key) = term.read_key() {
+    while let Some(key) = read_key() {
         let is_slash = buf.trim_start().starts_with('/') && !buf.trim_start().contains(' ');
         let needle = buf
             .trim_start()
             .trim_start_matches('/')
             .to_ascii_lowercase();
         let is_busy = busy.load(std::sync::atomic::Ordering::SeqCst);
-        match key {
-            Key::ArrowUp => {
+        if !matches!(key.code, KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            last_ctrl_c = None;
+        }
+        match key.code {
+            KeyCode::Up => {
                 if is_slash {
                     let total = filtered_len(&candidates, &needle);
                     if total > 0 {
@@ -743,7 +779,7 @@ fn input_thread(
                     selected = 0;
                 }
             }
-            Key::ArrowDown => {
+            KeyCode::Down => {
                 if is_slash {
                     let total = filtered_len(&candidates, &needle);
                     if total > 0 {
@@ -759,7 +795,7 @@ fn input_thread(
                     selected = 0;
                 }
             }
-            Key::Tab => {
+            KeyCode::Tab => {
                 if is_slash {
                     let all = items_for(&needle);
                     if let Some(choice) = all.get(selected) {
@@ -768,7 +804,7 @@ fn input_thread(
                     }
                 }
             }
-            Key::Enter => {
+            KeyCode::Enter => {
                 let line = buf.trim().to_string();
                 buf.clear();
                 selected = 0;
@@ -802,7 +838,7 @@ fn input_thread(
                     let _ = tx.send(HubEvent::Line(line));
                 }
             }
-            Key::Escape => {
+            KeyCode::Esc => {
                 if is_busy {
                     interrupt.notify_waiters();
                     buf.clear();
@@ -815,26 +851,36 @@ fn input_thread(
                     selected = 0;
                 }
             }
-            Key::PageUp => scroll_screen(&screen, 100_000),
-            Key::PageDown => scroll_screen(&screen, -100_000),
-            Key::Home => scroll_screen(&screen, 100_000),
-            Key::End => scroll_screen(&screen, -100_000),
-            Key::Backspace => {
+            KeyCode::PageUp => scroll_screen(&screen, 1),
+            KeyCode::PageDown => scroll_screen(&screen, -1),
+            KeyCode::Home => scroll_screen(&screen, 100_000),
+            KeyCode::End => scroll_screen(&screen, -100_000),
+            KeyCode::Backspace => {
                 buf.pop();
                 selected = 0;
                 if history_idx == history.len() {
                     saved_buf = buf.clone();
                 }
             }
-            Key::Char('\u{3}') => {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if is_busy {
                     interrupt.notify_waiters();
-                } else {
+                } else if last_ctrl_c
+                    .map(|t| t.elapsed() < std::time::Duration::from_secs(3))
+                    .unwrap_or(false)
+                {
                     let _ = tx.send(HubEvent::Quit);
                     return;
+                } else {
+                    last_ctrl_c = Some(std::time::Instant::now());
+                    let mut sc = lock_screen(&screen.0);
+                    sc.model
+                        .notices
+                        .push("Press Ctrl+C again within 3s to quit.".to_string());
+                    let _ = sc.draw();
                 }
             }
-            Key::Char(c) => {
+            KeyCode::Char(c) => {
                 buf.push(c);
                 selected = 0;
                 if history_idx == history.len() {
@@ -1164,7 +1210,8 @@ fn transcript_text(model: &Model, width: u16) -> Text<'static> {
 /// left border with no background fill — user borders secondary-blue, assistant the brand
 /// accent, tool calls muted — and raw output truncates to a head window with an expand hint.
 const THICK_BORDER: &str = "\u{258c} ";
-const MAX_RESULT_HEIGHT: usize = 10;
+/// Rows shown for a folded card before the expand hint.
+const COLLAPSED_PEEK: usize = 2;
 
 fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
     let (border, body_style) = if card.title == "Assistant" {
@@ -1204,7 +1251,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
     // First line carries the role label, opencode-style ("Bash: cmd", user just speaks).
     let total_lines = card.body.lines().count();
     if card.collapsed {
-        for source in card.body.lines().take(MAX_RESULT_HEIGHT) {
+        for source in card.body.lines().take(COLLAPSED_PEEK) {
             for row in wrap_display(source, width.saturating_sub(4)) {
                 push_bordered(&mut out, vec![Span::styled(row, body_style)]);
             }
@@ -1214,7 +1261,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
             vec![Span::styled(
                 format!(
                     "\u{2026} {} more line(s) \u{b7} /expand",
-                    total_lines.saturating_sub(MAX_RESULT_HEIGHT)
+                    total_lines.saturating_sub(COLLAPSED_PEEK)
                 ),
                 Style::default().fg(GREEN),
             )],
@@ -1361,10 +1408,10 @@ mod tests {
             collapsed: true,
         };
         let lines = card_lines(&card, 60);
-        assert_eq!(lines.len(), MAX_RESULT_HEIGHT + 1);
+        assert_eq!(lines.len(), COLLAPSED_PEEK + 1);
         let last = lines.last().unwrap();
         let text: String = last.spans.iter().map(|s| s.content.to_string()).collect();
-        assert!(text.contains("5 more line(s)"));
+        assert!(text.contains("13 more line(s)"));
         assert!(text.contains("/expand"));
     }
 }
