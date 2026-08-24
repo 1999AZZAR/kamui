@@ -58,6 +58,8 @@ const BORDER: Color = Color::Rgb(0x48, 0x48, 0x48);
 const BG_ELEMENT: Color = Color::Rgb(0x1e, 0x1e, 0x1e);
 const BG_PANEL: Color = Color::Rgb(0x14, 0x14, 0x14);
 const BLUE: Color = Color::Rgb(0x5c, 0x9c, 0xf5);
+/// Warm accent marking the user's own words (opencode primary tone).
+const ACCENT: Color = Color::Rgb(0xfa, 0xb2, 0x83);
 const GREEN: Color = Color::Rgb(0x7f, 0xd8, 0x8f);
 const WARN: Color = Color::Rgb(0xf5, 0xa7, 0x42);
 const RED: Color = Color::Rgb(0xe0, 0x6c, 0x75);
@@ -1914,7 +1916,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
         (BLUE, Style::default().fg(TEXT))
     } else {
         match card.kind {
-            CardKind::User => (BLUE, Style::default().fg(TEXT)),
+            CardKind::User => (ACCENT, Style::default().fg(TEXT)),
             CardKind::Tool => (MUTED, Style::default().fg(MUTED)),
             CardKind::Output => (MUTED, Style::default().fg(MUTED)),
             CardKind::Error => (RED, Style::default().fg(RED)),
@@ -2172,7 +2174,7 @@ mod tests {
         let lines = card_lines(&card, 20);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].spans[0].content, "\u{258c} ");
-        assert_eq!(lines[0].spans[0].style.fg, Some(BLUE));
+        assert_eq!(lines[0].spans[0].style.fg, Some(ACCENT));
     }
 
     #[test]
