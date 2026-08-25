@@ -241,6 +241,7 @@ where
                     Some(HubEvent::Line(line)) => line,
                     Some(HubEvent::Quit) | None => {
                         shutdown(
+                            &mut chat_ui,
                             database,
                             session.as_ref(),
                             context_window,
@@ -259,14 +260,28 @@ where
                 input = rx.recv() => match input {
                     Some(input) => input,
                     None => {
-                        shutdown(database, session.as_ref(), context_window, &job_registry, &config.prices)?;
+                        shutdown(
+                        &mut chat_ui,
+                        database,
+                        session.as_ref(),
+                        context_window,
+                        &job_registry,
+                        &config.prices,
+                    )?;
                         break;
                     }
                 },
                 signal = tokio::signal::ctrl_c() => {
                     signal.context("failed to listen for Ctrl+C")?;
                     println!();
-                    shutdown(database, session.as_ref(), context_window, &job_registry, &config.prices)?;
+                    shutdown(
+                        &mut chat_ui,
+                        database,
+                        session.as_ref(),
+                        context_window,
+                        &job_registry,
+                        &config.prices,
+                    )?;
                     break;
                 }
             };
@@ -276,6 +291,7 @@ where
 
         if input.eq_ignore_ascii_case("exit") || input == "/exit" {
             shutdown(
+                &mut chat_ui,
                 database,
                 session.as_ref(),
                 context_window,
@@ -1467,7 +1483,14 @@ where
                 signal = tokio::signal::ctrl_c() => {
                     signal.context("failed to listen for Ctrl+C")?;
                     println!();
-                    shutdown(database, session.as_ref(), context_window, &job_registry, &config.prices)?;
+                    shutdown(
+                        &mut chat_ui,
+                        database,
+                        session.as_ref(),
+                        context_window,
+                        &job_registry,
+                        &config.prices,
+                    )?;
                     break;
                 }
             };
@@ -1892,25 +1915,8 @@ fn handle_command(
             if sessions.is_empty() {
                 out!("No saved sessions.\n");
             } else {
-                for item in sessions {
-                    let marker = if session
-                        .as_ref()
-                        .is_some_and(|session| item.id == session.id)
-                    {
-                        "*"
-                    } else {
-                        " "
-                    };
-                    out!(
-                        "{marker} {}  {}  {:<40} {:>3} messages  {:>8} tokens",
-                        short_id(&item.id),
-                        format_timestamp(item.updated_at),
-                        item.title,
-                        item.message_count,
-                        item.total_tokens
-                    );
-                }
-                out!();
+                let active = session.as_ref().map(|session| session.id.as_str());
+                out!("{}", format_session_rows(&sessions, active));
             }
         }
         "/resume" => {
@@ -1984,22 +1990,9 @@ fn handle_command(
             if hits.is_empty() {
                 out!("No messages matched \"{argument}\".\n");
             } else {
-                for hit in hits {
-                    let speaker = match hit.role.as_str() {
-                        "user" => "You",
-                        "assistant" => "Assistant",
-                        "system" => "System",
-                        _ => "?",
-                    };
-                    out!(
-                        "{}  {}  {:<30}  {speaker}: {}",
-                        short_id(&hit.session_id),
-                        format_timestamp(hit.created_at),
-                        truncate(&hit.title, 30),
-                        make_snippet(&hit.content, argument),
-                    );
-                }
-                println!();
+                // Buffered like every other command: the bare `println!` that used to close
+                // this listing punched raw text straight through the frame ratatui owns.
+                out!("{}", format_search_hits(&hits, argument));
             }
         }
         "/stats" => match session.as_ref() {
@@ -2012,11 +2005,7 @@ fn handle_command(
             if entries.is_empty() {
                 out!("Nothing remembered yet.\n");
             } else {
-                out!("Remembered facts:");
-                for entry in &entries {
-                    out!("- {}", entry.content);
-                }
-                out!("\nUse /forget <text> or /forget all.\n");
+                out!("{}", format_memory_rows(&entries));
             }
         }
         "/forget" => {
@@ -2055,6 +2044,63 @@ fn handle_command(
     }
 
     Ok(())
+}
+
+/// One row per session, each terminating itself. `out!` appends nothing of its own, so a row
+/// formatter that omits the newline renders the entire listing as one run-on line -- which is
+/// exactly what `/sessions`, `/search`, and `/memory` all did.
+fn format_session_rows(
+    sessions: &[crate::storage::SessionSummary],
+    active: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    for item in sessions {
+        let marker = if active == Some(item.id.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        out.push_str(&format!(
+            "{marker} {}  {}  {:<40} {:>3} messages  {:>8} tokens\n",
+            short_id(&item.id),
+            format_timestamp(item.updated_at),
+            item.title,
+            item.message_count,
+            item.total_tokens
+        ));
+    }
+    out
+}
+
+/// One row per search hit, same self-terminating rule as `format_session_rows`.
+fn format_search_hits(hits: &[crate::storage::SearchHit], needle: &str) -> String {
+    let mut out = String::new();
+    for hit in hits {
+        let speaker = match hit.role.as_str() {
+            "user" => "You",
+            "assistant" => "Assistant",
+            "system" => "System",
+            _ => "?",
+        };
+        out.push_str(&format!(
+            "{}  {}  {:<30}  {speaker}: {}\n",
+            short_id(&hit.session_id),
+            format_timestamp(hit.created_at),
+            truncate(&hit.title, 30),
+            make_snippet(&hit.content, needle),
+        ));
+    }
+    out
+}
+
+/// The `/memory` listing: one fact per row, then the removal hint.
+fn format_memory_rows(entries: &[crate::storage::MemoryEntry]) -> String {
+    let mut out = String::from("Remembered facts:\n");
+    for entry in entries {
+        out.push_str(&format!("- {}\n", entry.content));
+    }
+    out.push_str("\nUse /forget <text> or /forget all.\n");
+    out
 }
 
 /// The closest built-in to a rejected command: a prefix match first (`/sess` -> `sessions`),
@@ -2348,6 +2394,7 @@ where
 }
 
 fn shutdown(
+    chat_ui: &mut ChatUi,
     database: &Database,
     session: Option<&Session>,
     context_window: Option<u64>,
@@ -2357,6 +2404,10 @@ fn shutdown(
     // Nothing should outlive the process: a still-running background job has no way to be
     // checked on or stopped once Kamui exits.
     tools::kill_all_jobs(jobs);
+    // Hand the terminal back first. Everything below is printed for the user to keep, and the
+    // alternate screen it would otherwise land on is discarded on the way out -- which is why
+    // exiting had stopped leaving any trace of the session behind.
+    chat_ui.leave_fullscreen();
     let mut buf = String::new();
     if let Some(session) = session {
         print_stats(database, session, context_window, prices, &mut buf)?;
@@ -2366,8 +2417,6 @@ fn shutdown(
         ));
     }
     buf.push_str("Goodbye\n");
-    // In fullscreen this is the final frame teardown companion; printing raw after leaving
-    // the alt screen is correct here because shutdown drops the TUI before returning.
     print!("{buf}");
     Ok(())
 }
@@ -4040,6 +4089,91 @@ mod tests {
     use crate::pricing::ModelPrice;
     use std::fs;
     use uuid::Uuid;
+
+    fn summary(id: &str, title: &str) -> crate::storage::SessionSummary {
+        crate::storage::SessionSummary {
+            id: id.to_string(),
+            title: title.to_string(),
+            message_count: 2,
+            total_tokens: 100,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn session_listing_puts_each_session_on_its_own_row() {
+        // Regression: `out!` appends no newline, so the row formatter has to. Without it the
+        // whole listing arrived as one unreadable run-on line.
+        let rows = format_session_rows(
+            &[
+                summary("aaaaaaaa-1111", "first"),
+                summary("bbbbbbbb-2222", "second"),
+                summary("cccccccc-3333", "third"),
+            ],
+            Some("bbbbbbbb-2222"),
+        );
+        let lines: Vec<&str> = rows.lines().collect();
+        assert_eq!(lines.len(), 3, "one row per session: {rows:?}");
+        assert!(
+            lines[0].starts_with("  "),
+            "inactive rows are unmarked: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with("* "),
+            "the active session is marked: {:?}",
+            lines[1]
+        );
+        assert!(lines[2].contains("third"), "{:?}", lines[2]);
+    }
+
+    #[test]
+    fn search_listing_puts_each_hit_on_its_own_row() {
+        let hits = vec![
+            crate::storage::SearchHit {
+                session_id: "aaaaaaaa-1111".into(),
+                title: "a chat".into(),
+                role: "user".into(),
+                content: "the needle is here".into(),
+                created_at: 0,
+            },
+            crate::storage::SearchHit {
+                session_id: "bbbbbbbb-2222".into(),
+                title: "another".into(),
+                role: "assistant".into(),
+                content: "needle again".into(),
+                created_at: 0,
+            },
+        ];
+        let rows = format_search_hits(&hits, "needle");
+        assert_eq!(rows.lines().count(), 2, "one row per hit: {rows:?}");
+        assert!(rows.lines().next().unwrap().contains("You:"), "{rows:?}");
+        assert!(
+            rows.lines().nth(1).unwrap().contains("Assistant:"),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn memory_listing_puts_each_fact_on_its_own_row() {
+        let entries = vec![
+            crate::storage::MemoryEntry {
+                content: "prefers rust".into(),
+            },
+            crate::storage::MemoryEntry {
+                content: "lives in jakarta".into(),
+            },
+        ];
+        let rows = format_memory_rows(&entries);
+        let lines: Vec<&str> = rows.lines().collect();
+        assert_eq!(lines[0], "Remembered facts:");
+        assert_eq!(lines[1], "- prefers rust");
+        assert_eq!(lines[2], "- lives in jakarta");
+        assert!(
+            rows.contains("/forget"),
+            "the removal hint survives: {rows:?}"
+        );
+    }
 
     #[test]
     fn every_advertised_command_is_dispatched_somewhere() {

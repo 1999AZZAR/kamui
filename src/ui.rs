@@ -1,6 +1,7 @@
 use crate::terminal::{Style as AnsiStyle, Ui};
 use anyhow::{Context, Result};
 use crossterm::{
+    cursor::SetCursorStyle,
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
         MouseButton, MouseEventKind,
@@ -229,6 +230,9 @@ struct FullScreen {
     /// under the pointer.
     last_card_rows: Vec<(u16, u64)>,
     next_card_id: u64,
+    /// Set once the real terminal has been handed back. Further draws are dropped so a
+    /// still-running input thread cannot repaint over restored scrollback.
+    restored: bool,
 }
 
 impl FullScreen {
@@ -237,13 +241,23 @@ impl FullScreen {
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+            let _ = execute!(
+                io::stdout(),
+                SetCursorStyle::DefaultUserShape,
+                LeaveAlternateScreen,
+                DisableMouseCapture
+            );
             previous_hook(info);
         }));
         let mut stdout = io::stdout();
         enable_raw_mode().context("could not enable raw mode")?;
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-            .context("could not enter alternate screen")?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            SetCursorStyle::BlinkingBar
+        )
+        .context("could not enter alternate screen")?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = match Terminal::new(backend) {
             Ok(terminal) => terminal,
@@ -270,12 +284,16 @@ impl FullScreen {
             last_viewport_rows: 0,
             last_card_rows: Vec::new(),
             next_card_id: 0,
+            restored: false,
         };
         screen.draw()?;
         Ok(screen)
     }
 
     fn draw(&mut self) -> Result<()> {
+        if self.restored {
+            return Ok(());
+        }
         let model = self.model.clone();
         let mut info = RenderInfo::default();
         self.terminal.draw(|frame| {
@@ -459,16 +477,30 @@ impl FullScreen {
     }
 }
 
-impl Drop for FullScreen {
-    fn drop(&mut self) {
+impl FullScreen {
+    /// Hands the real terminal back: leaves the alternate screen, drops raw mode and mouse
+    /// capture. Idempotent, because `Drop` also calls it for the paths that never shut down
+    /// explicitly.
+    fn restore(&mut self) {
+        if self.restored {
+            return;
+        }
+        self.restored = true;
         let _ = self.terminal.show_cursor();
         let _ = execute!(
             self.terminal.backend_mut(),
+            SetCursorStyle::DefaultUserShape,
             LeaveAlternateScreen,
             DisableMouseCapture
         );
         let _ = disable_raw_mode();
         let _ = self.terminal.backend_mut().flush();
+    }
+}
+
+impl Drop for FullScreen {
+    fn drop(&mut self) {
+        self.restore();
     }
 }
 
@@ -826,6 +858,18 @@ impl ChatUi {
                 print!("{rendered}");
                 Ok(())
             }
+        }
+    }
+
+    /// Leaves fullscreen and restores the real terminal. Anything printed after this lands in
+    /// the user's scrollback; anything printed *before* it goes to the alternate screen, which
+    /// is discarded on the way out. The exit summary has to come after.
+    ///
+    /// The terminal is restored in place rather than by dropping the handle: the input thread
+    /// holds its own clone, so `Drop` would not run until that thread also lets go.
+    pub fn leave_fullscreen(&mut self) {
+        if let Some(screen) = self.fullscreen.take() {
+            lock_screen(&screen).restore();
         }
     }
 
@@ -1790,8 +1834,10 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     }
     frame.render_widget(editor_widget(model, editor_area), editor_area);
 
-    // Terminal cursor sits at the end of the typed text whenever the editor owns input.
-    if model.thinking.is_none() && !model.intro {
+    // Terminal cursor sits at the end of the typed text whenever the editor owns input. This
+    // includes the home screen: ratatui hides the cursor on any frame that sets no position,
+    // so skipping it there left the first thing a user types with no visible caret.
+    if model.thinking.is_none() {
         let inner = editor_area.width.saturating_sub(4).max(1) as usize;
         let segments: Vec<&str> = model.input.split('\n').collect();
         let last = segments.last().copied().unwrap_or("");
