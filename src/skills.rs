@@ -353,47 +353,17 @@ fn parse_skill(folder_name: &str, content: &str) -> Result<ParsedSkill, String> 
     ))
 }
 
+/// A skill's frontmatter, reduced to the keys the loader understands. Unknown keys are
+/// dropped rather than rejected, so a SKILL.md written for another tool loads unchanged.
 fn split_frontmatter(content: &str) -> Option<(std::collections::HashMap<String, String>, &str)> {
-    let normalized = content.strip_prefix('\u{feff}').unwrap_or(content);
-    let rest = normalized.strip_prefix("---")?;
-    let rest = rest
-        .strip_prefix('\n')
-        .or_else(|| rest.strip_prefix("\r\n"))?;
-    let (front, body) = split_at_closing_fence(rest)?;
-    let mut map = std::collections::HashMap::new();
-    for line in front.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        let key = key.trim().to_ascii_lowercase();
-        let value = value.trim().trim_matches(['"', '\'']).trim().to_string();
-        if value.is_empty() {
-            continue;
-        }
-        // Only keep known keys; unknown keys are ignored (compat with other tools).
-        match key.as_str() {
-            "name" | "description" | "allowed-tools" | "when_to_use" | "argument-hint" => {
-                map.insert(key, value);
-            }
-            _ => {}
-        }
-    }
-    Some((map, body))
-}
-
-fn split_at_closing_fence(rest: &str) -> Option<(&str, &str)> {
-    let mut offset = 0usize;
-    for line in rest.split_inclusive('\n') {
-        if line.trim_end() == "---" {
-            return Some((&rest[..offset], &rest[offset + line.len()..]));
-        }
-        offset += line.len();
-    }
-    None
+    let (mut keys, body) = crate::frontmatter::split(content)?;
+    keys.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "name" | "description" | "allowed-tools" | "when_to_use" | "argument-hint"
+        )
+    });
+    Some((keys, body))
 }
 
 #[cfg(test)]

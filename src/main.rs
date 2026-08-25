@@ -4,6 +4,7 @@ mod commands;
 mod compaction;
 mod config;
 mod context;
+mod frontmatter;
 mod jobs;
 mod markdown;
 mod mcp;

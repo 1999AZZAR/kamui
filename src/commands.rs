@@ -151,42 +151,36 @@ fn is_valid_name(name: &str) -> bool {
 /// Split an optional leading `---` frontmatter block off the body, returning any `description`
 /// found in it. Only `description` is read; everything else in the block is ignored, so files
 /// written for another tool (with `tags:`, `agents:`, and so on) can be used unchanged.
+/// The description a command file declares, and its body. A file without frontmatter is a
+/// body with no description, which is the ordinary case.
 fn split_frontmatter(content: &str) -> (Option<String>, &str) {
     let normalized = content.strip_prefix('\u{feff}').unwrap_or(content);
-    let Some(rest) = normalized.strip_prefix("---") else {
-        return (None, normalized);
-    };
-    let rest = rest
-        .strip_prefix('\n')
-        .or_else(|| rest.strip_prefix("\r\n"));
-    let Some(rest) = rest else {
-        return (None, normalized);
-    };
-    // The block ends at the first line that is exactly `---`.
-    let Some((front, body)) = split_at_closing_fence(rest) else {
-        return (None, normalized);
-    };
-    let description = front.lines().find_map(|line| {
-        let value = line.trim().strip_prefix("description:")?.trim();
-        (!value.is_empty()).then(|| value.trim_matches(['"', '\'']).to_string())
-    });
-    (description, body)
-}
-
-fn split_at_closing_fence(rest: &str) -> Option<(&str, &str)> {
-    let mut offset = 0usize;
-    for line in rest.split_inclusive('\n') {
-        if line.trim_end() == "---" {
-            return Some((&rest[..offset], &rest[offset + line.len()..]));
-        }
-        offset += line.len();
+    match crate::frontmatter::split(content) {
+        Some((keys, body)) => (keys.get("description").cloned(), body),
+        None => (None, normalized),
     }
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_capitalised_description_key_is_honoured() {
+        // Skills accepted `Description:` and commands did not, silently producing no description
+        // for the same file. One parser now decides that for both.
+        let (description, body) =
+            split_frontmatter("---\nDescription: Review a diff\n---\nreview this\n");
+        assert_eq!(description.as_deref(), Some("Review a diff"));
+        assert_eq!(body, "review this\n");
+    }
+
+    #[test]
+    fn a_command_without_frontmatter_keeps_its_whole_body() {
+        let (description, body) = split_frontmatter("just the prompt\n");
+        assert!(description.is_none());
+        assert_eq!(body, "just the prompt\n");
+    }
     use std::fs;
     use uuid::Uuid;
 
