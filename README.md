@@ -443,6 +443,10 @@ Highlights:
 - **Dialogs** — `Ctrl+K` model picker, `Ctrl+S` session switcher, `?` keybinding sheet. Bare
   `/model`, `/sessions`, and `/help` open the same overlays. Enter submits through the normal
   command path, so queueing still applies while busy.
+- **Copying out** — `Ctrl+Y` copies the latest answer as the raw Markdown that was streamed;
+  **right-click** a cell to copy that cell (its header and outcome included, so you can tell what
+  the text is). Both report what was taken. Mouse capture means drag-select belongs to Kamui, but
+  most terminals still fall back to their own selection while **Shift** is held.
 - **Permission modal** — tool and plan approvals render as "Allow once / Always allow this
   session / Reject" with the diff or command preview inline.
 - **Model registry** — the model dialog ends with "+ Add provider / model": enter a base URL and
@@ -453,7 +457,9 @@ Highlights:
 - **Tool cards** — a call and its result are one block: a header naming the tool and its
   arguments, then an outcome row (`✓ completed · 1.2s · 142 chars`, or `✗ failed · 1.2s`) that
   stays visible while the output itself stays folded. **`Ctrl+O` or a click** on the card
-  expands or folds it; `/expand` // `/collapse` still toggle the latest card. Multi-line command
+  expands or folds it; `/expand` // `/collapse` do the same from the prompt. All three act on
+  the newest cell that actually has rows folded away, so a command's own output cell never
+  steals the target. Multi-line command
   output renders as proper lines instead of one run-on blob.
 - **Sidebar** — session, id, version, model, project, MCP servers with their live tool counts
   (a server that failed to start reads `unavailable` rather than quietly disappearing), context

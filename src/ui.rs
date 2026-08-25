@@ -98,6 +98,26 @@ struct Card {
 }
 
 impl Card {
+    /// What copying this cell yields. An answer copies as the raw Markdown that was streamed,
+    /// with no rails or headers; anything else keeps its header and outcome, which are the
+    /// parts that say what the body actually is.
+    fn clipboard_text(&self) -> String {
+        if self.title == "Assistant" {
+            return self.body.clone();
+        }
+        let mut out = String::new();
+        if !self.title.is_empty() {
+            out.push_str(&self.title);
+            out.push('\n');
+        }
+        if let Some((status, _)) = &self.status {
+            out.push_str(status);
+            out.push('\n');
+        }
+        out.push_str(&self.body);
+        out
+    }
+
     /// Body rows hidden behind the fold; 0 means there is nothing to expand.
     fn foldable_rows(&self) -> usize {
         if self.body.trim().is_empty() {
@@ -199,7 +219,7 @@ impl Default for Model {
             header: String::from("Kamui"),
             cards: Vec::new(),
             footer: String::from(
-                "! shell · / commands · Tab · \u{2191} history · Ctrl+O expand · PgUp/PgDn scroll · Ctrl+C cancel",
+                "! shell · / commands · Tab · \u{2191} history · Ctrl+O expand · Ctrl+Y copy · PgUp/PgDn scroll · Ctrl+C cancel",
             ),
             scroll_from_bottom: 0,
             prompt_visible: true,
@@ -406,18 +426,61 @@ impl FullScreen {
 
     /// Flips the fold on the newest card that has anything folded away.
     fn toggle_last_card(&mut self) -> Result<bool> {
-        let Some(card) = self
-            .model
-            .cards
-            .iter_mut()
-            .rev()
-            .find(|card| card.foldable_rows() > 0)
-        else {
+        let Some(card) = self.last_foldable_mut() else {
             return Ok(false);
         };
         card.collapsed = !card.collapsed;
         self.draw()?;
         Ok(true)
+    }
+
+    /// Copies the cell drawn at `row` to the system clipboard, reporting what was taken.
+    /// Mouse capture means the terminal's own drag-select is unavailable, so the transcript
+    /// needs its own way to get text out.
+    fn copy_card_at_row(&mut self, row: u16) -> Result<()> {
+        let id = self
+            .last_card_rows
+            .iter()
+            .find(|(y, _)| *y == row)
+            .map(|(_, id)| *id);
+        let text = id
+            .and_then(|id| self.model.cards.iter().find(|card| card.id == id))
+            .map(Card::clipboard_text);
+        self.copy_reporting(text, "cell")
+    }
+
+    /// Copies the newest answer, or failing that the newest cell with any text in it.
+    fn copy_latest(&mut self) -> Result<()> {
+        let newest_answer = self
+            .model
+            .cards
+            .iter()
+            .rev()
+            .find(|card| card.title == "Assistant" && !card.body.trim().is_empty());
+        let (text, what) = match newest_answer {
+            Some(card) => (Some(card.clipboard_text()), "answer"),
+            None => (
+                self.model
+                    .cards
+                    .iter()
+                    .rev()
+                    .find(|card| !card.clipboard_text().trim().is_empty())
+                    .map(Card::clipboard_text),
+                "cell",
+            ),
+        };
+        self.copy_reporting(text, what)
+    }
+
+    fn copy_reporting(&mut self, text: Option<String>, what: &str) -> Result<()> {
+        let Some(text) = text.filter(|text| !text.trim().is_empty()) else {
+            return self.add_notice(format!("nothing to copy under the {what}"));
+        };
+        let characters = text.chars().count();
+        match set_clipboard_text(&text) {
+            Ok(()) => self.add_notice(format!("copied {characters} chars ({what}) to clipboard")),
+            Err(error) => self.add_notice(format!("could not copy: {error:#}")),
+        }
     }
 
     /// Flips the fold on whichever card was drawn at `row`, for click-to-expand.
@@ -436,13 +499,21 @@ impl FullScreen {
         Ok(true)
     }
 
+    /// Folds or unfolds the newest card that actually has hidden rows -- the same card Ctrl+O
+    /// toggles. Aiming at the literal last card made `/expand` target the note cell holding the
+    /// command's own output rather than the tool output the user meant.
     fn set_last_collapsed(&mut self, collapsed: bool) -> Result<bool> {
-        let Some(card) = self.model.cards.last_mut() else {
+        let Some(card) = self.last_foldable_mut() else {
             return Ok(false);
         };
         card.collapsed = collapsed;
         self.draw()?;
         Ok(true)
+    }
+
+    fn last_foldable_mut(&mut self) -> Option<&mut Card> {
+        let index = last_foldable_index(&self.model.cards)?;
+        self.model.cards.get_mut(index)
     }
 
     /// Appends to the note cell that is already open, or starts one. Consecutive lines from a
@@ -1348,11 +1419,13 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         height,
     };
     frame.render_widget(Clear, box_area);
-    let rows: [(&str, &str); 13] = [
+    let rows: [(&str, &str); 15] = [
         ("Enter", "send message"),
         ("Ctrl+K", "switch model"),
         ("Ctrl+S", "resume a session"),
         ("Ctrl+O / click", "expand or fold tool output"),
+        ("Ctrl+Y", "copy the latest answer"),
+        ("Right click", "copy the cell under the pointer"),
         ("?", "toggle this help"),
         ("Tab", "accept slash completion"),
         ("\u{2191}/\u{2193}", "history / menu navigation"),
@@ -1441,6 +1514,9 @@ fn input_thread(
                     // a card id, so folds open without leaving the mouse.
                     MouseEventKind::Down(MouseButton::Left) => {
                         let _ = lock_screen(&screen.0).toggle_card_at_row(mouse.row);
+                    }
+                    MouseEventKind::Down(MouseButton::Right) => {
+                        let _ = lock_screen(&screen.0).copy_card_at_row(mouse.row);
                     }
                     _ => {}
                 },
@@ -1594,6 +1670,10 @@ fn input_thread(
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
             let _ = lock_screen(&screen.0).toggle_last_card();
+            continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
+            let _ = lock_screen(&screen.0).copy_latest();
             continue;
         }
         if key.code == KeyCode::Char('?') && buf.is_empty() {
@@ -1925,6 +2005,23 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         viewport_rows: if home { 0 } else { body_area.height as usize },
         card_rows,
     }
+}
+
+/// The newest card with rows hidden behind a fold -- the one Ctrl+O, `/expand`, and
+/// `/collapse` all act on. Command output is a cell too now, so "the last card" is usually the
+/// note holding that command's own output rather than the tool output worth unfolding.
+fn last_foldable_index(cards: &[Card]) -> Option<usize> {
+    cards.iter().rposition(|card| card.foldable_rows() > 0)
+}
+
+/// Puts text on the system clipboard. Kept behind one function so the failure mode -- a
+/// headless session with no clipboard at all -- is reported once, as a notice, instead of
+/// taking the UI down.
+fn set_clipboard_text(text: &str) -> Result<()> {
+    arboard::Clipboard::new()
+        .context("could not access the system clipboard")?
+        .set_text(text.to_string())
+        .context("could not write to the system clipboard")
 }
 
 /// How many buffer rows the editor shows at once; longer buffers scroll to the newest.
@@ -2574,6 +2671,66 @@ mod tests {
             status: None,
             collapsed: false,
         }
+    }
+
+    #[test]
+    fn folding_targets_the_newest_card_that_has_something_folded() {
+        // A command leaves a note cell behind as the literal last card. `/expand` used to aim
+        // at that instead of the tool output the user had just seen.
+        let cards = vec![
+            note(1, "", "no body to speak of"),
+            Card {
+                id: 2,
+                kind: CardKind::Tool,
+                title: "read_file".into(),
+                body: "a\nb\nc".into(),
+                status: Some(("completed".into(), true)),
+                collapsed: true,
+            },
+            note(3, "/sessions", ""),
+        ];
+        assert_eq!(
+            last_foldable_index(&cards),
+            Some(1),
+            "the tool card, not the trailing note"
+        );
+        assert_eq!(last_foldable_index(&[]), None);
+        assert_eq!(
+            last_foldable_index(&[note(1, "/help", "")]),
+            None,
+            "a cell with no body folds nothing"
+        );
+    }
+
+    #[test]
+    fn copying_an_answer_yields_the_raw_markdown() {
+        let card = Card {
+            id: 1,
+            kind: CardKind::Output,
+            title: "Assistant".into(),
+            body: "# Heading\n\nsome **text**".into(),
+            status: None,
+            collapsed: false,
+        };
+        // No rails, no header: what is copied is what the model wrote.
+        assert_eq!(card.clipboard_text(), "# Heading\n\nsome **text**");
+    }
+
+    #[test]
+    fn copying_a_tool_cell_keeps_what_says_the_body_is() {
+        let card = Card {
+            id: 1,
+            kind: CardKind::Tool,
+            title: tool_header("read_file", r#"{"path": "src/main.rs"}"#),
+            body: "fn main() {}".into(),
+            status: Some(("completed \u{b7} 3ms \u{b7} 12 chars".into(), true)),
+            collapsed: true,
+        };
+        let text = card.clipboard_text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].contains("read_file"), "{text:?}");
+        assert!(lines[1].contains("completed"), "{text:?}");
+        assert_eq!(lines[2], "fn main() {}");
     }
 
     #[test]
