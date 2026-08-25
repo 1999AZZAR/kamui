@@ -999,7 +999,7 @@ where
         // Say what was attached. The prompt text only ever shows what was typed (`@clipboard`,
         // `@shot.png`), so without this there is nothing to tell you whether an image was
         // actually picked up, how big it was, or that it needs a vision model to be read.
-        if let Some(note) = describe_attachments(&expanded.images) {
+        if let Some(note) = describe_attachments(&expanded) {
             chat_ui.notice(&note)?;
         }
         turn_messages.push(Message::user_with_images(expanded.text, expanded.images));
@@ -1705,7 +1705,7 @@ where
         system.push_str(&memory_snapshot);
     }
     let mut turn_messages = vec![Message::system(system)];
-    if let Some(note) = describe_attachments(&expanded.images) {
+    if let Some(note) = describe_attachments(&expanded) {
         println!("{note}");
     }
     turn_messages.push(Message::user_with_images(expanded.text, expanded.images));
@@ -3012,9 +3012,30 @@ fn skill_fix_report(before: &[String], after: &[String]) -> SkillFixReport {
     }
 }
 
-/// A one-line summary of what a prompt is carrying besides text. `None` when it carries only
-/// text, so the ordinary case stays silent.
-fn describe_attachments(images: &[crate::provider::ImageAttachment]) -> Option<String> {
+/// A one-line summary of what a prompt is carrying besides its own words. `None` when it
+/// carries nothing notable, so the ordinary case stays silent.
+///
+/// Omitted files matter as much as attached ones: an `@src` that quietly delivered twelve of
+/// fifty files produced an answer built on partial context, with nothing on screen saying so.
+fn describe_attachments(expanded: &crate::context::Expanded) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if expanded.attached_files > 0 {
+        parts.push(format!("{} file(s) attached", expanded.attached_files));
+    }
+    if expanded.omitted_files > 0 {
+        parts.push(format!(
+            "{} left out (binary, too large, or over the context budget)",
+            expanded.omitted_files
+        ));
+    }
+    if let Some(images) = describe_images(&expanded.images) {
+        parts.push(images);
+    }
+    (!parts.is_empty()).then(|| format!("\u{1f4ce} {}", parts.join(" \u{b7} ")))
+}
+
+/// The image half of `describe_attachments`.
+fn describe_images(images: &[crate::provider::ImageAttachment]) -> Option<String> {
     if images.is_empty() {
         return None;
     }
@@ -3027,7 +3048,7 @@ fn describe_attachments(images: &[crate::provider::ImageAttachment]) -> Option<S
         })
         .collect();
     Some(format!(
-        "\u{1f4ce} {} image(s) attached ({}) \u{2014} needs a vision model",
+        "{} image(s) ({}) \u{2014} needs a vision model",
         images.len(),
         kinds.join(", ")
     ))
@@ -4457,16 +4478,49 @@ mod tests {
         }
     }
 
+    /// An expansion carrying the given images and file counts.
+    fn expanded(
+        images: Vec<crate::provider::ImageAttachment>,
+        attached: usize,
+        omitted: usize,
+    ) -> crate::context::Expanded {
+        crate::context::Expanded {
+            text: String::new(),
+            images,
+            attached_files: attached,
+            omitted_files: omitted,
+        }
+    }
+
     #[test]
     fn a_text_only_prompt_says_nothing_about_attachments() {
-        assert!(describe_attachments(&[]).is_none());
+        assert!(describe_attachments(&expanded(Vec::new(), 0, 0)).is_none());
+    }
+
+    #[test]
+    fn files_left_out_of_a_directory_are_reported_too() {
+        // `@src` delivering twelve of fifty files answered from partial context and said so only
+        // inside the prompt sent to the model.
+        let note = describe_attachments(&expanded(Vec::new(), 12, 38)).expect("a note");
+        assert!(note.contains("12 file(s) attached"), "{note}");
+        assert!(note.contains("38 left out"), "{note}");
+        assert!(
+            note.contains("context budget"),
+            "the reason is given: {note}"
+        );
+
+        // A directory that fitted entirely says nothing about omissions.
+        let full = describe_attachments(&expanded(Vec::new(), 4, 0)).expect("a note");
+        assert!(full.contains("4 file(s) attached"), "{full}");
+        assert!(!full.contains("left out"), "{full}");
     }
 
     #[test]
     fn attached_images_are_reported_with_type_and_size() {
         // `@clipboard` and `@shot.png` look like plain text in the transcript, so the only way
         // to know an image was picked up is for the attachment to announce itself.
-        let note = describe_attachments(&[image("image/png", 210 * 1024)]).expect("a note");
+        let note = describe_attachments(&expanded(vec![image("image/png", 210 * 1024)], 0, 0))
+            .expect("a note");
         assert!(note.contains("1 image(s)"), "{note}");
         assert!(note.contains("image/png"), "{note}");
         assert!(note.contains("KiB"), "{note}");
@@ -4475,8 +4529,12 @@ mod tests {
             "the requirement is stated: {note}"
         );
 
-        let two = describe_attachments(&[image("image/png", 1024), image("image/jpeg", 2048)])
-            .expect("a note");
+        let two = describe_attachments(&expanded(
+            vec![image("image/png", 1024), image("image/jpeg", 2048)],
+            0,
+            0,
+        ))
+        .expect("a note");
         assert!(two.contains("2 image(s)"), "{two}");
         assert!(two.contains("image/jpeg"), "{two}");
     }

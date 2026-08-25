@@ -13,10 +13,15 @@ const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_DIRECTORY_FILES: usize = 50;
 
 /// A prompt after `@` references are expanded: text context inlined, images carried separately.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Expanded {
     pub text: String,
     pub images: Vec<ImageAttachment>,
+    /// Files that made it in, and files a directory reference had to leave out. The omissions
+    /// were already noted for the model, but not for the person who typed `@src` and got twelve
+    /// of its fifty files -- whose question is then answered from partial context, silently.
+    pub attached_files: usize,
+    pub omitted_files: usize,
 }
 
 pub struct ProjectContext {
@@ -74,13 +79,15 @@ impl ProjectContext {
         if references.is_empty() {
             return Ok(Expanded {
                 text: input.to_string(),
-                images: Vec::new(),
+                ..Expanded::default()
             });
         }
 
         let mut total_bytes = 0;
         let mut context = String::new();
         let mut images = Vec::new();
+        let mut attached_files = 0usize;
+        let mut omitted_files = 0usize;
         for reference in references {
             // Named sources are not paths, so they are resolved before any filesystem lookup.
             let named = match reference.as_str() {
@@ -121,13 +128,16 @@ impl ProjectContext {
             let path = resolve_within_root(&self.root, &reference)?;
             if path.is_dir() {
                 let budget = MAX_CONTEXT_BYTES.saturating_sub(total_bytes);
-                let (blocks, used) = read_project_directory(&self.root, &path, &reference, budget)?;
-                total_bytes += used;
-                context.push_str(&blocks);
+                let directory = read_project_directory(&self.root, &path, &reference, budget)?;
+                total_bytes += directory.bytes;
+                attached_files += directory.attached;
+                omitted_files += directory.omitted;
+                context.push_str(&directory.blocks);
                 continue;
             }
 
             let content = read_text_file(&path)?;
+            attached_files += 1;
             total_bytes += content.len();
             if total_bytes > MAX_CONTEXT_BYTES {
                 anyhow::bail!("attached context exceeds {} KiB", MAX_CONTEXT_BYTES / 1024);
@@ -140,6 +150,8 @@ impl ProjectContext {
         Ok(Expanded {
             text: format!("{input}\n\nAttached project context:{context}"),
             images,
+            attached_files,
+            omitted_files,
         })
     }
 
@@ -342,12 +354,22 @@ pub fn list_project_directory(root: &Path, reference: &str) -> Result<String> {
 /// files. Files are added in path order until the remaining context budget or the file cap runs
 /// out; anything left over (too large, binary, or over budget) is reported rather than failing the
 /// whole prompt. Returns the rendered context blocks and how many bytes they consumed.
+/// What one `@dir` reference contributed: the context blocks, the bytes they cost, and how many
+/// files were taken versus left out.
+#[derive(Default)]
+struct DirectoryAttachment {
+    blocks: String,
+    bytes: usize,
+    attached: usize,
+    omitted: usize,
+}
+
 fn read_project_directory(
     root: &Path,
     directory: &Path,
     reference: &str,
     budget: usize,
-) -> Result<(String, usize)> {
+) -> Result<DirectoryAttachment> {
     let mut paths: Vec<PathBuf> = ignore::WalkBuilder::new(directory)
         .hidden(true)
         .git_ignore(true)
@@ -400,7 +422,12 @@ fn read_project_directory(
             "\n\n<context source=\"{reference}\">({omitted} more files omitted: binary, too large, or over the context budget)</context>"
         ));
     }
-    Ok((blocks, used))
+    Ok(DirectoryAttachment {
+        blocks,
+        bytes: used,
+        attached,
+        omitted,
+    })
 }
 
 /// Recognize an attachable image by extension, returning its MIME type.
@@ -513,6 +540,54 @@ fn read_text_file(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn a_directory_reports_what_it_could_not_attach() {
+        // The omission note already went to the model; these counts are what lets the person who
+        // typed `@dir` be told as well.
+        let root = project();
+        let dir = root.join("many");
+        fs::create_dir(&dir).unwrap();
+        for i in 0..60 {
+            fs::write(dir.join(format!("file-{i:02}.txt")), "x").unwrap();
+        }
+        let context = ProjectContext::from_root(root.clone()).unwrap();
+
+        let expanded = context.expand_file_references("look at @many").unwrap();
+
+        // MAX_DIRECTORY_FILES caps the attachment; the rest are counted, not dropped in silence.
+        assert_eq!(expanded.attached_files, MAX_DIRECTORY_FILES);
+        assert_eq!(expanded.omitted_files, 60 - MAX_DIRECTORY_FILES);
+        assert!(
+            expanded.text.contains("more files omitted"),
+            "the model is still told too"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_single_file_reference_counts_as_one_attachment() {
+        let root = project();
+        fs::write(root.join("notes.txt"), "hello").unwrap();
+        let context = ProjectContext::from_root(root.clone()).unwrap();
+
+        let expanded = context.expand_file_references("see @notes.txt").unwrap();
+
+        assert_eq!(expanded.attached_files, 1);
+        assert_eq!(expanded.omitted_files, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_prompt_without_references_counts_nothing() {
+        let root = project();
+        let context = ProjectContext::from_root(root.clone()).unwrap();
+        let expanded = context.expand_file_references("just a question").unwrap();
+        assert_eq!(expanded.attached_files, 0);
+        assert_eq!(expanded.omitted_files, 0);
+        assert_eq!(expanded.text, "just a question");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn project() -> PathBuf {
         let path = std::env::temp_dir().join(format!("kamui-context-{}", Uuid::new_v4()));
