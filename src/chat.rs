@@ -768,14 +768,18 @@ where
                 continue;
             }
             if command == "/index" {
+                // Indexing walks a whole project over the network; without this it looks frozen.
+                let mut spinner = start_spinner("Indexing...", ui, &mut chat_ui);
                 let outcome = tokio::select! {
                     result = run_index(provider.as_ref(), &active, database, project) => result,
                     signal = tokio::signal::ctrl_c() => {
                         signal.context("failed to listen for Ctrl+C")?;
+                        stop_spinner(&mut spinner, &mut chat_ui).await;
                         chat_ui.notice("interrupted — back to prompt")?;
                         continue;
                     }
                 };
+                stop_spinner(&mut spinner, &mut chat_ui).await;
                 match outcome {
                     Ok(summary) => chat_ui.notice(&summary)?,
                     Err(error) => {
@@ -3272,6 +3276,10 @@ async fn run_spawned_agent(
 /// Rebuild the semantic-search index: walk the project the same `.gitignore`-aware way `grep`/
 /// `glob` do, skip any file whose content hash matches what was indexed last time, chunk and embed
 /// the rest, and drop entries for files that no longer exist. Returns a one-line summary.
+/// Consecutive failures, with nothing succeeding, that mean the problem is the endpoint rather
+/// than the files. Below this a failure is treated as one bad file and skipped.
+const SYSTEMIC_INDEX_FAILURES: usize = 3;
+
 async fn run_index(
     provider: &dyn Provider,
     active: &Profile,
@@ -3289,6 +3297,7 @@ async fn run_index(
     let mut indexed = 0usize;
     let mut skipped = 0usize;
     let mut chunk_total = 0usize;
+    let mut failed: Vec<String> = Vec::new();
 
     for path in tools::walk(root) {
         let relative = tools::relative_slug(root, &path);
@@ -3303,7 +3312,7 @@ async fn run_index(
             continue;
         }
 
-        chunk_total += index_file(
+        match index_file(
             provider,
             embedding_model,
             database,
@@ -3312,8 +3321,26 @@ async fn run_index(
             &content,
             &hash,
         )
-        .await?;
-        indexed += 1;
+        .await
+        {
+            Ok(chunks) => {
+                chunk_total += chunks;
+                indexed += 1;
+            }
+            Err(error) => {
+                // A file the embedding endpoint refuses is skipped, not fatal. Aborting left the
+                // project permanently unindexable: a re-run skips the files already stored and
+                // reaches the same bad one again.
+                failed.push(format!("{relative} ({error:#})"));
+                // Nothing succeeding after several tries is systemic (endpoint down, bad key),
+                // and walking the rest of the project would only produce one error per file.
+                if indexed == 0 && failed.len() >= SYSTEMIC_INDEX_FAILURES {
+                    return Err(error).with_context(|| {
+                        format!("indexing failed on the first {} file(s)", failed.len())
+                    });
+                }
+            }
+        }
     }
 
     // Anything indexed before but not seen on this walk no longer exists (or is now ignored).
@@ -3326,11 +3353,21 @@ async fn run_index(
         }
     }
 
-    Ok(format!(
+    let mut summary = format!(
         "Indexed {indexed} file(s) ({chunk_total} new chunks), skipped {skipped} unchanged, \
          removed {removed} deleted. {} chunk(s) total.",
         database.chunk_count(&key)?
-    ))
+    );
+    if !failed.is_empty() {
+        // Named, not just counted: a file missing from the index is one `search_code` can
+        // never find, and knowing which one is what makes that fixable.
+        summary.push_str(&format!(
+            " Could not index {}: {}",
+            failed.len(),
+            failed.join("; ")
+        ));
+    }
+    Ok(summary)
 }
 
 /// Chunk, embed, and store one file's content for a project, replacing whatever was indexed for
@@ -5489,6 +5526,32 @@ mod tests {
         }
     }
 
+    /// A `Provider` whose `embed` refuses any input containing `poison`, standing in for a file
+    /// the embedding endpoint will not accept.
+    struct PickyEmbeddingProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for PickyEmbeddingProvider {
+        fn name(&self) -> &'static str {
+            "picky-embeddings"
+        }
+        async fn chat(&self, _request: ChatRequest) -> Result<crate::provider::ChatResponse> {
+            panic!("these tests only exercise embedding");
+        }
+        async fn chat_stream(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<mpsc::UnboundedReceiver<Result<crate::provider::StreamEvent>>> {
+            panic!("these tests only exercise embedding");
+        }
+        async fn embed(&self, _model: &str, input: Vec<String>) -> Result<Vec<Vec<f32>>> {
+            if input.iter().any(|text| text.contains("poison")) {
+                anyhow::bail!("input rejected by the embedding endpoint");
+            }
+            Ok(input.iter().map(|text| vec![text.len() as f32]).collect())
+        }
+    }
+
     fn profile_with_embedding(embedding_model: Option<&str>) -> Profile {
         Profile {
             name: "default".to_string(),
@@ -5880,6 +5943,59 @@ mod tests {
 
         assert!(staleness.is_fresh(), "{staleness:?}");
         assert_eq!(staleness.describe(), "");
+    }
+
+    #[tokio::test]
+    async fn one_unindexable_file_does_not_abort_the_whole_index() {
+        // Aborting made the project permanently unindexable: a re-run skips the files already
+        // stored and reaches the same bad one again, so the index could never be completed.
+        let root = temporary_directory().canonicalize().unwrap();
+        fs::write(root.join("good-one.txt"), "fine content").unwrap();
+        fs::write(root.join("bad.txt"), "poison content").unwrap();
+        fs::write(root.join("good-two.txt"), "also fine").unwrap();
+        let project = ProjectContext::from_root(root.clone()).unwrap();
+        let database = Database::open_in_memory_for_tests();
+
+        let summary = run_index(
+            &PickyEmbeddingProvider,
+            &profile_with_embedding(Some("embed-model")),
+            &database,
+            &project,
+        )
+        .await
+        .expect("the run survives one bad file");
+
+        assert!(summary.contains("Indexed 2 file(s)"), "{summary}");
+        assert!(summary.contains("Could not index 1"), "{summary}");
+        assert!(summary.contains("bad.txt"), "the file is named: {summary}");
+        assert!(
+            database.chunk_count(&project.key()).unwrap() > 0,
+            "the good files were still stored"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_that_refuses_everything_fails_instead_of_walking_the_project() {
+        // Every file failing is systemic. Reporting one error per file would bury the cause.
+        let root = temporary_directory().canonicalize().unwrap();
+        for i in 1..=6 {
+            fs::write(root.join(format!("poison-{i}.txt")), "poison").unwrap();
+        }
+        let project = ProjectContext::from_root(root.clone()).unwrap();
+        let database = Database::open_in_memory_for_tests();
+
+        let error = run_index(
+            &PickyEmbeddingProvider,
+            &profile_with_embedding(Some("embed-model")),
+            &database,
+            &project,
+        )
+        .await
+        .expect_err("a systemic failure is an error, not a summary");
+        let text = format!("{error:#}");
+        assert!(text.contains("first 3 file(s)"), "it stops early: {text}");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

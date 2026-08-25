@@ -154,7 +154,10 @@ each file into roughly 50-line chunks, preferring blank lines and common declara
 target so chunks stay more coherent, and embeds any chunk from a file whose content changed since
 the last run (tracked by a content hash, so re-running `/index` after a small edit only re-embeds
 the files that actually changed). Embeddings are sent in bounded batches, and a file's old index is
-replaced transactionally only after every new embedding succeeds. `search_code` combines SQLite
+replaced transactionally only after every new embedding succeeds. A file the embedding endpoint
+refuses is skipped and named in the summary rather than failing the run — aborting made the project
+permanently unindexable, since a re-run skips what is already stored and reaches the same bad file
+again. If nothing succeeds at all the run does stop, because that is the endpoint, not the files. `search_code` combines SQLite
 FTS5 identifier/path candidates with locality-sensitive embedding buckets, then runs exact cosine
 ranking over that shortlist. Small indexes still use exhaustive ranking for maximum recall. Results
 are returned as `path:start-end` with the chunk text. Without an `embedding_model` configured,
