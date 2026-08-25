@@ -124,6 +124,10 @@ model = "codeqwen:latest"
 tools = false                   # this model does not support tools
 ```
 
+Profiles and providers are resolved from the **global** file only. A project `kamui.toml` may set
+`default_profile` to pin that project to one of them, but defining `[profiles.*]` or
+`[providers.*]` there is rejected outright rather than silently ignored.
+
 In chat, `/model` lists the profiles and marks the active one, and `/model codeqwen` switches the
 active provider and model for the next messages. Your choice is remembered across restarts, and the
 banner always shows which model is active — handy for comparing the same prompt across models. A
