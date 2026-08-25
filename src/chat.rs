@@ -99,6 +99,9 @@ where
     }
     let ui = Ui::stdio();
     let mcp_sidebar = mcp_sidebar_value(&mcp_statuses);
+    if let Some(note) = tools_disabled_note(&active) {
+        chat_ui.warning(&note)?;
+    }
     // One tidy startup line instead of a wall of per-skill warnings; /skills still lists every
     // individual reason.
     let skill_warning_count = skill_library.warnings().len();
@@ -175,7 +178,7 @@ where
     update_sidebar(
         &mut chat_ui,
         session.as_ref(),
-        &active.model,
+        &model_label(&active),
         env!("CARGO_PKG_VERSION"),
         project,
         &mcp_sidebar,
@@ -420,7 +423,7 @@ where
                     update_sidebar(
                         &mut chat_ui,
                         session.as_ref(),
-                        &active.model,
+                        &model_label(&active),
                         env!("CARGO_PKG_VERSION"),
                         project,
                         &mcp_sidebar,
@@ -752,7 +755,7 @@ where
                 update_sidebar(
                     &mut chat_ui,
                     session.as_ref(),
-                    &active.model,
+                    &model_label(&active),
                     env!("CARGO_PKG_VERSION"),
                     project,
                     &mcp_sidebar,
@@ -1126,7 +1129,7 @@ where
                 update_sidebar(
                     &mut chat_ui,
                     session.as_ref(),
-                    &active.model,
+                    &model_label(&active),
                     env!("CARGO_PKG_VERSION"),
                     project,
                     &mcp_sidebar,
@@ -1139,7 +1142,7 @@ where
                 update_sidebar(
                     &mut chat_ui,
                     session.as_ref(),
-                    &active.model,
+                    &model_label(&active),
                     env!("CARGO_PKG_VERSION"),
                     project,
                     &mcp_sidebar,
@@ -2411,6 +2414,9 @@ where
             *context_window = profile.context_window;
             database.set_setting(ACTIVE_PROFILE_KEY, &profile.name)?;
             out!("Now using {} ({}).\n", profile.model, profile.name);
+            if let Some(note) = tools_disabled_note(profile) {
+                out!("{note}\n");
+            }
         }
         None => out!("Unknown profile '{name}'. Type /model to list profiles.\n"),
     }
@@ -2581,6 +2587,30 @@ fn refresh_session_source(database: &Database, hub: &InputHub) {
 /// The sidebar's MCP block: one row per configured server with its live tool count, and an
 /// explicit "unavailable" for one that failed to start. A server that simply vanishes from the
 /// rail is indistinguishable from one that was never configured.
+/// The sidebar's model row. A profile with `tools = false` says so here: without tools the
+/// agent cannot read a file or run a command, and a model that is never offered any will
+/// happily invent tool-call syntax in plain prose instead, which reads as the agent being
+/// broken rather than switched off.
+fn model_label(active: &Profile) -> String {
+    if active.tools {
+        active.model.clone()
+    } else {
+        format!("{} \u{b7} no tools", active.model)
+    }
+}
+
+/// Spelled out once when it matters: at startup and whenever the active profile changes.
+fn tools_disabled_note(active: &Profile) -> Option<String> {
+    (!active.tools).then(|| {
+        format!(
+            "Profile '{}' has tools = false, so {} is offered no tools: it cannot read files, \
+             search, or run commands. Set tools = true in kamui.toml, or /model to a profile \
+             that has them.",
+            active.name, active.model
+        )
+    })
+}
+
 fn mcp_sidebar_value(statuses: &[ConnectionStatus]) -> String {
     statuses
         .iter()
@@ -4315,6 +4345,40 @@ mod tests {
             trusted,
             error: error.map(str::to_string),
         }
+    }
+
+    fn profile(name: &str, model: &str, tools: bool) -> Profile {
+        Profile {
+            name: name.to_string(),
+            model: model.to_string(),
+            base_url: "http://localhost".to_string(),
+            api_key: "k".to_string(),
+            context_window: None,
+            tools,
+            embedding_model: None,
+        }
+    }
+
+    #[test]
+    fn the_model_row_says_when_a_profile_has_no_tools() {
+        // A model offered no tools will invent tool-call syntax in prose, which reads as the
+        // agent being broken rather than switched off. The rail has to say which it is.
+        assert_eq!(
+            model_label(&profile("muse", "orvix/auto", true)),
+            "orvix/auto"
+        );
+        let off = model_label(&profile("ornith", "ornith:latest", false));
+        assert!(off.starts_with("ornith:latest"), "{off}");
+        assert!(off.contains("no tools"), "{off}");
+    }
+
+    #[test]
+    fn disabled_tools_are_explained_in_full() {
+        assert!(tools_disabled_note(&profile("muse", "orvix/auto", true)).is_none());
+        let note = tools_disabled_note(&profile("ornith", "ornith:latest", false)).expect("note");
+        assert!(note.contains("ornith"), "names the profile: {note}");
+        assert!(note.contains("tools = false"), "names the setting: {note}");
+        assert!(note.contains("/model"), "offers a way out: {note}");
     }
 
     #[test]

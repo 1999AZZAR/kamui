@@ -472,7 +472,9 @@ Highlights:
   the newest cell that actually has rows folded away, so a command's own output cell never
   steals the target. Multi-line command
   output renders as proper lines instead of one run-on blob.
-- **Sidebar** — session, id, version, model, project, MCP servers with their live tool counts
+- **Sidebar** — session, id, version, model (marked `· no tools` when the active profile sets
+  `tools = false`, since a model offered no tools invents tool-call syntax in prose and looks
+  broken rather than switched off), project, MCP servers with their live tool counts
   (a server that failed to start reads `unavailable` rather than quietly disappearing), context
   usage, and last-turn metrics.
 - **Unknown commands name themselves** and suggest the nearest built-in (`/sesions` → "Did you
