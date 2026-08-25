@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseEventKind,
+        MouseButton, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -79,10 +79,28 @@ pub enum CardKind {
 
 #[derive(Debug, Clone)]
 struct Card {
+    /// Monotonic id. Clicks resolve to a card through this rather than a position, so a
+    /// history trim between the draw and the click cannot toggle the wrong card.
+    id: u64,
     kind: CardKind,
     title: String,
     body: String,
+    /// Tool outcome ("completed - 1.2s - 142 chars") plus whether it succeeded. Rendered as
+    /// its own row that stays visible when the card is folded, so a finished tool always
+    /// reports how it ended without the output being unfolded.
+    status: Option<(String, bool)>,
     collapsed: bool,
+}
+
+impl Card {
+    /// Body rows hidden behind the fold; 0 means there is nothing to expand.
+    fn foldable_rows(&self) -> usize {
+        if self.body.trim().is_empty() {
+            0
+        } else {
+            self.body.lines().count()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -178,7 +196,7 @@ impl Default for Model {
             cards: Vec::new(),
             notices: Vec::new(),
             footer: String::from(
-                "! shell · / commands · Tab · \u{2191} history · PgUp/PgDn scroll · Ctrl+C cancel",
+                "! shell · / commands · Tab · \u{2191} history · Ctrl+O expand · PgUp/PgDn scroll · Ctrl+C cancel",
             ),
             scroll_from_bottom: 0,
             prompt_visible: true,
@@ -207,6 +225,10 @@ struct FullScreen {
     /// Transcript viewport height from the most recent draw; PageUp/PageDown use it as the
     /// scroll page size.
     last_viewport_rows: usize,
+    /// Terminal row -> card id from the most recent draw, so a mouse click can find the card
+    /// under the pointer.
+    last_card_rows: Vec<(u16, u64)>,
+    next_card_id: u64,
 }
 
 impl FullScreen {
@@ -246,6 +268,8 @@ impl FullScreen {
             terminal,
             model,
             last_viewport_rows: 0,
+            last_card_rows: Vec::new(),
+            next_card_id: 0,
         };
         screen.draw()?;
         Ok(screen)
@@ -253,12 +277,18 @@ impl FullScreen {
 
     fn draw(&mut self) -> Result<()> {
         let model = self.model.clone();
-        let mut viewport = 0usize;
+        let mut info = RenderInfo::default();
         self.terminal.draw(|frame| {
-            viewport = render(frame, &model);
+            info = render(frame, &model);
         })?;
-        self.last_viewport_rows = viewport;
+        self.last_viewport_rows = info.viewport_rows;
+        self.last_card_rows = info.card_rows;
         Ok(())
+    }
+
+    fn take_card_id(&mut self) -> u64 {
+        self.next_card_id += 1;
+        self.next_card_id
     }
 
     fn set_header(&mut self, header: String) -> Result<()> {
@@ -276,17 +306,20 @@ impl FullScreen {
         let title = title.into();
         let body = body.into();
         // Agent noise starts folded: every tool call collapses to a two-line peek, and any
-        // output longer than two lines joins it. `/expand` // `/collapse` toggle the last
-        // card; answers and errors always show in full.
+        // output longer than two lines joins it. Ctrl+O, a click, or `/expand` // `/collapse`
+        // toggle it; answers and errors always show in full.
         let collapsed = match kind {
             CardKind::Tool => true,
             CardKind::Output => title != "Assistant" && body.lines().count() > 2,
             _ => false,
         };
+        let id = self.take_card_id();
         self.model.cards.push(Card {
+            id,
             kind,
             title,
             body,
+            status: None,
             collapsed,
         });
         self.trim_history();
@@ -299,15 +332,86 @@ impl FullScreen {
             Some(card) if matches!(card.kind, CardKind::Output) && card.title == "Assistant" => {
                 card.body = body;
             }
-            _ => self.model.cards.push(Card {
-                kind: CardKind::Output,
-                title: "Assistant".to_string(),
-                body,
-                collapsed: false,
-            }),
+            _ => {
+                let id = self.take_card_id();
+                self.model.cards.push(Card {
+                    id,
+                    kind: CardKind::Output,
+                    title: "Assistant".to_string(),
+                    body,
+                    status: None,
+                    collapsed: false,
+                });
+            }
         }
         self.trim_history();
         self.draw()
+    }
+
+    /// Records a tool's outcome. It lands on the pending `Tool` card when there is one, so a
+    /// call and its result render as a single block; otherwise it becomes a card of its own.
+    fn finish_tool(&mut self, outcome: String, ok: bool, body: String) -> Result<()> {
+        self.model.intro = false;
+        match self.model.cards.last_mut() {
+            Some(card) if matches!(card.kind, CardKind::Tool) && card.status.is_none() => {
+                // The call's arguments were the peek while it ran; real output replaces them,
+                // and a silent tool keeps its arguments so the card is not left blank.
+                if !body.is_empty() {
+                    card.body = body;
+                }
+                card.status = Some((outcome, ok));
+                card.collapsed = true;
+            }
+            _ => {
+                let id = self.take_card_id();
+                self.model.cards.push(Card {
+                    id,
+                    kind: if ok {
+                        CardKind::Output
+                    } else {
+                        CardKind::Error
+                    },
+                    title: "Tool Output".to_string(),
+                    body,
+                    status: Some((outcome, ok)),
+                    collapsed: true,
+                });
+            }
+        }
+        self.trim_history();
+        self.draw()
+    }
+
+    /// Flips the fold on the newest card that has anything folded away.
+    fn toggle_last_card(&mut self) -> Result<bool> {
+        let Some(card) = self
+            .model
+            .cards
+            .iter_mut()
+            .rev()
+            .find(|card| card.foldable_rows() > 0)
+        else {
+            return Ok(false);
+        };
+        card.collapsed = !card.collapsed;
+        self.draw()?;
+        Ok(true)
+    }
+
+    /// Flips the fold on whichever card was drawn at `row`, for click-to-expand.
+    fn toggle_card_at_row(&mut self, row: u16) -> Result<bool> {
+        let Some((_, id)) = self.last_card_rows.iter().find(|(y, _)| *y == row).copied() else {
+            return Ok(false);
+        };
+        let Some(card) = self.model.cards.iter_mut().find(|card| card.id == id) else {
+            return Ok(false);
+        };
+        if card.foldable_rows() == 0 {
+            return Ok(false);
+        }
+        card.collapsed = !card.collapsed;
+        self.draw()?;
+        Ok(true)
     }
 
     fn set_last_collapsed(&mut self, collapsed: bool) -> Result<bool> {
@@ -506,15 +610,41 @@ impl ChatUi {
     }
 
     pub fn tool_call(&mut self, name: &str, args: &str) -> Result<()> {
-        self.card(CardKind::Tool, format!("Tool: {name}"), args)
+        match self.fullscreen.as_ref() {
+            Some(screen) => {
+                lock_screen(screen).add_card(CardKind::Tool, tool_header(name, args), args)
+            }
+            None => {
+                print!(
+                    "{}",
+                    crate::render::render_tool_call(name, args, self.plain)
+                );
+                Ok(())
+            }
+        }
     }
 
-    pub fn tool_output(&mut self, text: &str) -> Result<()> {
-        self.card(CardKind::Output, "Tool Output", text)
-    }
-
-    pub fn tool_error(&mut self, text: &str) -> Result<()> {
-        self.card(CardKind::Error, "Error", text)
+    /// Reports a finished tool: `outcome` is the one-line result summary and always stays
+    /// visible, `text` is the output hidden behind the fold. In plain (non-TUI) mode both are
+    /// printed, matching the previous line-oriented output.
+    pub fn tool_finished(&mut self, outcome: &str, ok: bool, text: &str) -> Result<()> {
+        match self.fullscreen.as_ref() {
+            Some(screen) => {
+                lock_screen(screen).finish_tool(outcome.to_string(), ok, text.to_string())
+            }
+            None => {
+                if !text.is_empty() {
+                    if ok {
+                        print!("{}", crate::render::render_tool_output(text, self.plain));
+                    } else {
+                        print!("{}", crate::render::render_error(text, self.plain));
+                    }
+                }
+                println!("{outcome}");
+                io::stdout().flush().ok();
+                Ok(())
+            }
+        }
     }
 
     pub fn expand_last(&mut self) -> Result<bool> {
@@ -612,6 +742,19 @@ impl ChatUi {
     }
 
     /// Per-warning detail lines (paths + reasons).
+    /// Replaces the warning banner wholesale. `/warnings fix` re-checks the skills after the
+    /// repair turn, and a banner that still lists folders which now load is worse than none.
+    pub fn set_warnings(&mut self, lines: Vec<String>) -> Result<()> {
+        match self.fullscreen.as_ref() {
+            Some(screen) => {
+                let mut screen = lock_screen(screen);
+                screen.model.warnings = lines;
+                screen.draw()
+            }
+            None => Ok(()),
+        }
+    }
+
     pub fn set_warning_details(&mut self, details: Vec<String>) -> Result<()> {
         match self.fullscreen.as_ref() {
             Some(screen) => {
@@ -672,9 +815,11 @@ impl ChatUi {
                 let body = body.into();
                 let rendered = match kind {
                     CardKind::User => crate::render::render_user_prompt(&body, self.plain),
-                    CardKind::Tool => {
-                        crate::render::render_tool_call(&title[6..], &body, self.plain)
-                    }
+                    CardKind::Tool => crate::render::render_tool_call(
+                        title.strip_prefix("Tool: ").unwrap_or(&title),
+                        &body,
+                        self.plain,
+                    ),
                     CardKind::Output => crate::render::render_tool_output(&body, self.plain),
                     CardKind::Error => crate::render::render_error(&body, self.plain),
                 };
@@ -1107,10 +1252,11 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         height,
     };
     frame.render_widget(Clear, box_area);
-    let rows: [(&str, &str); 12] = [
+    let rows: [(&str, &str); 13] = [
         ("Enter", "send message"),
         ("Ctrl+K", "switch model"),
         ("Ctrl+S", "resume a session"),
+        ("Ctrl+O / click", "expand or fold tool output"),
         ("?", "toggle this help"),
         ("Tab", "accept slash completion"),
         ("\u{2191}/\u{2193}", "history / menu navigation"),
@@ -1195,6 +1341,11 @@ fn input_thread(
                 Ok(Event::Mouse(mouse)) => match mouse.kind {
                     MouseEventKind::ScrollUp => scroll_screen(&screen, 3),
                     MouseEventKind::ScrollDown => scroll_screen(&screen, -3),
+                    // Click-to-expand: the row map from the last draw resolves the pointer to
+                    // a card id, so folds open without leaving the mouse.
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let _ = lock_screen(&screen.0).toggle_card_at_row(mouse.row);
+                    }
                     _ => {}
                 },
                 Ok(_) => {}
@@ -1343,6 +1494,10 @@ fn input_thread(
                 drop(sc);
                 let _ = screen.draw_now();
             }
+            continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+            let _ = lock_screen(&screen.0).toggle_last_card();
             continue;
         }
         if key.code == KeyCode::Char('?') && buf.is_empty() {
@@ -1556,15 +1711,23 @@ impl ScreenHandle {
     }
 }
 
-/// Returns how many transcript rows are visible, so the input loop can page by a real
-/// viewport.
-fn render(frame: &mut Frame<'_>, model: &Model) -> usize {
+/// What one draw learned about the frame: the transcript viewport height (PageUp/PageDown
+/// page by it) and which card owns each drawn row (a click resolves through it).
+#[derive(Default)]
+struct RenderInfo {
+    viewport_rows: usize,
+    card_rows: Vec<(u16, u64)>,
+}
+
+fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     // OpenCode layout: transcript on top, autocomplete menu above the bordered editor, a
     // one-line footer, and the sidebar rail splitting the body horizontally.
     let popup_height = menu_height(model.ac_items.len());
     // Multiline editor: grows with the buffer's newlines (backslash-newline continuation).
-    let input_lines = model.input.lines().count().max(1);
-    let editor_rows = (input_lines as u16).min(6) + 2;
+    // Split the same way `editor_widget` does: `lines()` drops a trailing empty segment, which
+    // would leave the caret a row below the text after the buffer ends with a newline.
+    let input_lines = model.input.split('\n').count().max(1);
+    let editor_rows = (input_lines.min(EDITOR_VISIBLE_LINES) as u16) + 2;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1591,23 +1754,32 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> usize {
         _ => (body_area, None),
     };
 
+    let mut card_rows: Vec<(u16, u64)> = Vec::new();
     if model.intro && model.cards.is_empty() {
         frame.render_widget(intro_paragraph(model, body_area), body_area);
     } else {
         // Wrap every row ourselves so viewport math is exact (Paragraph's own wrap happens
         // after scroll offsets, which makes bottom-follow drift on long wrapped lines).
-        let transcript = transcript_text(model, transcript_area.width);
-        let mut rows: Vec<Line<'static>> = Vec::with_capacity(transcript.lines.len());
-        for line in &transcript.lines {
+        // Each source line carries its owning card, so wrapping cannot lose the attribution
+        // a click needs.
+        let transcript = transcript_rows(model, transcript_area.width);
+        let mut rows: Vec<(Line<'static>, Option<u64>)> = Vec::with_capacity(transcript.len());
+        for (line, owner) in &transcript {
             for row in wrap_spans(&line.spans, transcript_area.width.max(1) as usize) {
-                rows.push(Line::from(row));
+                rows.push((Line::from(row), *owner));
             }
         }
         let visible = transcript_area.height as usize;
         let start = rows
             .len()
             .saturating_sub(visible.saturating_add(model.scroll_from_bottom));
-        let window: Vec<Line<'static>> = rows.into_iter().skip(start).take(visible).collect();
+        let mut window: Vec<Line<'static>> = Vec::with_capacity(visible);
+        for (offset, (line, owner)) in rows.into_iter().skip(start).take(visible).enumerate() {
+            if let Some(id) = owner {
+                card_rows.push((transcript_area.y + offset as u16, id));
+            }
+            window.push(line);
+        }
         frame.render_widget(Paragraph::new(Text::from(window)), transcript_area);
     }
     if let Some(area) = sidebar_area {
@@ -1623,9 +1795,16 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> usize {
         let inner = editor_area.width.saturating_sub(4).max(1) as usize;
         let segments: Vec<&str> = model.input.split('\n').collect();
         let last = segments.last().copied().unwrap_or("");
-        let row = editor_area.y + 1 + segments.len().saturating_sub(1).min(4) as u16;
+        // The editor block draws a LEFT border: one column, no rows. Text then starts after the
+        // two-cell row prefix, so the caret belongs at x + 3 on the block's own first row --
+        // the previous `y + 1` aimed at a top border that this block never draws.
+        let row = editor_area.y
+            + segments
+                .len()
+                .saturating_sub(1)
+                .min(EDITOR_VISIBLE_LINES - 1) as u16;
         let col =
-            editor_area.x + 2 + UnicodeWidthStr::width(input_tail(last, inner)).min(inner) as u16;
+            editor_area.x + 3 + UnicodeWidthStr::width(input_tail(last, inner)).min(inner) as u16;
         frame.set_cursor_position((
             col.min(editor_area.right().saturating_sub(1)),
             row.min(editor_area.bottom().saturating_sub(1)),
@@ -1644,26 +1823,32 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> usize {
         render_dialog(frame, dialog, frame.area());
     }
 
-    if model.intro && model.cards.is_empty() {
-        0
-    } else {
-        body_area.height as usize
+    RenderInfo {
+        viewport_rows: if model.intro && model.cards.is_empty() {
+            0
+        } else {
+            body_area.height as usize
+        },
+        card_rows,
     }
 }
 
+/// How many buffer rows the editor shows at once; longer buffers scroll to the newest.
+const EDITOR_VISIBLE_LINES: usize = 5;
+
 /// The opencode-style prompt: left accent border, element background, `❯` glyph with the live
-/// buffer, and a meta line pairing session info with key hints.
+/// buffer, and the caret sitting at the end of the buffer.
 fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
     // Horizontal viewport: keep the caret (always at the end of the buffer) on screen.
-    let thinking = match model.thinking {
-        Some((frame_idx, label)) => Line::from(vec![
+    let rows: Vec<Line<'static>> = match model.thinking {
+        Some((frame_idx, label)) => vec![Line::from(vec![
             Span::styled(
                 format!("{} ", SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()]),
                 Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
             ),
             Span::styled(label.to_string(), Style::default().fg(MUTED)),
-        ]),
-        None if model.input.is_empty() => Line::from(vec![
+        ])],
+        None if model.input.is_empty() => vec![Line::from(vec![
             Span::styled(
                 "\u{276f} ".to_string(),
                 Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
@@ -1672,33 +1857,45 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
                 "type a message, or / for commands".to_string(),
                 Style::default().add_modifier(Modifier::DIM),
             ),
-        ]),
+        ])],
         None => {
-            // Render every newline segment; viewport shows the last few lines.
+            // One row per newline segment, newest rows kept in view. Joining the segments into
+            // a single Line (as this did) collapsed a multi-line buffer onto one row while the
+            // caret was still placed per segment, so the two disagreed about where text was.
             let inner = area.width.saturating_sub(4).max(1) as usize;
             let segments: Vec<&str> = model.input.split('\n').collect();
-            let first = segments.len().saturating_sub(5);
-            let mut spans = vec![Span::styled(
-                "\u{276f} ".to_string(),
-                Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
-            )];
-            for (i, seg) in segments[first..].iter().enumerate() {
-                if i > 0 {
-                    spans.push(Span::raw("  "));
-                }
-                spans.push(Span::styled(
-                    if i + 1 == segments[first..].len() {
-                        input_tail(seg, inner).to_string()
-                    } else {
-                        (*seg).to_string()
-                    },
-                    Style::default().fg(TEXT),
-                ));
-            }
-            Line::from(spans)
+            let first = segments.len().saturating_sub(EDITOR_VISIBLE_LINES);
+            let last = segments.len().saturating_sub(1);
+            segments[first..]
+                .iter()
+                .enumerate()
+                .map(|(offset, seg)| {
+                    let idx = first + offset;
+                    Line::from(vec![
+                        // Continuation rows repeat the prompt glyph's width so the text column
+                        // -- and therefore the caret column -- is the same on every row.
+                        if idx == 0 {
+                            Span::styled(
+                                "\u{276f} ".to_string(),
+                                Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+                            )
+                        } else {
+                            Span::raw("  ".to_string())
+                        },
+                        Span::styled(
+                            if idx == last {
+                                input_tail(seg, inner).to_string()
+                            } else {
+                                (*seg).to_string()
+                            },
+                            Style::default().fg(TEXT),
+                        ),
+                    ])
+                })
+                .collect()
         }
     };
-    Paragraph::new(Text::from(vec![thinking]))
+    Paragraph::new(Text::from(rows))
         .style(Style::default().bg(BG_ELEMENT))
         .block(
             Block::default()
@@ -1891,39 +2088,47 @@ fn footer_widget(model: &Model) -> Paragraph<'static> {
     Paragraph::new(Line::from(spans))
 }
 
-fn transcript_text(model: &Model, width: u16) -> Text<'static> {
+/// Every transcript line paired with the card it belongs to (`None` for notices and warnings,
+/// which fold nothing and so are not click targets).
+fn transcript_rows(model: &Model, width: u16) -> Vec<(Line<'static>, Option<u64>)> {
     let inner_width = width.max(20) as usize;
-    let mut lines = Vec::new();
+    let mut lines: Vec<(Line<'static>, Option<u64>)> = Vec::new();
     for card in &model.cards {
-        lines.extend(card_lines(card, inner_width));
-        lines.push(Line::from(""));
+        let owner = (card.foldable_rows() > 0).then_some(card.id);
+        for line in card_lines(card, inner_width) {
+            lines.push((line, owner));
+        }
+        lines.push((Line::from(""), None));
     }
     // Status notes render as quiet plain lines, opencode-style. Split on newlines here:
     // ratatui Span content silently drops embedded newlines, so they must become
     // separate Lines before construction.
     for notice in &model.notices {
         for row in notice.split('\n') {
-            lines.push(Line::styled(row.to_string(), Style::default().fg(MUTED)));
+            lines.push((
+                Line::styled(row.to_string(), Style::default().fg(MUTED)),
+                None,
+            ));
         }
     }
     if model.warnings_visible {
         for warning in &model.warnings {
-            lines.push(Line::styled(
-                format!("\u{26a0} {warning}"),
-                Style::default().fg(WARN),
+            lines.push((
+                Line::styled(format!("\u{26a0} {warning}"), Style::default().fg(WARN)),
+                None,
             ));
         }
         if model.warning_details_visible {
             for detail in &model.warning_details {
-                lines.push(Line::from(""));
-                lines.push(Line::styled(
-                    format!("  ↳ {detail}"),
-                    Style::default().fg(MUTED),
+                lines.push((Line::from(""), None));
+                lines.push((
+                    Line::styled(format!("  \u{21b3} {detail}"), Style::default().fg(MUTED)),
+                    None,
                 ));
             }
         }
     }
-    Text::from(lines)
+    lines
 }
 
 /// OpenCode's chat grammar (internal/tui/components/chat/message.go): every message is a thick
@@ -1932,6 +2137,18 @@ fn transcript_text(model: &Model, width: u16) -> Text<'static> {
 const THICK_BORDER: &str = "\u{258c} ";
 /// Rows shown for a folded card before the expand hint.
 const COLLAPSED_PEEK: usize = 2;
+
+/// One-line call header: the tool name plus a trimmed peek at its arguments, so a folded card
+/// still says what ran and against what.
+fn tool_header(name: &str, args: &str) -> String {
+    let compact = args.split_whitespace().collect::<Vec<_>>().join(" ");
+    let compact = crate::tui::truncate_chars(&compact, 60);
+    if compact.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}  {compact}")
+    }
+}
 
 fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
     let (border, body_style) = if card.title == "Assistant" {
@@ -1968,24 +2185,53 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
         return out;
     }
 
-    // First line carries the role label, opencode-style ("Bash: cmd", user just speaks).
+    // Tool cards lead with their own header row. Without it a finished call reduced to a
+    // bare outcome ("completed - 0ms - 332 chars") that never said which tool produced it.
+    if matches!(card.kind, CardKind::Tool) && !card.title.is_empty() {
+        push_bordered(
+            &mut out,
+            vec![Span::styled(
+                card.title.clone(),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            )],
+        );
+    }
+    // The outcome stays visible whether or not the output is folded: how a tool ended is the
+    // part worth reading at a glance, and it used to be a detached notice further down.
+    if let Some((status, ok)) = &card.status {
+        push_bordered(
+            &mut out,
+            vec![Span::styled(
+                format!("{} {status}", if *ok { "\u{2713}" } else { "\u{2717}" }),
+                Style::default().fg(if *ok { GREEN } else { RED }),
+            )],
+        );
+    }
+
     let total_lines = card.body.lines().count();
     if card.collapsed {
-        for source in card.body.lines().take(COLLAPSED_PEEK) {
+        // A card that already shows an outcome needs no peek: it folds to two tidy rows and
+        // opens on demand. Cards without one keep the old head window.
+        let peek = if card.status.is_some() {
+            0
+        } else {
+            COLLAPSED_PEEK
+        };
+        for source in card.body.lines().take(peek) {
             for row in wrap_display(source, width.saturating_sub(4)) {
                 push_bordered(&mut out, vec![Span::styled(row, body_style)]);
             }
         }
-        push_bordered(
-            &mut out,
-            vec![Span::styled(
-                format!(
-                    "\u{2026} {} more line(s) \u{b7} /expand",
-                    total_lines.saturating_sub(COLLAPSED_PEEK)
-                ),
-                Style::default().fg(GREEN),
-            )],
-        );
+        let hidden = total_lines.saturating_sub(peek);
+        if hidden > 0 && !card.body.trim().is_empty() {
+            push_bordered(
+                &mut out,
+                vec![Span::styled(
+                    format!("\u{2026} {hidden} more line(s) \u{b7} ctrl+o or click"),
+                    Style::default().fg(GREEN),
+                )],
+            );
+        }
         return out;
     }
 
@@ -2179,6 +2425,252 @@ fn wrap_display(text: &str, width: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Draws one frame into a test backend and reports where the terminal caret ended up
+    /// together with the row it landed on, so caret and text can be compared directly.
+    fn caret_and_row(model: &Model) -> ((u16, u16), String) {
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, model);
+            })
+            .expect("draw");
+        let pos = terminal.get_cursor_position().expect("caret");
+        let buffer = terminal.backend().buffer().clone();
+        let row: String = (0..60).map(|x| buffer[(x, pos.y)].symbol()).collect();
+        ((pos.x, pos.y), row)
+    }
+
+    /// Collects a card's rendered rows as plain strings.
+    fn rendered(card: &Card, width: usize) -> Vec<String> {
+        card_lines(card, width)
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn folded_tool_card_still_names_the_tool_and_its_outcome() {
+        // The reported problem: a finished call collapsed to a bare "completed - 0ms - 332
+        // chars" with no way to tell which tool it belonged to.
+        let card = Card {
+            id: 7,
+            kind: CardKind::Tool,
+            title: tool_header("read_file", r#"{"path": "src/main.rs"}"#),
+            body: (1..=20)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            status: Some(("completed \u{b7} 28.0s \u{b7} 142 chars".into(), true)),
+            collapsed: true,
+        };
+        let rows = rendered(&card, 70);
+        assert_eq!(rows.len(), 3, "header + outcome + fold hint: {rows:?}");
+        assert!(
+            rows[0].contains("read_file"),
+            "header names the tool: {rows:?}"
+        );
+        assert!(
+            rows[0].contains("src/main.rs"),
+            "header peeks at args: {rows:?}"
+        );
+        assert!(
+            rows[1].contains("completed"),
+            "outcome stays visible: {rows:?}"
+        );
+        assert!(
+            rows[1].contains('\u{2713}'),
+            "outcome is marked as success: {rows:?}"
+        );
+        assert!(
+            rows[2].contains("20 more line(s)"),
+            "everything else folds: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn failed_tool_card_marks_the_outcome_and_keeps_the_detail_foldable() {
+        let card = Card {
+            id: 8,
+            kind: CardKind::Tool,
+            title: tool_header("run_command", r#"{"command": "cargo test"}"#),
+            body: "thread 'main' panicked\nstack backtrace follows".into(),
+            status: Some(("failed \u{b7} 1.2s".into(), false)),
+            collapsed: true,
+        };
+        let rows = rendered(&card, 70);
+        assert!(rows[1].contains('\u{2717}'), "failure is marked: {rows:?}");
+        assert!(
+            rows[1].contains("failed"),
+            "outcome says it failed: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| !row.contains("panicked")),
+            "detail stays folded until asked for: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn unfolding_a_card_reveals_the_body_under_the_outcome() {
+        let mut card = Card {
+            id: 9,
+            kind: CardKind::Tool,
+            title: tool_header("grep", "pattern"),
+            body: "hit one\nhit two".into(),
+            status: Some(("completed \u{b7} 3ms \u{b7} 15 chars".into(), true)),
+            collapsed: false,
+        };
+        let rows = rendered(&card, 70);
+        assert!(rows.iter().any(|row| row.contains("hit one")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("hit two")), "{rows:?}");
+        card.collapsed = true;
+        assert!(
+            rendered(&card, 70)
+                .iter()
+                .all(|row| !row.contains("hit one")),
+            "folding hides the body again"
+        );
+    }
+
+    #[test]
+    fn drawn_rows_map_back_to_their_card_for_click_targeting() {
+        let model = Model {
+            intro: false,
+            cards: vec![Card {
+                id: 42,
+                kind: CardKind::Tool,
+                title: tool_header("glob", "**/*.rs"),
+                body: (1..=6)
+                    .map(|i| format!("file {i}.rs"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                status: Some(("completed \u{b7} 9ms \u{b7} 60 chars".into(), true)),
+                collapsed: true,
+            }],
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut info = RenderInfo::default();
+        terminal
+            .draw(|frame| {
+                info = render(frame, &model);
+            })
+            .expect("draw");
+        assert!(!info.card_rows.is_empty(), "card rows are recorded");
+        assert!(
+            info.card_rows.iter().all(|(_, id)| *id == 42),
+            "every recorded row belongs to the only card"
+        );
+        // A card with nothing folded away is not a click target.
+        let plain = Model {
+            intro: false,
+            cards: vec![Card {
+                id: 43,
+                kind: CardKind::User,
+                title: "User".into(),
+                body: String::new(),
+                status: None,
+                collapsed: false,
+            }],
+            ..Default::default()
+        };
+        terminal
+            .draw(|frame| {
+                info = render(frame, &plain);
+            })
+            .expect("draw");
+        assert!(
+            info.card_rows.is_empty(),
+            "nothing to expand, nothing to click"
+        );
+    }
+
+    #[test]
+    fn caret_lands_on_the_row_that_holds_the_typed_text() {
+        // Reproduces the slash-menu report: with `/st` typed the caret sat one row below the
+        // text and one column short of its end, because the block draws no top border and the
+        // "\u{276f} " prefix is two cells wide.
+        let model = Model {
+            intro: false,
+            input: "/st".into(),
+            ac_items: vec![
+                ("stats".into(), "Show current session usage".into()),
+                ("status".into(), "Show project and connection status".into()),
+            ],
+            ..Default::default()
+        };
+        let ((x, y), row) = caret_and_row(&model);
+        assert!(
+            row.starts_with("\u{2502}\u{276f} /st"),
+            "caret row holds the buffer: {row:?}"
+        );
+        let buffer_end = ("\u{2502}\u{276f} /st".chars().count()) as u16;
+        assert_eq!(
+            x, buffer_end,
+            "caret sits immediately after the last character"
+        );
+        // And the cell under the caret is still empty, i.e. it did not land on a glyph.
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &model);
+            })
+            .expect("draw");
+        assert_eq!(terminal.backend().buffer()[(x, y)].symbol(), " ");
+    }
+
+    #[test]
+    fn caret_follows_the_last_line_of_a_multiline_buffer() {
+        let model = Model {
+            intro: false,
+            input: "first\nsecond".into(),
+            ..Default::default()
+        };
+        let ((x, y), row) = caret_and_row(&model);
+        assert!(
+            row.starts_with("\u{2502}  second"),
+            "caret row is the last segment: {row:?}"
+        );
+        assert_eq!(x, "\u{2502}  second".chars().count() as u16);
+        // The earlier segment keeps its own row rather than being joined onto this one.
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &model);
+            })
+            .expect("draw");
+        let above: String = (0..60)
+            .map(|col| terminal.backend().buffer()[(col, y - 1)].symbol())
+            .collect();
+        assert!(
+            above.starts_with("\u{2502}\u{276f} first"),
+            "previous segment on its own row: {above:?}"
+        );
+    }
+
+    #[test]
+    fn caret_stays_inside_the_editor_when_the_buffer_ends_with_a_newline() {
+        let model = Model {
+            intro: false,
+            input: "done\n".into(),
+            ..Default::default()
+        };
+        let ((x, y), row) = caret_and_row(&model);
+        assert_eq!(
+            x, 3,
+            "caret rests on the continuation indent of the empty last line"
+        );
+        assert!(
+            row.trim_start_matches('\u{2502}').trim().is_empty(),
+            "last row is the empty segment: {row:?}"
+        );
+        // Height is derived from the same split, so the caret cannot fall past the editor.
+        assert!(y < 12);
+    }
+
     #[test]
     fn wrapping_uses_display_width() {
         let rows = wrap_display("abc界def", 5);
@@ -2188,9 +2680,11 @@ mod tests {
     #[test]
     fn user_cards_use_thick_left_border() {
         let card = Card {
+            id: 1,
             kind: CardKind::User,
             title: "User".into(),
             body: "hello".into(),
+            status: None,
             collapsed: false,
         };
         let lines = card_lines(&card, 20);
@@ -2202,9 +2696,11 @@ mod tests {
     #[test]
     fn assistant_cards_render_unboxed() {
         let card = Card {
+            id: 1,
             kind: CardKind::Output,
             title: "Assistant".into(),
             body: "hello **world**".into(),
+            status: None,
             collapsed: false,
         };
         let lines = card_lines(&card, 40);
@@ -2220,12 +2716,14 @@ mod tests {
     #[test]
     fn collapsed_tool_output_shows_head_window_and_hint() {
         let card = Card {
+            id: 1,
             kind: CardKind::Output,
             title: "Tool Output".into(),
             body: (1..=15)
                 .map(|i| format!("line {i}"))
                 .collect::<Vec<_>>()
                 .join("\n"),
+            status: None,
             collapsed: true,
         };
         let lines = card_lines(&card, 60);
@@ -2233,7 +2731,7 @@ mod tests {
         let last = lines.last().unwrap();
         let text: String = last.spans.iter().map(|s| s.content.to_string()).collect();
         assert!(text.contains("13 more line(s)"));
-        assert!(text.contains("/expand"));
+        assert!(text.contains("ctrl+o"), "fold hint names the key: {text:?}");
     }
 }
 
@@ -2254,7 +2752,7 @@ mod line_tests {
     use super::*;
 
     /// ratatui 0.30 strips embedded newlines from Span content at construction. This is WHY
-    /// multi-line notices are split into separate Lines in transcript_text.
+    /// multi-line notices are split into separate Lines in transcript_rows.
     #[test]
     fn line_styled_strips_embedded_newlines() {
         let line = Line::styled("a\nb\nc".to_string(), Style::default());
@@ -2268,11 +2766,9 @@ mod line_tests {
             notices: vec!["line one\nline two".to_string()],
             ..Model::default()
         };
-        let text = transcript_text(&model, 80);
-        let rendered: Vec<String> = text
-            .lines
+        let rendered: Vec<String> = transcript_rows(&model, 80)
             .iter()
-            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+            .map(|(line, _)| line.spans.iter().map(|sp| sp.content.as_ref()).collect())
             .collect();
         assert!(rendered.contains(&"line one".to_string()));
         assert!(rendered.contains(&"line two".to_string()));

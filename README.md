@@ -440,8 +440,16 @@ Highlights:
   in the global config, then switches to it.
 - **Multiline input** — end a line with `\` and press Enter to continue on the next line; the
   editor box grows as you type.
-- Tool calls fold by default to a two-line peek (`/expand` // `/collapse` toggle the latest card),
-  and multi-line command output renders as proper lines instead of one run-on blob.
+- **Tool cards** — a call and its result are one block: a header naming the tool and its
+  arguments, then an outcome row (`✓ completed · 1.2s · 142 chars`, or `✗ failed · 1.2s`) that
+  stays visible while the output itself stays folded. **`Ctrl+O` or a click** on the card
+  expands or folds it; `/expand` // `/collapse` still toggle the latest card. Multi-line command
+  output renders as proper lines instead of one run-on blob.
+- **Sidebar** — session, id, version, model, project, MCP servers with their live tool counts
+  (a server that failed to start reads `unavailable` rather than quietly disappearing), context
+  usage, and last-turn metrics.
+- **Unknown commands name themselves** and suggest the nearest built-in (`/sesions` → "Did you
+  mean /sessions?").
 
 `-p`, pipes, redirects, and `NO_COLOR` retain the script-friendly line-oriented output path.
 
@@ -468,7 +476,7 @@ Highlights:
 | `/forget <text>` | Forget one remembered fact, or `/forget all` |
 | `/expand` | Expand the latest transcript card |
 | `/collapse` | Collapse the latest transcript card |
-| `/warnings [on\|off\|details\|fix]` | Hide/show, expand details of, or hand skill warnings to Kamui as a repair task |
+| `/warnings [on\|off\|details\|fix]` | Hide/show, expand details of, or hand skill warnings to Kamui as a repair task. After a `fix` turn Kamui reloads the skill loader and reports what actually changed — how many folders now load, how many still fail, and whether the repair broke a folder that used to work — rather than leaving the old warning banner in place |
 | `/help` | List available commands |
 | `/exit` | Save and quit |
 

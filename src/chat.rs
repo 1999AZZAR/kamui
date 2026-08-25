@@ -64,7 +64,10 @@ where
     let mut context_window = active.context_window;
     let job_registry = tools.jobs();
     let command_library = commands::CommandLibrary::load(project.root());
-    let skill_library = crate::skills::SkillLibrary::load(project.root());
+    let mut skill_library = crate::skills::SkillLibrary::load(project.root());
+    // Warnings captured when `/warnings fix` was invoked, so the turn that repairs them can
+    // be compared against a fresh load and reported instead of ending silently.
+    let mut pending_skill_fix: Option<Vec<String>> = None;
     let use_tui = crate::tui::is_interactive();
     let mut chat_ui = crate::ui::ChatUi::new(
         use_tui,
@@ -95,6 +98,7 @@ where
         refresh_session_source(database, hub);
     }
     let ui = Ui::stdio();
+    let mcp_sidebar = mcp_sidebar_value(&mcp_statuses);
     // One tidy startup line instead of a wall of per-skill warnings; /skills still lists every
     // individual reason.
     let skill_warning_count = skill_library.warnings().len();
@@ -174,6 +178,7 @@ where
         &active.model,
         env!("CARGO_PKG_VERSION"),
         project,
+        &mcp_sidebar,
         None,
         context_window,
         None,
@@ -289,14 +294,16 @@ where
                 chat_ui.notice("usage: !<command> runs it in the shell (e.g. !git status)")?;
                 continue;
             }
+            let started = Instant::now();
             let output = tools::run_direct_command(
                 project.root(),
                 direct,
                 Duration::from_secs(config.command_timeout_secs),
             )
             .await;
+            let (outcome, ok) = format_tool_outcome(&output, started.elapsed());
             chat_ui.tool_call("shell", direct)?;
-            chat_ui.tool_output(&output)?;
+            chat_ui.tool_finished(&outcome, ok, tool_body(&output))?;
             continue;
         }
         // Slash commands are UI operations, not conversation turns — opencode hides them
@@ -397,6 +404,7 @@ where
                         &active.model,
                         env!("CARGO_PKG_VERSION"),
                         project,
+                        &mcp_sidebar,
                         None,
                         context_window,
                         None,
@@ -496,7 +504,11 @@ where
                         );
                         if let Some(h) = hub.as_ref() {
                             h.push_prompt(prompt);
-                            chat_ui.notice("Asked Kamui to repair the flagged skills.")?;
+                            pending_skill_fix = Some(skill_library.warnings().to_vec());
+                            chat_ui.notice(&format!(
+                                "Repairing {} flagged skill folder(s) \u{2014} the result is reported when the turn ends.",
+                                skill_library.warnings().len()
+                            ))?;
                         } else {
                             anyhow::bail!("/warnings fix requires interactive TUI mode");
                         }
@@ -724,6 +736,7 @@ where
                     &active.model,
                     env!("CARGO_PKG_VERSION"),
                     project,
+                    &mcp_sidebar,
                     None,
                     context_window,
                     None,
@@ -1079,6 +1092,7 @@ where
                     &active.model,
                     env!("CARGO_PKG_VERSION"),
                     project,
+                    &mcp_sidebar,
                     Some(usage.prompt_tokens),
                     context_window,
                     Some(lt),
@@ -1091,6 +1105,7 @@ where
                     &active.model,
                     env!("CARGO_PKG_VERSION"),
                     project,
+                    &mcp_sidebar,
                     Some(usage.prompt_tokens),
                     context_window,
                     None,
@@ -1349,17 +1364,13 @@ where
                     .get(&call.id)
                     .map(|(_, elapsed)| *elapsed)
                     .unwrap_or_else(|| tool_started.elapsed());
-                if !output.starts_with("Error: ") && !output.is_empty() {
-                    chat_ui.tool_output(&preview_output(&output))?;
-                } else if chat_ui.is_fullscreen() {
-                    chat_ui.tool_error(output.trim_start_matches("Error: "))?;
-                }
-                let outcome = format_tool_outcome(&output, elapsed);
-                if chat_ui.is_fullscreen() {
-                    chat_ui.notice(&outcome)?;
+                let (outcome, ok) = format_tool_outcome(&output, elapsed);
+                let body = if ok {
+                    preview_output(&output)
                 } else {
-                    println!("{outcome}");
-                }
+                    tool_body(&output).to_string()
+                };
+                chat_ui.tool_finished(&outcome, ok, &body)?;
                 let result_message = Message::tool_result(&call.id, output);
                 turn_messages.push(result_message.clone());
                 tool_trail.push(result_message);
@@ -1407,6 +1418,22 @@ where
             active_session.title = make_title(title_source);
         }
         messages.extend(turn_record);
+
+        // A `/warnings fix` turn is only finished once the loader has been asked again: the
+        // agent's own summary is a claim, a fresh load is the evidence.
+        if let Some(before) = pending_skill_fix.take() {
+            skill_library = crate::skills::SkillLibrary::load(project.root());
+            let report = skill_fix_report(&before, skill_library.warnings());
+            chat_ui.notice(&report.summary)?;
+            chat_ui.set_warnings(report.banner.into_iter().collect())?;
+            chat_ui.set_warning_details(
+                skill_library
+                    .warnings()
+                    .iter()
+                    .map(|warning| warning.to_string())
+                    .collect(),
+            )?;
+        }
 
         // Only after the turn is safely persisted: a refresh failure must never cost the exchange.
         if let Some(snapshot) = last_turn_snapshot.as_ref() {
@@ -2008,20 +2035,19 @@ fn handle_command(
                 );
             }
         }
-        _ => out!("Unknown command. Type /help for available commands.\n"),
+        // Name the command and point at the nearest real one. Several rejected commands in a
+        // row produced identical lines with nothing to tell them apart, which is how this was
+        // reported in the first place.
+        _ => match nearest_command(command) {
+            Some(suggestion) => out!(
+                "Unknown command \"{command}\". Did you mean /{suggestion}? Type /help for the \
+                 full list.\n"
+            ),
+            None => out!("Unknown command \"{command}\". Type /help for available commands.\n"),
+        },
     }
 
     if !out_buf.is_empty() {
-        std::fs::write(
-            "/tmp/opencode/flush_debug.txt",
-            format!(
-                "len={} nl={} tui={}",
-                out_buf.len(),
-                out_buf.matches('\n').count(),
-                tui.is_some()
-            ),
-        )
-        .ok();
         match tui {
             Some(ui) => ui.notice(out_buf.trim_end())?,
             None => print!("{out_buf}"),
@@ -2029,6 +2055,45 @@ fn handle_command(
     }
 
     Ok(())
+}
+
+/// The closest built-in to a rejected command: a prefix match first (`/sess` -> `sessions`),
+/// then a small edit distance for typos. `None` when nothing is close enough to suggest.
+fn nearest_command(typed: &str) -> Option<&'static str> {
+    let typed = typed.trim_start_matches('/').to_ascii_lowercase();
+    if typed.is_empty() {
+        return None;
+    }
+    let names = crate::tui::BUILTINS.iter().map(|(name, _)| *name);
+    if let Some(prefix) = names
+        .clone()
+        .filter(|name| name.starts_with(&typed))
+        .min_by_key(|name| name.len())
+    {
+        return Some(prefix);
+    }
+    names
+        .map(|name| (edit_distance(&typed, name), name))
+        .filter(|(distance, _)| *distance <= 2)
+        .min_by_key(|(distance, name)| (*distance, name.len()))
+        .map(|(_, name)| name)
+}
+
+/// Levenshtein distance over chars, two rows at a time. Only ever run against the short
+/// built-in command list, so the quadratic cost is irrelevant.
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0usize; right.len() + 1];
+    for (i, left_char) in left.chars().enumerate() {
+        current[0] = i + 1;
+        for (j, right_char) in right.iter().enumerate() {
+            let substitution = previous[j] + usize::from(left_char != *right_char);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
 }
 
 fn resolve_session(database: &Database, id_prefix: &str) -> Result<Session> {
@@ -2440,6 +2505,28 @@ fn refresh_session_source(database: &Database, hub: &InputHub) {
     }
 }
 
+/// The sidebar's MCP block: one row per configured server with its live tool count, and an
+/// explicit "unavailable" for one that failed to start. A server that simply vanishes from the
+/// rail is indistinguishable from one that was never configured.
+fn mcp_sidebar_value(statuses: &[ConnectionStatus]) -> String {
+    statuses
+        .iter()
+        .map(|server| match &server.error {
+            Some(_) => format!("{} · unavailable", server.name),
+            None => format!(
+                "{} · {} tool(s){}",
+                server.name,
+                server.tool_count,
+                if server.trusted { " · trusted" } else { "" }
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn update_sidebar(
     chat_ui: &mut ChatUi,
@@ -2447,6 +2534,7 @@ fn update_sidebar(
     model: &str,
     version: &str,
     project: &ProjectContext,
+    mcp: &str,
     last_input_tokens: Option<u64>,
     context_window: Option<u64>,
     last_turn: Option<String>,
@@ -2467,6 +2555,9 @@ fn update_sidebar(
     entries.push(("Version".to_string(), format!("v{version}")));
     entries.push(("Model".to_string(), model.to_string()));
     entries.push(("Project".to_string(), display_path(project.root())));
+    if !mcp.is_empty() {
+        entries.push(("MCP".to_string(), mcp.to_string()));
+    }
     let context_line = match (last_input_tokens, context_window) {
         (Some(tokens), Some(window)) => {
             format!(
@@ -2535,15 +2626,86 @@ fn format_usage(
     line
 }
 
-fn format_tool_outcome(output: &str, elapsed: Duration) -> String {
-    match output.strip_prefix("Error: ") {
-        Some(error) => format!("failed · {} · {error}", format_duration(elapsed)),
-        None => format!(
-            "completed · {} · {} chars",
-            format_duration(elapsed),
-            output.chars().count()
-        ),
+/// The one-line result summary plus whether the call succeeded. Failure detail is left to
+/// the card body: a long provider error used to be pasted into this line, and this is the
+/// row that has to stay readable at a glance.
+fn format_tool_outcome(output: &str, elapsed: Duration) -> (String, bool) {
+    if output.starts_with("Error: ") {
+        (format!("failed · {}", format_duration(elapsed)), false)
+    } else {
+        (
+            format!(
+                "completed · {} · {} chars",
+                format_duration(elapsed),
+                output.chars().count()
+            ),
+            true,
+        )
     }
+}
+
+/// What a `/warnings fix` turn achieved, measured by reloading the skill library rather than
+/// by trusting the agent's own account of it.
+struct SkillFixReport {
+    summary: String,
+    /// Replacement warning banner: empty once every flagged folder loads.
+    banner: Option<String>,
+}
+
+/// The stable part of a skill warning: which folder it concerns, without the reason. A folder
+/// that fails for a *different* reason after the repair has still not been fixed.
+fn skill_warning_key(warning: &str) -> &str {
+    for marker in [" is missing", " could not be read", " is invalid"] {
+        if let Some(index) = warning.find(marker) {
+            return &warning[..index];
+        }
+    }
+    warning
+}
+
+fn skill_fix_report(before: &[String], after: &[String]) -> SkillFixReport {
+    let before_keys: HashSet<&str> = before.iter().map(|w| skill_warning_key(w)).collect();
+    let after_keys: HashSet<&str> = after.iter().map(|w| skill_warning_key(w)).collect();
+    let repaired = before_keys.difference(&after_keys).count();
+    let broke = after_keys.difference(&before_keys).count();
+
+    let mut summary = if repaired == 0 {
+        format!(
+            "Skill repair: nothing fixed \u{2014} {} of {} folder(s) still fail to load.",
+            after_keys.len(),
+            before_keys.len()
+        )
+    } else if after_keys.is_empty() {
+        format!("Skill repair: all {repaired} folder(s) now load. Restart Kamui to use them.")
+    } else {
+        format!(
+            "Skill repair: {repaired} of {} folder(s) fixed, {} still failing.",
+            before_keys.len(),
+            after_keys.len()
+        )
+    };
+    if broke > 0 {
+        summary.push_str(&format!(
+            " {broke} folder(s) newly broken \u{2014} /warnings details."
+        ));
+    }
+    if !after_keys.is_empty() {
+        summary.push_str(" /warnings details lists what is left.");
+    }
+    SkillFixReport {
+        summary,
+        banner: (!after.is_empty()).then(|| {
+            format!(
+                "{} skill folder(s) skipped (invalid name or frontmatter) \u{2014} /warnings details, /warnings fix",
+                after.len()
+            )
+        }),
+    }
+}
+
+/// A tool result stripped of its `Error: ` marker, which the outcome row already conveys.
+fn tool_body(output: &str) -> &str {
+    output.strip_prefix("Error: ").unwrap_or(output)
 }
 
 /// Fold one agent-loop round's usage into the turn total: output tokens accumulate across every
@@ -3878,6 +4040,157 @@ mod tests {
     use crate::pricing::ModelPrice;
     use std::fs;
     use uuid::Uuid;
+
+    #[test]
+    fn every_advertised_command_is_dispatched_somewhere() {
+        // The slash menu and the dispatcher drifting apart is what makes a listed command come
+        // back as "Unknown command", so hold them together here.
+        let source = include_str!("chat.rs");
+        for (name, _) in crate::tui::BUILTINS {
+            let inline = source.contains(&format!("command == \"/{name}\""));
+            let arm = source.contains(&format!("\"/{name}\" =>"));
+            let early = source.contains(&format!("input == \"/{name}\""));
+            assert!(
+                inline || arm || early,
+                "/{name} is offered by the slash menu but nothing handles it"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_commands_suggest_the_nearest_builtin() {
+        assert_eq!(nearest_command("/sess"), Some("sessions"));
+        assert_eq!(nearest_command("/sesions"), Some("sessions"));
+        assert_eq!(nearest_command("/stat"), Some("stats"));
+        // Two edits away still earns a suggestion: /quit is a common try for /exit.
+        assert_eq!(nearest_command("/quit"), Some("exit"));
+        assert_eq!(
+            nearest_command("/deploy"),
+            None,
+            "nothing close enough to guess"
+        );
+        assert_eq!(nearest_command("/"), None);
+    }
+
+    #[test]
+    fn edit_distance_counts_single_character_edits() {
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("abc", "abc"), 0);
+        assert_eq!(edit_distance("abc", "abd"), 1);
+        assert_eq!(edit_distance("ab", "abc"), 1);
+    }
+
+    fn status(name: &str, tools: usize, trusted: bool, error: Option<&str>) -> ConnectionStatus {
+        ConnectionStatus {
+            name: name.to_string(),
+            tool_count: tools,
+            trusted,
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn mcp_sidebar_lists_every_server_with_its_tool_count() {
+        let value = mcp_sidebar_value(&[
+            status("mcptools", 79, false, None),
+            status("filesystem", 11, true, None),
+        ]);
+        let rows: Vec<&str> = value.split('\n').collect();
+        assert_eq!(rows.len(), 2, "one row per server: {rows:?}");
+        assert!(
+            rows[0].contains("mcptools") && rows[0].contains("79 tool(s)"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[1].contains("trusted"),
+            "trusted servers say so: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_sidebar_names_a_server_that_failed_to_start() {
+        // Dropping it would make a broken server look like an unconfigured one.
+        let value = mcp_sidebar_value(&[status("excel", 0, false, Some("spawn failed"))]);
+        assert!(value.contains("excel"), "{value}");
+        assert!(value.contains("unavailable"), "{value}");
+    }
+
+    #[test]
+    fn mcp_sidebar_is_empty_without_servers() {
+        assert!(mcp_sidebar_value(&[]).is_empty());
+    }
+
+    fn warn(folder: &str, reason: &str) -> String {
+        format!("skill '{folder}' in /skills {reason}")
+    }
+
+    #[test]
+    fn skill_fix_report_counts_a_full_repair() {
+        let before = vec![
+            warn("alpha", "is invalid: missing name"),
+            warn("beta", "is missing SKILL.md"),
+        ];
+        let report = skill_fix_report(&before, &[]);
+        assert!(
+            report.summary.contains("all 2 folder(s) now load"),
+            "{}",
+            report.summary
+        );
+        assert!(report.banner.is_none(), "banner clears once nothing fails");
+    }
+
+    #[test]
+    fn skill_fix_report_counts_a_partial_repair() {
+        let before = vec![
+            warn("alpha", "is invalid: missing name"),
+            warn("beta", "is missing SKILL.md"),
+            warn("gamma", "is invalid: missing description"),
+        ];
+        let after = vec![warn("gamma", "is invalid: missing description")];
+        let report = skill_fix_report(&before, &after);
+        assert!(
+            report
+                .summary
+                .contains("2 of 3 folder(s) fixed, 1 still failing"),
+            "{}",
+            report.summary
+        );
+        assert!(
+            report.banner.is_some(),
+            "banner still names the remaining failure"
+        );
+    }
+
+    #[test]
+    fn a_folder_failing_for_a_new_reason_does_not_count_as_fixed() {
+        // The agent rewrote the frontmatter but broke it differently. Comparing whole warning
+        // strings would call that a fix; comparing the folder they name does not.
+        let before = vec![warn("alpha", "is missing SKILL.md")];
+        let after = vec![warn("alpha", "is invalid: missing description")];
+        let report = skill_fix_report(&before, &after);
+        assert!(
+            report.summary.contains("nothing fixed"),
+            "{}",
+            report.summary
+        );
+    }
+
+    #[test]
+    fn skill_fix_report_flags_folders_broken_by_the_repair() {
+        let before = vec![warn("alpha", "is missing SKILL.md")];
+        let after = vec![warn("beta", "is invalid: missing name")];
+        let report = skill_fix_report(&before, &after);
+        assert!(
+            report.summary.contains("1 of 1 folder(s) fixed"),
+            "{}",
+            report.summary
+        );
+        assert!(
+            report.summary.contains("newly broken"),
+            "{}",
+            report.summary
+        );
+    }
 
     fn temporary_directory() -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("kamui-status-{}", Uuid::new_v4()));
