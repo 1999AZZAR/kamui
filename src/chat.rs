@@ -920,6 +920,12 @@ where
         }
         let mut turn_messages = vec![Message::system(system)];
         turn_messages.extend(messages[summarized_upto..].iter().cloned());
+        // Say what was attached. The prompt text only ever shows what was typed (`@clipboard`,
+        // `@shot.png`), so without this there is nothing to tell you whether an image was
+        // actually picked up, how big it was, or that it needs a vision model to be read.
+        if let Some(note) = describe_attachments(&expanded.images) {
+            chat_ui.notice(&note)?;
+        }
         turn_messages.push(Message::user_with_images(expanded.text, expanded.images));
 
         // Agent loop: stream a turn, run any tools it requests, and repeat until a plain answer.
@@ -1605,6 +1611,9 @@ where
         system.push_str(&memory_snapshot);
     }
     let mut turn_messages = vec![Message::system(system)];
+    if let Some(note) = describe_attachments(&expanded.images) {
+        println!("{note}");
+    }
     turn_messages.push(Message::user_with_images(expanded.text, expanded.images));
 
     let user_message = Message::user(prompt);
@@ -2764,6 +2773,37 @@ fn skill_fix_report(before: &[String], after: &[String]) -> SkillFixReport {
                 after.len()
             )
         }),
+    }
+}
+
+/// A one-line summary of what a prompt is carrying besides text. `None` when it carries only
+/// text, so the ordinary case stays silent.
+fn describe_attachments(images: &[crate::provider::ImageAttachment]) -> Option<String> {
+    if images.is_empty() {
+        return None;
+    }
+    let kinds: Vec<String> = images
+        .iter()
+        .map(|image| {
+            // `data` is base64, which costs four characters per three bytes.
+            let bytes = image.data.len() / 4 * 3;
+            format!("{} ~{}", image.media_type, format_bytes(bytes))
+        })
+        .collect();
+    Some(format!(
+        "\u{1f4ce} {} image(s) attached ({}) \u{2014} needs a vision model",
+        images.len(),
+        kinds.join(", ")
+    ))
+}
+
+fn format_bytes(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{} KiB", bytes / 1024)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -4113,6 +4153,45 @@ mod tests {
             total_tokens: 100,
             updated_at: 0,
         }
+    }
+
+    fn image(media: &str, decoded_bytes: usize) -> crate::provider::ImageAttachment {
+        crate::provider::ImageAttachment {
+            media_type: media.to_string(),
+            // Base64 spends four characters per three bytes.
+            data: "A".repeat(decoded_bytes / 3 * 4),
+        }
+    }
+
+    #[test]
+    fn a_text_only_prompt_says_nothing_about_attachments() {
+        assert!(describe_attachments(&[]).is_none());
+    }
+
+    #[test]
+    fn attached_images_are_reported_with_type_and_size() {
+        // `@clipboard` and `@shot.png` look like plain text in the transcript, so the only way
+        // to know an image was picked up is for the attachment to announce itself.
+        let note = describe_attachments(&[image("image/png", 210 * 1024)]).expect("a note");
+        assert!(note.contains("1 image(s)"), "{note}");
+        assert!(note.contains("image/png"), "{note}");
+        assert!(note.contains("KiB"), "{note}");
+        assert!(
+            note.contains("vision model"),
+            "the requirement is stated: {note}"
+        );
+
+        let two = describe_attachments(&[image("image/png", 1024), image("image/jpeg", 2048)])
+            .expect("a note");
+        assert!(two.contains("2 image(s)"), "{two}");
+        assert!(two.contains("image/jpeg"), "{two}");
+    }
+
+    #[test]
+    fn byte_sizes_scale_to_readable_units() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(2048), "2 KiB");
+        assert_eq!(format_bytes(3 * 1024 * 1024), "3.0 MiB");
     }
 
     #[test]

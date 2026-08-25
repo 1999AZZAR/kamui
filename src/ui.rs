@@ -3,8 +3,8 @@ use anyhow::{Context, Result};
 use crossterm::{
     cursor::SetCursorStyle,
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -266,6 +266,7 @@ impl FullScreen {
             let _ = execute!(
                 io::stdout(),
                 SetCursorStyle::DefaultUserShape,
+                DisableBracketedPaste,
                 LeaveAlternateScreen,
                 DisableMouseCapture
             );
@@ -277,6 +278,7 @@ impl FullScreen {
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
+            EnableBracketedPaste,
             SetCursorStyle::BlinkingBar
         )
         .context("could not enter alternate screen")?;
@@ -600,6 +602,7 @@ impl FullScreen {
         let _ = execute!(
             self.terminal.backend_mut(),
             SetCursorStyle::DefaultUserShape,
+            DisableBracketedPaste,
             LeaveAlternateScreen,
             DisableMouseCapture
         );
@@ -1507,6 +1510,26 @@ fn input_thread(
         let key = 'feed: {
             match event::read() {
                 Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => break 'feed Some(key),
+                // A paste is one event carrying its whole payload, so newlines inside it stay
+                // in the buffer instead of each submitting a separate message.
+                Ok(Event::Paste(pasted)) => {
+                    let cleaned = pasted.replace("\r\n", "\n").replace('\r', "\n");
+                    if !cleaned.is_empty() {
+                        buf.push_str(&cleaned);
+                        selected = 0;
+                        if history_idx == history.len() {
+                            saved_buf = buf.clone();
+                        }
+                        let is_slash =
+                            buf.trim_start().starts_with('/') && !buf.trim_start().contains(' ');
+                        let items = if is_slash {
+                            items_for(&needle_of(&buf))
+                        } else {
+                            Vec::new()
+                        };
+                        sync(&screen, &buf, selected, items);
+                    }
+                }
                 Ok(Event::Mouse(mouse)) => match mouse.kind {
                     MouseEventKind::ScrollUp => scroll_screen(&screen, 3),
                     MouseEventKind::ScrollDown => scroll_screen(&screen, -3),

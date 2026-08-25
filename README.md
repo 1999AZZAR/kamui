@@ -454,6 +454,11 @@ Highlights:
   in the global config, then switches to it.
 - **Multiline input** — end a line with `\` and press Enter to continue on the next line; the
   editor box grows as you type.
+- **Pasting** — a multi-line paste arrives as one message, newlines and all, instead of each line
+  submitting itself. Images cannot travel through a terminal paste at all; use `@clipboard` to
+  read a screenshot straight from the system clipboard, or `@shot.png` for a file. Either way the
+  transcript reports what was attached (`1 image(s) attached (image/png ~210 KiB)`), since the
+  prompt itself only ever shows the reference you typed.
 - **Tool cards** — a call and its result are one block: a header naming the tool and its
   arguments, then an outcome row (`✓ completed · 1.2s · 142 chars`, or `✗ failed · 1.2s`) that
   stays visible while the output itself stays folded. **`Ctrl+O` or a click** on the card
