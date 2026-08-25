@@ -338,7 +338,7 @@ where
                 Duration::from_secs(config.command_timeout_secs),
             )
             .await;
-            let (outcome, ok) = format_tool_outcome(&output, started.elapsed());
+            let (outcome, ok) = crate::terminal::tool_outcome_parts(&output, started.elapsed());
             chat_ui.tool_call("shell", direct)?;
             chat_ui.tool_finished(&outcome, ok, tool_body(&output))?;
             continue;
@@ -1237,11 +1237,14 @@ where
                 lt.push_str(&format!("\n  in : {}", usage.prompt_tokens));
                 lt.push_str(&format!("\n  out : {}", usage.completion_tokens));
                 if let Some(t) = ttft {
-                    lt.push_str(&format!("\n  lat : {}", format_duration(t)));
+                    lt.push_str(&format!(
+                        "\n  lat : {}",
+                        crate::terminal::format_duration(t)
+                    ));
                 }
                 lt.push_str(&format!(
                     "\n  time : {}",
-                    format_duration(started.elapsed())
+                    crate::terminal::format_duration(started.elapsed())
                 ));
                 update_sidebar(
                     &mut chat_ui,
@@ -1523,7 +1526,7 @@ where
                     .get(&call.id)
                     .map(|(_, elapsed)| *elapsed)
                     .unwrap_or_else(|| tool_started.elapsed());
-                let (outcome, ok) = format_tool_outcome(&output, elapsed);
+                let (outcome, ok) = crate::terminal::tool_outcome_parts(&output, elapsed);
                 let body = if ok {
                     preview_output(&output)
                 } else {
@@ -1844,7 +1847,9 @@ where
                 .get(&call.id)
                 .map(|(_, elapsed)| *elapsed)
                 .unwrap_or_else(|| tool_started.elapsed());
-            if !output.starts_with("Error: ") && !output.is_empty() {
+            if output.starts_with("Error: ") {
+                print!("{}", render::render_error(tool_body(&output), ui));
+            } else if !output.is_empty() {
                 print!(
                     "{}",
                     render::render_tool_output(&preview_output(&output), ui)
@@ -2962,31 +2967,16 @@ fn format_usage(
         line.push_str(&format!(" | Context: {percent:.1}%"));
     }
     if let Some(ttft) = ttft {
-        line.push_str(&format!(" | TTFT: {}", format_duration(ttft)));
+        line.push_str(&format!(
+            " | TTFT: {}",
+            crate::terminal::format_duration(ttft)
+        ));
     }
     line.push_str(&format!(
         " | Time: {} | Finish: {finish_reason}",
-        format_duration(elapsed)
+        crate::terminal::format_duration(elapsed)
     ));
     line
-}
-
-/// The one-line result summary plus whether the call succeeded. Failure detail is left to
-/// the card body: a long provider error used to be pasted into this line, and this is the
-/// row that has to stay readable at a glance.
-fn format_tool_outcome(output: &str, elapsed: Duration) -> (String, bool) {
-    if output.starts_with("Error: ") {
-        (format!("failed · {}", format_duration(elapsed)), false)
-    } else {
-        (
-            format!(
-                "completed · {} · {} chars",
-                format_duration(elapsed),
-                output.chars().count()
-            ),
-            true,
-        )
-    }
 }
 
 /// What a `/warnings fix` turn achieved, measured by reloading the skill library rather than
@@ -3113,15 +3103,6 @@ fn accumulate_usage(total: &mut Usage, round: &Usage) {
     total.prompt_tokens = round.prompt_tokens;
     total.cached_tokens = round.cached_tokens;
     total.total_tokens = total.prompt_tokens + total.completion_tokens;
-}
-
-fn format_duration(duration: Duration) -> String {
-    let seconds = duration.as_secs_f64();
-    if seconds < 1.0 {
-        format!("{}ms", duration.as_millis())
-    } else {
-        format!("{seconds:.1}s")
-    }
 }
 
 fn make_title(input: &str) -> String {
@@ -5068,10 +5049,24 @@ mod tests {
 
     #[test]
     fn format_duration_switches_units_at_one_second() {
-        assert_eq!(format_duration(Duration::from_millis(320)), "320ms");
-        assert_eq!(format_duration(Duration::from_millis(999)), "999ms");
-        assert_eq!(format_duration(Duration::from_millis(4200)), "4.2s");
-        assert_eq!(format_duration(Duration::from_secs(1)), "1.0s");
+        // Kept here as well as in `terminal`: this is the boundary the two copies had to agree
+        // on, and now only one implementation can define it.
+        assert_eq!(
+            crate::terminal::format_duration(Duration::from_millis(320)),
+            "320ms"
+        );
+        assert_eq!(
+            crate::terminal::format_duration(Duration::from_millis(999)),
+            "999ms"
+        );
+        assert_eq!(
+            crate::terminal::format_duration(Duration::from_millis(4200)),
+            "4.2s"
+        );
+        assert_eq!(
+            crate::terminal::format_duration(Duration::from_secs(1)),
+            "1.0s"
+        );
     }
 
     #[test]

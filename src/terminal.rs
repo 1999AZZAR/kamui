@@ -88,25 +88,22 @@ impl Ui {
 
     pub fn tool_outcome(self, output: &str, elapsed: Duration) -> String {
         if !self.interactive {
+            // The script-friendly contract, unchanged: no timing, and the error inline,
+            // because nothing else is printed alongside it on this path.
             return match output.strip_prefix("Error: ") {
                 Some(error) => format!("    ! {error}"),
                 None => format!("    ok ({} chars)", output.chars().count()),
             };
         }
 
-        match output.strip_prefix("Error: ") {
-            Some(error) => self.style(
-                &format!("    x failed · {} · {error}", format_duration(elapsed)),
+        let (text, ok) = tool_outcome_parts(output, elapsed);
+        if ok {
+            self.style(&format!("    ✓ {text}"), &[Style::BgGreen, Style::Black])
+        } else {
+            self.style(
+                &format!("    ✗ {text}"),
                 &[Style::BgRed, Style::White, Style::Bold],
-            ),
-            None => self.style(
-                &format!(
-                    "    ✓ completed · {} · {} chars",
-                    format_duration(elapsed),
-                    output.chars().count()
-                ),
-                &[Style::BgGreen, Style::Black],
-            ),
+            )
         }
     }
 
@@ -125,7 +122,28 @@ impl Ui {
     }
 }
 
-fn format_duration(duration: Duration) -> String {
+/// The one-line result of a tool call, and whether it succeeded. Shared with the interactive
+/// transcript so the two cannot describe the same call differently -- they already did: the
+/// failure line inlined the error here and not there, because only one of the two was
+/// updated. Failure detail belongs in the body printed alongside, not crammed into this line.
+pub fn tool_outcome_parts(output: &str, elapsed: Duration) -> (String, bool) {
+    if output.starts_with("Error: ") {
+        (format!("failed · {}", format_duration(elapsed)), false)
+    } else {
+        (
+            format!(
+                "completed · {} · {} chars",
+                format_duration(elapsed),
+                output.chars().count()
+            ),
+            true,
+        )
+    }
+}
+
+/// Sub-second durations in milliseconds, longer ones in seconds to one decimal. Shared, because
+/// two copies of this that happened to agree is how a pair starts drifting.
+pub fn format_duration(duration: Duration) -> String {
     if duration.as_secs() > 0 {
         format!("{:.1}s", duration.as_secs_f64())
     } else {
@@ -163,5 +181,22 @@ mod tests {
             ui.tool_outcome("done", Duration::from_millis(12)),
             "    ✓ completed · 12ms · 4 chars"
         );
+        // Failure detail is printed as its own body, so this line stays one readable
+        // summary -- and says the same thing the interactive transcript says.
+        assert_eq!(
+            ui.tool_outcome("Error: nope", Duration::from_millis(12)),
+            "    ✗ failed · 12ms"
+        );
+    }
+
+    #[test]
+    fn both_front_ends_describe_a_call_the_same_way() {
+        let (text, ok) = tool_outcome_parts("done", Duration::from_millis(12));
+        assert!(ok);
+        assert_eq!(text, "completed · 12ms · 4 chars");
+        let (text, ok) = tool_outcome_parts("Error: boom", Duration::from_millis(12));
+        assert!(!ok);
+        assert_eq!(text, "failed · 12ms");
+        assert!(!text.contains("boom"), "the detail is the body's job");
     }
 }
