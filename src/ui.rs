@@ -145,6 +145,8 @@ struct Model {
     sidebar: Option<Vec<(String, String)>>,
     /// Live typed text rendered inside the editor box; driven by `ScreenHandle`.
     input: String,
+    /// Caret position as a byte offset into `input`. Editing happens here, not only at the end.
+    input_caret: usize,
     /// Autocomplete menu state mirrored from the input loop each keystroke.
     ac_items: Vec<(String, String)>,
     ac_selected: usize,
@@ -227,6 +229,7 @@ impl Default for Model {
             intro: true,
             sidebar: None,
             input: String::new(),
+            input_caret: 0,
             ac_items: Vec::new(),
             ac_selected: 0,
             warnings: Vec::new(),
@@ -1239,18 +1242,83 @@ impl Drop for BusyGuard {
 /// Viewport height from the last draw; one page for PageUp/PageDown.
 /// Suffix of `input` that fits `max` display columns - the editor scrolls horizontally,
 /// keeping the caret (always at the end of the buffer) visible.
-fn input_tail(input: &str, max: usize) -> &str {
-    let mut start = 0usize;
-    let mut used = 0usize;
-    for (i, ch) in input.char_indices().rev() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(1);
-        if used + cw > max {
-            start = i + ch.len_utf8();
+/// Byte index of the char boundary before `caret`, or 0.
+fn prev_char_boundary(buf: &str, caret: usize) -> usize {
+    buf[..caret.min(buf.len())]
+        .char_indices()
+        .next_back()
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+/// Byte index of the char boundary after `caret`, or the end.
+fn next_char_boundary(buf: &str, caret: usize) -> usize {
+    let caret = caret.min(buf.len());
+    buf[caret..]
+        .chars()
+        .next()
+        .map(|ch| caret + ch.len_utf8())
+        .unwrap_or(buf.len())
+}
+
+/// Start of the word before `caret`: skip any run of spaces, then the run of non-spaces. This
+/// is both where Alt+Left lands and what Ctrl+W deletes.
+fn prev_word_boundary(buf: &str, caret: usize) -> usize {
+    let mut index = caret.min(buf.len());
+    while index > 0 {
+        let previous = prev_char_boundary(buf, index);
+        if buf[previous..index].chars().all(char::is_whitespace) {
+            index = previous;
+        } else {
             break;
         }
-        used += cw;
     }
-    &input[start..]
+    while index > 0 {
+        let previous = prev_char_boundary(buf, index);
+        if buf[previous..index].chars().any(char::is_whitespace) {
+            break;
+        }
+        index = previous;
+    }
+    index
+}
+
+/// End of the word after `caret`, mirroring `prev_word_boundary`.
+fn next_word_boundary(buf: &str, caret: usize) -> usize {
+    let mut index = caret.min(buf.len());
+    while index < buf.len() {
+        let next = next_char_boundary(buf, index);
+        if buf[index..next].chars().all(char::is_whitespace) {
+            index = next;
+        } else {
+            break;
+        }
+    }
+    while index < buf.len() {
+        let next = next_char_boundary(buf, index);
+        if buf[index..next].chars().any(char::is_whitespace) {
+            break;
+        }
+        index = next;
+    }
+    index
+}
+
+/// Start of the buffer line holding `caret` (Home).
+fn line_start(buf: &str, caret: usize) -> usize {
+    buf[..caret.min(buf.len())]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
+/// End of the buffer line holding `caret` (End).
+fn line_end(buf: &str, caret: usize) -> usize {
+    let caret = caret.min(buf.len());
+    buf[caret..]
+        .find('\n')
+        .map(|offset| caret + offset)
+        .unwrap_or(buf.len())
 }
 
 fn page_rows(screen: &ScreenHandle) -> i64 {
@@ -1412,7 +1480,7 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
 /// `?` overlay: the keybinding sheet.
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let width = 64.min(area.width.saturating_sub(4));
-    let height = 18.min(area.height.saturating_sub(2));
+    let height = 22.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let box_area = Rect {
@@ -1422,8 +1490,12 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         height,
     };
     frame.render_widget(Clear, box_area);
-    let rows: [(&str, &str); 15] = [
+    let rows: [(&str, &str); 19] = [
         ("Enter", "send message"),
+        ("Shift/Ctrl+Enter", "newline without sending"),
+        ("\u{2190}/\u{2192}", "move the caret"),
+        ("Alt+\u{2190}/\u{2192}", "move by word"),
+        ("Home/End, Ctrl+A/E", "start / end of line"),
         ("Ctrl+K", "switch model"),
         ("Ctrl+S", "resume a session"),
         ("Ctrl+O / click", "expand or fold tool output"),
@@ -1433,7 +1505,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         ("Tab", "accept slash completion"),
         ("\u{2191}/\u{2193}", "history / menu navigation"),
         ("PgUp/PgDn", "scroll transcript"),
-        ("Home/End", "jump to top/bottom"),
+        ("Ctrl+Home/End", "jump to top/bottom"),
         ("!<command>", "run a shell command"),
         ("/warnings", "hide or show warnings"),
         ("Esc", "interrupt the agent"),
@@ -1478,15 +1550,23 @@ fn input_thread(
     sessions_src: Arc<std::sync::RwLock<Vec<(String, String)>>>,
 ) {
     let mut buf = String::new();
+    // Caret as a byte offset into `buf`. Editing used to be append-and-backspace only: a typo
+    // near the start of a long prompt meant deleting everything back to it.
+    let mut caret = 0usize;
     let mut selected = 0usize;
     let mut history: Vec<String> = Vec::new();
     let mut history_idx = 0usize;
     let mut saved_buf = String::new();
     let mut last_ctrl_c: Option<std::time::Instant> = None;
 
-    let sync = |screen: &ScreenHandle, buf: &str, selected: usize, items: Vec<(String, String)>| {
+    let sync = |screen: &ScreenHandle,
+                buf: &str,
+                caret: usize,
+                selected: usize,
+                items: Vec<(String, String)>| {
         let mut s = lock_screen(&screen.0);
         s.model.input = buf.to_string();
+        s.model.input_caret = caret.min(buf.len());
         s.model.ac_selected = selected;
         s.model.ac_items = items;
         let _ = s.draw();
@@ -1501,7 +1581,7 @@ fn input_thread(
             .collect()
     };
 
-    sync(&screen, "", 0, Vec::new());
+    sync(&screen, "", 0, 0, Vec::new());
     // Feed loop: the wheel scrolls right here; only key presses fall through to the editor.
     // Read errors are tolerated briefly, then quit gracefully (never process::exit - that
     // would skip FullScreen's Drop and leave raw mode + mouse capture enabled).
@@ -1515,7 +1595,8 @@ fn input_thread(
                 Ok(Event::Paste(pasted)) => {
                     let cleaned = pasted.replace("\r\n", "\n").replace('\r', "\n");
                     if !cleaned.is_empty() {
-                        buf.push_str(&cleaned);
+                        buf.insert_str(caret, &cleaned);
+                        caret += cleaned.len();
                         selected = 0;
                         if history_idx == history.len() {
                             saved_buf = buf.clone();
@@ -1527,7 +1608,7 @@ fn input_thread(
                         } else {
                             Vec::new()
                         };
-                        sync(&screen, &buf, selected, items);
+                        sync(&screen, &buf, caret, selected, items);
                     }
                 }
                 Ok(Event::Mouse(mouse)) => match mouse.kind {
@@ -1730,6 +1811,7 @@ fn input_thread(
                     }
                     history_idx -= 1;
                     buf = history[history_idx].clone();
+                    caret = buf.len();
                     selected = 0;
                 }
             }
@@ -1746,6 +1828,7 @@ fn input_thread(
                     } else {
                         history[history_idx].clone()
                     };
+                    caret = buf.len();
                     selected = 0;
                 }
             }
@@ -1754,21 +1837,88 @@ fn input_thread(
                     let all = items_for(&needle);
                     if let Some(choice) = all.get(selected) {
                         buf = format!("/{} ", choice.0);
+                        caret = buf.len();
                         selected = 0;
                     }
                 }
             }
-            KeyCode::Enter => {
-                // opencode editor behavior: a trailing backslash escapes the newline and
-                // continues the message on the next line.
-                if buf.ends_with('\\') {
-                    buf.pop();
-                    buf.push('\n');
+            // Caret motion. Alt jumps by word, plain arrows by character.
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                caret = prev_word_boundary(&buf, caret);
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                caret = next_word_boundary(&buf, caret);
+            }
+            KeyCode::Left => caret = prev_char_boundary(&buf, caret),
+            KeyCode::Right => caret = next_char_boundary(&buf, caret),
+            KeyCode::Delete => {
+                let end = next_char_boundary(&buf, caret);
+                if end > caret {
+                    buf.replace_range(caret..end, "");
                     selected = 0;
+                    if history_idx == history.len() {
+                        saved_buf = buf.clone();
+                    }
+                }
+            }
+            // Ctrl+W deletes the word before the caret, as in a shell.
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let start = prev_word_boundary(&buf, caret);
+                if start < caret {
+                    buf.replace_range(start..caret, "");
+                    caret = start;
+                    selected = 0;
+                    if history_idx == history.len() {
+                        saved_buf = buf.clone();
+                    }
+                }
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                caret = line_start(&buf, caret);
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                caret = line_end(&buf, caret);
+            }
+            // Newline without submitting. opencode binds shift+return / ctrl+return /
+            // alt+return / ctrl+j for this; terminals disagree about which of those they
+            // report, so accept all of them. The trailing-\\ form still works.
+            KeyCode::Enter
+                if key.modifiers.intersects(
+                    KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+                ) =>
+            {
+                buf.insert(caret, '\n');
+                caret += 1;
+                selected = 0;
+                if history_idx == history.len() {
+                    saved_buf = buf.clone();
+                }
+            }
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                buf.insert(caret, '\n');
+                caret += 1;
+                selected = 0;
+                if history_idx == history.len() {
+                    saved_buf = buf.clone();
+                }
+            }
+            KeyCode::Enter => {
+                // opencode editor behavior: a backslash before the caret escapes the newline
+                // and continues the message on the next line. Read at the caret rather than at
+                // the end of the buffer, so it still works mid-line.
+                let before = prev_char_boundary(&buf, caret);
+                if before < caret && &buf[before..caret] == "\\" {
+                    buf.replace_range(before..caret, "\n");
+                    caret = before + 1;
+                    selected = 0;
+                    // Sync before looping: returning early used to leave the new line undrawn
+                    // until the next keystroke.
+                    sync(&screen, &buf, caret, selected, Vec::new());
                     continue 'keys;
                 }
                 let line = buf.trim().to_string();
                 buf.clear();
+                caret = 0;
                 selected = 0;
                 if !line.is_empty() {
                     history.push(line.clone());
@@ -1789,22 +1939,36 @@ fn input_thread(
                 if is_busy {
                     interrupt.notify_one();
                     buf.clear();
+                    caret = 0;
                     selected = 0;
                     let _ = lock_screen(&screen.0).add_notice("interrupt requested");
                 } else {
                     buf.clear();
+                    caret = 0;
                     selected = 0;
                 }
             }
             KeyCode::PageUp => scroll_screen(&screen, page_rows(&screen)),
             KeyCode::PageDown => scroll_screen(&screen, -page_rows(&screen)),
-            KeyCode::Home => scroll_screen(&screen, 100_000),
-            KeyCode::End => scroll_screen(&screen, -100_000),
+            // Home/End move the caret, which is what they do in every other text field.
+            // Jumping the transcript to top/bottom moved to Ctrl+Home / Ctrl+End.
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                scroll_screen(&screen, 100_000);
+            }
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                scroll_screen(&screen, -100_000);
+            }
+            KeyCode::Home => caret = line_start(&buf, caret),
+            KeyCode::End => caret = line_end(&buf, caret),
             KeyCode::Backspace => {
-                buf.pop();
-                selected = 0;
-                if history_idx == history.len() {
-                    saved_buf = buf.clone();
+                let start = prev_char_boundary(&buf, caret);
+                if start < caret {
+                    buf.replace_range(start..caret, "");
+                    caret = start;
+                    selected = 0;
+                    if history_idx == history.len() {
+                        saved_buf = buf.clone();
+                    }
                 }
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1823,7 +1987,8 @@ fn input_thread(
                 }
             }
             KeyCode::Char(c) => {
-                buf.push(c);
+                buf.insert(caret, c);
+                caret += c.len_utf8();
                 selected = 0;
                 if history_idx == history.len() {
                     saved_buf = buf.clone();
@@ -1840,7 +2005,7 @@ fn input_thread(
         } else {
             (Vec::new(), 0)
         };
-        sync(&screen, &buf, selected, items);
+        sync(&screen, &buf, caret, selected, items);
     }
 }
 
@@ -1994,18 +2159,12 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     // so skipping it there left the first thing a user types with no visible caret.
     {
         let inner = editor_area.width.saturating_sub(4).max(1) as usize;
-        let segments: Vec<&str> = model.input.split('\n').collect();
-        let last = segments.last().copied().unwrap_or("");
+        let view = editor_view(&model.input, model.input_caret, inner);
         // The editor block draws a LEFT border: one column, no rows. Text then starts after the
         // two-cell row prefix, so the caret belongs at x + 3 on the block's own first row --
-        // the previous `y + 1` aimed at a top border that this block never draws.
-        let row = editor_area.y
-            + segments
-                .len()
-                .saturating_sub(1)
-                .min(EDITOR_VISIBLE_LINES - 1) as u16;
-        let col =
-            editor_area.x + 3 + UnicodeWidthStr::width(input_tail(last, inner)).min(inner) as u16;
+        // an earlier `y + 1` aimed at a top border that this block never draws.
+        let row = editor_area.y + view.caret_row as u16;
+        let col = editor_area.x + 3 + view.caret_col.min(inner) as u16;
         frame.set_cursor_position((
             col.min(editor_area.right().saturating_sub(1)),
             row.min(editor_area.bottom().saturating_sub(1)),
@@ -2047,6 +2206,68 @@ fn set_clipboard_text(text: &str) -> Result<()> {
         .context("could not write to the system clipboard")
 }
 
+/// The editor's visible rows together with where the caret sits among them. Rows and caret come
+/// from one function on purpose: derived separately they drift apart, which is how the caret
+/// ended up pointing at a row the text was never drawn on.
+struct EditorView {
+    rows: Vec<String>,
+    caret_row: usize,
+    /// Display columns from the start of the row's text.
+    caret_col: usize,
+}
+
+/// Lays out `input` for an editor `width` columns wide, scrolled so the caret is always on
+/// screen both vertically (long multi-line buffers) and horizontally (long single lines).
+fn editor_view(input: &str, caret: usize, width: usize) -> EditorView {
+    let width = width.max(1);
+    let caret = caret.min(input.len());
+    let segments: Vec<&str> = input.split('\n').collect();
+
+    // Which buffer line the caret is on, and how many chars into it.
+    let start_of_line = line_start(input, caret);
+    let caret_row_full = input[..start_of_line].matches('\n').count();
+    let caret_chars = input[start_of_line..caret].chars().count();
+
+    // Vertical viewport: the newest lines, extended back if the caret sits above them.
+    let mut first = segments.len().saturating_sub(EDITOR_VISIBLE_LINES);
+    first = first.min(caret_row_full);
+
+    let mut rows = Vec::with_capacity(segments.len() - first);
+    let mut caret_col = 0usize;
+    for (offset, segment) in segments[first..].iter().enumerate() {
+        if first + offset == caret_row_full {
+            let (visible, column) = visible_around_caret(segment, caret_chars, width);
+            caret_col = column;
+            rows.push(visible);
+        } else {
+            rows.push(segment.chars().take(width).collect());
+        }
+    }
+    EditorView {
+        rows,
+        caret_row: caret_row_full - first,
+        caret_col,
+    }
+}
+
+/// The slice of one buffer line that fits in `width` columns while keeping the caret visible,
+/// plus the caret's column inside that slice.
+fn visible_around_caret(segment: &str, caret_chars: usize, width: usize) -> (String, usize) {
+    let chars: Vec<char> = segment.chars().collect();
+    // One column is reserved so a caret at the very end of the line still has somewhere to sit.
+    let span = width.saturating_sub(1).max(1);
+    let start = caret_chars.saturating_sub(span);
+    let end = chars.len().min(start + width);
+    let visible: String = chars[start.min(chars.len())..end].iter().collect();
+    let column = UnicodeWidthStr::width(
+        chars[start.min(chars.len())..caret_chars.min(chars.len())]
+            .iter()
+            .collect::<String>()
+            .as_str(),
+    );
+    (visible, column)
+}
+
 /// How many buffer rows the editor shows at once; longer buffers scroll to the newest.
 const EDITOR_VISIBLE_LINES: usize = 5;
 
@@ -2070,22 +2291,19 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
             ),
         ])],
         _ => {
-            // One row per newline segment, newest rows kept in view. Joining the segments into
-            // a single Line (as this did) collapsed a multi-line buffer onto one row while the
-            // caret was still placed per segment, so the two disagreed about where text was.
+            // One row per newline segment, scrolled to keep the caret in view. Joining the
+            // segments into a single Line (as this did) collapsed a multi-line buffer onto one
+            // row while the caret was placed per segment, so the two disagreed about the text.
             let inner = area.width.saturating_sub(4).max(1) as usize;
-            let segments: Vec<&str> = model.input.split('\n').collect();
-            let first = segments.len().saturating_sub(EDITOR_VISIBLE_LINES);
-            let last = segments.len().saturating_sub(1);
-            segments[first..]
-                .iter()
+            let view = editor_view(&model.input, model.input_caret, inner);
+            view.rows
+                .into_iter()
                 .enumerate()
-                .map(|(offset, seg)| {
-                    let idx = first + offset;
+                .map(|(offset, row)| {
                     Line::from(vec![
                         // Continuation rows repeat the prompt glyph's width so the text column
                         // -- and therefore the caret column -- is the same on every row.
-                        if idx == 0 {
+                        if offset == 0 && model.input_caret <= model.input.len() {
                             Span::styled(
                                 "\u{276f} ".to_string(),
                                 Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
@@ -2093,14 +2311,7 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
                         } else {
                             Span::raw("  ".to_string())
                         },
-                        Span::styled(
-                            if idx == last {
-                                input_tail(seg, inner).to_string()
-                            } else {
-                                (*seg).to_string()
-                            },
-                            Style::default().fg(TEXT),
-                        ),
+                        Span::styled(row, Style::default().fg(TEXT)),
                     ])
                 })
                 .collect()
@@ -2839,6 +3050,7 @@ mod tests {
         let model = Model {
             intro: false,
             input: "steer me".into(),
+            input_caret: 8,
             thinking: Some((3, "Thinking...")),
             ..Default::default()
         };
@@ -2863,6 +3075,91 @@ mod tests {
             all.iter().any(|row| row.contains("Esc interrupts")),
             "the loading row says how to stop: {all:?}"
         );
+    }
+
+    #[test]
+    fn caret_motion_walks_characters_words_and_lines() {
+        let buf = "hello brave world";
+        assert_eq!(prev_char_boundary(buf, 5), 4);
+        assert_eq!(prev_char_boundary(buf, 0), 0, "start of buffer is a floor");
+        assert_eq!(next_char_boundary(buf, 16), 17);
+        assert_eq!(
+            next_char_boundary(buf, 17),
+            17,
+            "end of buffer is a ceiling"
+        );
+
+        // Alt+Left from the end lands at the start of the last word, and again at the one
+        // before it -- the run of spaces is skipped, not counted as a word.
+        assert_eq!(prev_word_boundary(buf, buf.len()), 12);
+        assert_eq!(prev_word_boundary(buf, 12), 6);
+        assert_eq!(prev_word_boundary(buf, 0), 0);
+        assert_eq!(next_word_boundary(buf, 0), 5);
+        assert_eq!(next_word_boundary(buf, buf.len()), buf.len());
+    }
+
+    #[test]
+    fn caret_motion_is_utf8_safe() {
+        // Byte stepping would slice a multi-byte char in half and panic.
+        let buf = "haló界";
+        let mut caret = buf.len();
+        let mut steps = 0;
+        while caret > 0 {
+            caret = prev_char_boundary(buf, caret);
+            steps += 1;
+            assert!(
+                buf.is_char_boundary(caret),
+                "landed mid-character at {caret}"
+            );
+        }
+        assert_eq!(steps, 5, "five characters, not eight bytes");
+    }
+
+    #[test]
+    fn home_and_end_act_on_the_buffer_line_under_the_caret() {
+        let buf = "first\nsecond\nthird";
+        let caret = buf.find("second").unwrap() + 2;
+        assert_eq!(line_start(buf, caret), buf.find("second").unwrap());
+        assert_eq!(line_end(buf, caret), buf.find("second").unwrap() + 6);
+        assert_eq!(
+            line_start(buf, 2),
+            0,
+            "first line starts at the buffer start"
+        );
+        assert_eq!(line_end(buf, buf.len()), buf.len());
+    }
+
+    #[test]
+    fn a_long_line_scrolls_to_keep_the_caret_visible() {
+        // Editing in the middle of a line longer than the box must not push the caret off it.
+        let buf = "x".repeat(200);
+        let view = editor_view(&buf, 120, 40);
+        assert_eq!(view.rows.len(), 1);
+        assert!(
+            view.caret_col < 40,
+            "caret stays inside the box: {}",
+            view.caret_col
+        );
+        assert!(view.rows[0].chars().count() <= 40, "row fits the box");
+
+        // At the very start the window shows the head, with the caret at column 0.
+        let head = editor_view(&buf, 0, 40);
+        assert_eq!(head.caret_col, 0);
+        assert!(head.rows[0].starts_with('x'));
+    }
+
+    #[test]
+    fn the_view_scrolls_up_to_reach_a_caret_on_an_earlier_line() {
+        // Eight lines with the caret on the first: the newest-lines window alone would leave
+        // the caret off screen, so the window has to extend back to it.
+        let buf = (1..=8)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let view = editor_view(&buf, 2, 40);
+        assert_eq!(view.caret_row, 0, "the caret's line is the first shown");
+        assert!(view.rows[0].contains("line 1"), "{:?}", view.rows);
+        assert_eq!(view.caret_col, 2);
     }
 
     #[test]
@@ -3010,6 +3307,7 @@ mod tests {
         let model = Model {
             intro: false,
             input: "/st".into(),
+            input_caret: 3,
             ac_items: vec![
                 ("stats".into(), "Show current session usage".into()),
                 ("status".into(), "Show project and connection status".into()),
@@ -3042,6 +3340,7 @@ mod tests {
         let model = Model {
             intro: false,
             input: "first\nsecond".into(),
+            input_caret: "first\nsecond".len(),
             ..Default::default()
         };
         let ((x, y), row) = caret_and_row(&model);
@@ -3072,6 +3371,7 @@ mod tests {
         let model = Model {
             intro: false,
             input: "done\n".into(),
+            input_caret: "done\n".len(),
             ..Default::default()
         };
         let ((x, y), row) = caret_and_row(&model);

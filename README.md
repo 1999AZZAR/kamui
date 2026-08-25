@@ -452,8 +452,14 @@ Highlights:
 - **Model registry** — the model dialog ends with "+ Add provider / model": enter a base URL and
   API key, Kamui fetches the provider's live model list and registers your pick as a new profile
   in the global config, then switches to it.
-- **Multiline input** — end a line with `\` and press Enter to continue on the next line; the
-  editor box grows as you type.
+- **Real editing** — the caret moves. `←`/`→` by character, `Alt`+`←`/`→` by word,
+  `Home`/`End` or `Ctrl+A`/`Ctrl+E` to the ends of the line, `Delete` forward, `Ctrl+W` to rub out
+  the word behind the caret. Text is inserted where the caret is, and a line longer than the box
+  scrolls horizontally to keep the caret in view. (Jumping the transcript to top/bottom moved to
+  `Ctrl+Home`/`Ctrl+End`.)
+- **Multiline input** — `Shift+Enter`, `Ctrl+Enter`, `Alt+Enter`, or `Ctrl+J` starts a new line
+  without sending; terminals disagree about which of those they report, so all are accepted.
+  Ending a line with `\` and pressing Enter still works. The editor box grows as you type.
 - **Pasting** — a multi-line paste arrives as one message, newlines and all, instead of each line
   submitting itself. Images cannot travel through a terminal paste at all; use `@clipboard` to
   read a screenshot straight from the system clipboard, or `@shot.png` for a file. Either way the
