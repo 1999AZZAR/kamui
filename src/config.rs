@@ -367,6 +367,14 @@ fn resolve(mut global: ConfigFile, mut project: Option<ConfigFile>) -> Result<Co
                 "a project kamui.toml must not define [permissions]; declare allow_commands in the global config"
             );
         }
+        // Only the global file's profiles and providers are resolved. Accepting these here and
+        // then ignoring them left `default_profile` failing with "does not match any [profiles.*]
+        // entry" while the file being read plainly contained one.
+        if !project.profiles.is_empty() || !project.providers.is_empty() {
+            anyhow::bail!(
+                "a project kamui.toml must not define [profiles.*] or [providers.*]; they are resolved from the global config only. Use `default_profile` here to pin this project to one of the profiles defined there."
+            );
+        }
     }
 
     let command_timeout_secs = project
@@ -676,6 +684,54 @@ mod tests {
         let path = std::env::temp_dir().join(format!("kamui-config-{}.toml", Uuid::new_v4()));
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn a_project_file_may_not_define_profiles_or_providers() {
+        // Only the global file's profiles are resolved. Accepting these and ignoring them made
+        // `default_profile` fail with "does not match any [profiles.*] entry" while the file the
+        // user was staring at plainly contained one.
+        let global = file(
+            r#"
+default_profile = "a"
+[profiles.a]
+model = "m"
+api_key = "k"
+"#,
+        );
+        let project = file(
+            r#"
+[profiles.dead]
+model = "nothing"
+"#,
+        );
+
+        let error = resolve(global, Some(project)).expect_err("project profiles are rejected");
+        let text = format!("{error:#}");
+        assert!(text.contains("[profiles.*]"), "{text}");
+        assert!(
+            text.contains("default_profile"),
+            "it points at what does work here: {text}"
+        );
+    }
+
+    #[test]
+    fn a_project_file_may_still_pin_the_default_profile() {
+        let global = file(
+            r#"
+default_profile = "a"
+[profiles.a]
+model = "m"
+api_key = "k"
+[profiles.b]
+model = "n"
+api_key = "k"
+"#,
+        );
+        let project = file(r#"default_profile = "b""#);
+
+        let config = resolve(global, Some(project)).expect("pinning is allowed");
+        assert_eq!(config.default().name, "b");
     }
 
     #[test]

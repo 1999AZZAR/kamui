@@ -31,6 +31,22 @@ pub async fn run(path: &Path) -> Result<()> {
 
         println!("Checking available models...");
         match OpenAIProvider::list_models(&api_key, &base_url).await {
+            // A provider can answer successfully with an empty list -- a key with no model
+            // entitlements, or a base URL pointing at something that is not a model API.
+            // `FuzzySelect` over no items has nothing to return, and indexing the empty list
+            // afterwards would panic, on a first run, before anything else exists.
+            Ok(models) if models.is_empty() => {
+                eprintln!(
+                    "That provider returned no models. Check the base URL and that the key has                      access to at least one model."
+                );
+                if !Confirm::with_theme(&theme)
+                    .with_prompt("Try provider setup again?")
+                    .default(true)
+                    .interact()?
+                {
+                    bail!("provider setup cancelled");
+                }
+            }
             Ok(models) => {
                 let selected = FuzzySelect::with_theme(&theme)
                     .with_prompt("Choose the default model (type to search)")
