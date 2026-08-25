@@ -443,6 +443,10 @@ Highlights:
 - **Dialogs** — `Ctrl+K` model picker, `Ctrl+S` session switcher, `?` keybinding sheet. Bare
   `/model`, `/sessions`, and `/help` open the same overlays. Enter submits through the normal
   command path, so queueing still applies while busy.
+- **Transcript search** — `Ctrl+F` searches what is on screen right now (`/search` looks through
+  saved sessions in SQLite, which is a different question). Every matching row is washed, the one
+  in view brighter, with an `n/m` readout; `Enter` and `Up` step through them wrapping at both
+  ends, and `Esc` closes and returns to the live tail.
 - **Copying out** — `Ctrl+Y` copies the latest answer as the raw Markdown that was streamed;
   **right-click** a cell to copy that cell (its header and outcome included, so you can tell what
   the text is). Both report what was taken. Mouse capture means drag-select belongs to Kamui, but

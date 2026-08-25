@@ -61,6 +61,9 @@ const BG_PANEL: Color = Color::Rgb(0x14, 0x14, 0x14);
 const BLUE: Color = Color::Rgb(0x5c, 0x9c, 0xf5);
 /// Opaque near-black for every overlay so nothing bleeds through.
 const POPUP_BG: Color = Color::Rgb(0x0a, 0x0a, 0x0a);
+/// Search hits: every match gets a quiet wash, the one in view a brighter one.
+const MATCH_BG: Color = Color::Rgb(0x33, 0x2d, 0x14);
+const MATCH_CURRENT_BG: Color = Color::Rgb(0x6b, 0x55, 0x12);
 /// Warm accent marking the user's own words (opencode primary tone).
 const ACCENT: Color = Color::Rgb(0xfa, 0xb2, 0x83);
 const GREEN: Color = Color::Rgb(0x7f, 0xd8, 0x8f);
@@ -165,6 +168,19 @@ struct Model {
     token_badge: Option<(String, u8)>,
     /// Open approval modal (opencode permission panel).
     permission: Option<PermissionState>,
+    /// Live transcript search (Ctrl+F). `/search` looks through saved sessions in SQLite; this
+    /// looks through what is on screen right now, which is a different question.
+    search: Option<SearchState>,
+}
+
+/// An in-progress transcript search: what was typed, and which match is being looked at.
+#[derive(Debug, Clone, Default)]
+pub struct SearchState {
+    pub query: String,
+    /// Index into the matching rows, wrapping at both ends.
+    pub current: usize,
+    /// Match count from the last draw, for the `3/17` readout.
+    pub total: usize,
 }
 
 /// Approval modal options, opencode labels.
@@ -241,6 +257,7 @@ impl Default for Model {
             help_visible: false,
             token_badge: None,
             permission: None,
+            search: None,
         }
     }
 }
@@ -254,6 +271,9 @@ struct FullScreen {
     /// Terminal row -> card id from the most recent draw, so a mouse click can find the card
     /// under the pointer.
     last_card_rows: Vec<(u16, u64)>,
+    /// Transcript width and height from the last draw. Search re-wraps the transcript exactly
+    /// as the renderer did, so the row it scrolls to is the row the user will see.
+    last_transcript_width: u16,
     next_card_id: u64,
     /// Set once the real terminal has been handed back. Further draws are dropped so a
     /// still-running input thread cannot repaint over restored scrollback.
@@ -310,6 +330,7 @@ impl FullScreen {
             model,
             last_viewport_rows: 0,
             last_card_rows: Vec::new(),
+            last_transcript_width: 0,
             next_card_id: 0,
             restored: false,
         };
@@ -328,6 +349,7 @@ impl FullScreen {
         })?;
         self.last_viewport_rows = info.viewport_rows;
         self.last_card_rows = info.card_rows;
+        self.last_transcript_width = info.transcript_width;
         Ok(())
     }
 
@@ -437,6 +459,74 @@ impl FullScreen {
         card.collapsed = !card.collapsed;
         self.draw()?;
         Ok(true)
+    }
+
+    /// Opens transcript search, closing the slash menu so the two never share the row.
+    fn open_search(&mut self) -> Result<()> {
+        self.model.search = Some(SearchState::default());
+        self.model.ac_items.clear();
+        self.draw()
+    }
+
+    fn close_search(&mut self) -> Result<()> {
+        self.model.search = None;
+        // Searching scrolls back through history; closing it returns to the live tail, which is
+        // where the next answer will appear.
+        self.model.scroll_from_bottom = 0;
+        self.draw()
+    }
+
+    /// Applies an edit to the query and re-runs it from the top.
+    fn edit_search(&mut self, edit: impl FnOnce(&mut String)) -> Result<()> {
+        let Some(search) = self.model.search.as_mut() else {
+            return Ok(());
+        };
+        edit(&mut search.query);
+        search.current = 0;
+        self.refresh_search()
+    }
+
+    /// Steps to the next or previous match, wrapping at both ends.
+    fn step_search(&mut self, delta: isize) -> Result<()> {
+        let Some(search) = self.model.search.as_mut() else {
+            return Ok(());
+        };
+        if search.total > 0 {
+            let total = search.total as isize;
+            let current = search.current as isize;
+            search.current = ((current + delta).rem_euclid(total)) as usize;
+        }
+        self.refresh_search()
+    }
+
+    /// Recounts the matches and scrolls the current one into view. The transcript is re-wrapped
+    /// exactly as the renderer wraps it, so the row counted here is the row that gets drawn.
+    fn refresh_search(&mut self) -> Result<()> {
+        let width = self.last_transcript_width;
+        let visible = self.last_viewport_rows.max(1);
+        let Some(query) = self.model.search.as_ref().map(|s| s.query.clone()) else {
+            return Ok(());
+        };
+        let rows = wrapped_transcript(&self.model, width);
+        let hits = matching_rows(&rows, &query);
+        if let Some(search) = self.model.search.as_mut() {
+            search.total = hits.len();
+            if hits.is_empty() {
+                search.current = 0;
+            } else {
+                search.current %= hits.len();
+            }
+        }
+        if let Some(row) = self
+            .model
+            .search
+            .as_ref()
+            .filter(|_| !hits.is_empty())
+            .map(|search| hits[search.current])
+        {
+            self.model.scroll_from_bottom = scroll_to_row(rows.len(), visible, row);
+        }
+        self.draw()
     }
 
     /// Copies the cell drawn at `row` to the system clipboard, reporting what was taken.
@@ -1480,7 +1570,7 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
 /// `?` overlay: the keybinding sheet.
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let width = 64.min(area.width.saturating_sub(4));
-    let height = 24.min(area.height.saturating_sub(2));
+    let height = 25.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let box_area = Rect {
@@ -1490,7 +1580,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         height,
     };
     frame.render_widget(Clear, box_area);
-    let rows: [(&str, &str); 20] = [
+    let rows: [(&str, &str); 21] = [
         ("Enter", "send message"),
         ("Shift/Ctrl+Enter", "newline without sending"),
         ("\u{2190}/\u{2192}", "move the caret"),
@@ -1499,6 +1589,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         ("Ctrl+K", "switch model"),
         ("Ctrl+S", "resume a session"),
         ("Ctrl+O / click", "expand or fold tool output"),
+        ("Ctrl+F", "search the transcript"),
         ("Ctrl+Y", "copy the latest answer"),
         ("Right click", "copy the cell under the pointer"),
         ("?", "toggle this help"),
@@ -1744,6 +1835,41 @@ fn input_thread(
                 continue;
             }
             drop(s);
+        }
+
+        // Transcript search owns the keyboard while it is open, so its query cannot leak into
+        // the editor buffer.
+        let searching = lock_screen(&screen.0).model.search.is_some();
+        if searching {
+            let mut sc = lock_screen(&screen.0);
+            match key.code {
+                KeyCode::Esc => {
+                    let _ = sc.close_search();
+                }
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let _ = sc.close_search();
+                }
+                KeyCode::Enter | KeyCode::Down => {
+                    let _ = sc.step_search(1);
+                }
+                KeyCode::Up => {
+                    let _ = sc.step_search(-1);
+                }
+                KeyCode::Backspace => {
+                    let _ = sc.edit_search(|query| {
+                        query.pop();
+                    });
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let _ = sc.edit_search(|query| query.push(c));
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
+            let _ = lock_screen(&screen.0).open_search();
+            continue;
         }
 
         // Openers.
@@ -2097,12 +2223,18 @@ impl ScreenHandle {
 struct RenderInfo {
     viewport_rows: usize,
     card_rows: Vec<(u16, u64)>,
+    transcript_width: u16,
 }
 
 fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     // OpenCode layout: transcript on top, autocomplete menu above the bordered editor, a
     // one-line footer, and the sidebar rail splitting the body horizontally.
-    let popup_height = menu_height(model.ac_items.len());
+    // The search bar and the slash menu never coexist: opening search closes the editor's menu.
+    let popup_height = if model.search.is_some() {
+        1
+    } else {
+        menu_height(model.ac_items.len())
+    };
     // Multiline editor: grows with the buffer's newlines (backslash-newline continuation).
     // Split the same way `editor_widget` does: `lines()` drops a trailing empty segment, which
     // would leave the caret a row below the text after the buffer ends with a newline.
@@ -2148,22 +2280,34 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         // after scroll offsets, which makes bottom-follow drift on long wrapped lines).
         // Each source line carries its owning card, so wrapping cannot lose the attribution
         // a click needs.
-        let transcript = transcript_rows(model, transcript_area.width);
-        let mut rows: Vec<(Line<'static>, Option<u64>)> = Vec::with_capacity(transcript.len());
-        for (line, owner) in &transcript {
-            for row in wrap_spans(&line.spans, transcript_area.width.max(1) as usize) {
-                rows.push((Line::from(row), *owner));
-            }
-        }
+        let rows = wrapped_transcript(model, transcript_area.width);
         let visible = transcript_area.height as usize;
         let start = rows
             .len()
             .saturating_sub(visible.saturating_add(model.scroll_from_bottom));
+        let hits = model
+            .search
+            .as_ref()
+            .map(|search| matching_rows(&rows, &search.query))
+            .unwrap_or_default();
+        let current_hit = model
+            .search
+            .as_ref()
+            .filter(|_| !hits.is_empty())
+            .map(|search| hits[search.current % hits.len()]);
         let mut window: Vec<Line<'static>> = Vec::with_capacity(visible);
         for (offset, (line, owner)) in rows.into_iter().skip(start).take(visible).enumerate() {
             if let Some(id) = owner {
                 card_rows.push((transcript_area.y + offset as u16, id));
             }
+            let absolute = start + offset;
+            let line = if Some(absolute) == current_hit {
+                highlight_row(line, MATCH_CURRENT_BG)
+            } else if hits.binary_search(&absolute).is_ok() {
+                highlight_row(line, MATCH_BG)
+            } else {
+                line
+            };
             window.push(line);
         }
         frame.render_widget(Paragraph::new(Text::from(window)), transcript_area);
@@ -2171,7 +2315,9 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     if let Some(area) = sidebar_area {
         frame.render_widget(sidebar_paragraph(model, area), area);
     }
-    if popup_height > 0 {
+    if let Some(search) = &model.search {
+        frame.render_widget(search_widget(search), popup_area);
+    } else if popup_height > 0 {
         frame.render_widget(popup_widget(model), popup_area);
     }
     frame.render_widget(editor_widget(model, editor_area), editor_area);
@@ -2208,6 +2354,7 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     RenderInfo {
         viewport_rows: if home { 0 } else { body_area.height as usize },
         card_rows,
+        transcript_width: transcript_area.width,
     }
 }
 
@@ -2377,6 +2524,33 @@ pub(crate) fn menu_height(item_count: usize) -> u16 {
     } else {
         (item_count.min(MENU_VISIBLE) as u16 + 2).min(10)
     }
+}
+
+/// The search bar: what was typed, and which match of how many is in view.
+fn search_widget(search: &SearchState) -> Paragraph<'static> {
+    let readout = if search.query.is_empty() {
+        "type to search the transcript".to_string()
+    } else if search.total == 0 {
+        "no matches".to_string()
+    } else {
+        format!("{}/{}", search.current % search.total + 1, search.total)
+    };
+    Paragraph::new(Text::from(Line::from(vec![
+        Span::styled(
+            "search ".to_string(),
+            Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(search.query.clone(), Style::default().fg(TEXT)),
+        Span::styled(
+            format!("  {readout}"),
+            Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            "  \u{b7} Enter next \u{b7} Up prev \u{b7} Esc close".to_string(),
+            Style::default().fg(BORDER).add_modifier(Modifier::DIM),
+        ),
+    ])))
+    .style(Style::default().bg(POPUP_BG))
 }
 
 fn popup_widget(model: &Model) -> Paragraph<'static> {
@@ -2549,6 +2723,65 @@ fn footer_widget(model: &Model) -> Paragraph<'static> {
         ));
     }
     Paragraph::new(Line::from(spans))
+}
+
+/// The transcript as it is actually drawn: every source line wrapped to `width`, each wrapped
+/// row still carrying its owning card. Search re-uses this so the row it counts is the row that
+/// gets rendered.
+fn wrapped_transcript(model: &Model, width: u16) -> Vec<(Line<'static>, Option<u64>)> {
+    let mut rows = Vec::new();
+    for (line, owner) in transcript_rows(model, width) {
+        for row in wrap_spans(&line.spans, width.max(1) as usize) {
+            rows.push((Line::from(row), owner));
+        }
+    }
+    rows
+}
+
+/// Repaints a whole drawn row onto `background`. Colouring only the matched substring would
+/// mean re-deriving character offsets through styling and wrapping that have already been
+/// applied; marking the row says the same thing and cannot drift out of step with it.
+fn highlight_row(line: Line<'static>, background: Color) -> Line<'static> {
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(|span| {
+                let style = span.style.bg(background);
+                Span::styled(span.content.to_string(), style)
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Plain text of one drawn row, for matching a search against.
+fn row_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+/// Indices of the drawn rows containing `needle`, case-insensitively.
+fn matching_rows(rows: &[(Line<'static>, Option<u64>)], needle: &str) -> Vec<usize> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let needle = needle.to_lowercase();
+    rows.iter()
+        .enumerate()
+        .filter(|(_, (line, _))| row_text(line).to_lowercase().contains(&needle))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The `scroll_from_bottom` that puts `row` in the middle of a `visible`-row viewport.
+fn scroll_to_row(total_rows: usize, visible: usize, row: usize) -> usize {
+    let half = visible / 2;
+    let start = row.saturating_sub(half);
+    let max_start = total_rows.saturating_sub(visible);
+    total_rows
+        .saturating_sub(visible)
+        .saturating_sub(start.min(max_start))
 }
 
 /// Every transcript line paired with the card it belongs to (`None` for notices and warnings,
@@ -3097,6 +3330,81 @@ mod tests {
             all.iter().any(|row| row.contains("Esc interrupts")),
             "the loading row says how to stop: {all:?}"
         );
+    }
+
+    fn rows_of(texts: &[&str]) -> Vec<(Line<'static>, Option<u64>)> {
+        texts
+            .iter()
+            .map(|text| (Line::from(Span::raw(text.to_string())), None))
+            .collect()
+    }
+
+    #[test]
+    fn search_matches_rows_case_insensitively() {
+        let rows = rows_of(&["the Cargo build", "nothing here", "cargo test", "CARGO"]);
+        assert_eq!(matching_rows(&rows, "cargo"), vec![0, 2, 3]);
+        assert_eq!(
+            matching_rows(&rows, "CARGO"),
+            vec![0, 2, 3],
+            "either case finds either"
+        );
+        assert!(matching_rows(&rows, "absent").is_empty());
+        assert!(
+            matching_rows(&rows, "").is_empty(),
+            "an empty query matches nothing, not everything"
+        );
+    }
+
+    #[test]
+    fn search_matches_text_split_across_styled_spans() {
+        // Rows are built from many spans (rail, header, body). Matching per span would miss a
+        // word that straddles two of them.
+        let line = Line::from(vec![
+            Span::raw("\u{258c} ".to_string()),
+            Span::raw("car".to_string()),
+            Span::raw("go build".to_string()),
+        ]);
+        let rows = vec![(line, None)];
+        assert_eq!(matching_rows(&rows, "cargo build"), vec![0]);
+    }
+
+    #[test]
+    fn scrolling_to_a_match_centres_it_and_stays_in_range() {
+        // 100 rows, a 20-row viewport. scroll_from_bottom counts up from the live tail.
+        assert_eq!(
+            scroll_to_row(100, 20, 90),
+            0,
+            "a match in the tail needs no scrolling"
+        );
+        assert_eq!(
+            scroll_to_row(100, 20, 50),
+            40,
+            "40 rows back puts row 50 mid-viewport"
+        );
+        assert_eq!(
+            scroll_to_row(100, 20, 0),
+            80,
+            "the first row scrolls all the way back"
+        );
+        // Fewer rows than fit: nothing to scroll, and no underflow.
+        assert_eq!(scroll_to_row(5, 20, 3), 0);
+        assert_eq!(scroll_to_row(0, 20, 0), 0);
+    }
+
+    #[test]
+    fn highlighting_a_row_repaints_it_without_losing_its_text() {
+        let line = Line::from(vec![
+            Span::styled("\u{258c} ".to_string(), Style::default().fg(BLUE)),
+            Span::styled("hit".to_string(), Style::default().fg(TEXT)),
+        ]);
+        let painted = highlight_row(line, MATCH_BG);
+        assert_eq!(row_text(&painted), "\u{258c} hit", "text survives");
+        for span in &painted.spans {
+            assert_eq!(span.style.bg, Some(MATCH_BG), "every span carries the wash");
+        }
+        // Foreground styling is left alone, so a highlighted answer still reads as an answer.
+        assert_eq!(painted.spans[0].style.fg, Some(BLUE));
+        assert_eq!(painted.spans[1].style.fg, Some(TEXT));
     }
 
     #[test]
