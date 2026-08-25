@@ -239,8 +239,15 @@ where
     let mut show_warnings = true;
     // In-flight "Add provider" wizard: base URL + API key awaiting a picked model id.
     let mut pending_add: Option<(String, String)> = None;
+    // Background jobs already reported as finished, so each is announced once.
+    let mut announced_jobs: HashSet<String> = HashSet::new();
 
     'chat: loop {
+        // A background job that ended could previously only be found by polling `/jobs`. Report
+        // it on the way back to the prompt, which is when there is somewhere to put it.
+        for line in tools::drain_finished_jobs(&job_registry, &mut announced_jobs) {
+            chat_ui.notice(&line)?;
+        }
         let input = if use_tui {
             let hub = hub.as_mut().expect("tui implies hub");
             let cmds: Vec<crate::commands::CustomCommand> = command_library.list().to_vec();
@@ -1552,16 +1559,22 @@ where
         // Only after the turn is safely persisted: a refresh failure must never cost the exchange.
         if let Some(snapshot) = last_turn_snapshot.as_ref() {
             let edited: Vec<PathBuf> = snapshot.keys().cloned().collect();
-            report_index_refresh(tokio::select! {
+            let mut interrupted = false;
+            let outcome = tokio::select! {
                 result = refresh_index_for_paths(
                     provider.as_ref(), &active, database, project, edited,
                 ) => result,
                 signal = tokio::signal::ctrl_c() => {
                     signal.context("failed to listen for Ctrl+C")?;
-                    println!("\n(interrupted — the index may be stale; /index refreshes it)");
+                    interrupted = true;
                     Ok(0)
                 }
-            });
+            };
+            if interrupted {
+                chat_ui.notice("interrupted — the index may be stale; /index rebuilds it")?;
+            } else {
+                report_index_refresh(&mut chat_ui, outcome);
+            }
         }
 
         if is_first_exchange {
@@ -1829,9 +1842,16 @@ where
     session.title = make_title(title_source);
 
     // Only after the turn is safely persisted: a refresh failure must never cost the exchange.
-    report_index_refresh(
+    if let Some((text, failed)) = index_refresh_message(
         refresh_index_for_paths(provider.as_ref(), &active, database, project, edited).await,
-    );
+    ) {
+        // `-p` output is script input, so it stays on the plain streams.
+        if failed {
+            eprintln!("({text})");
+        } else {
+            println!("({text})");
+        }
+    }
 
     let title_response = provider
         .chat(ChatRequest {
@@ -3419,11 +3439,32 @@ async fn refresh_index_for_paths(
 
 /// Report the outcome of a post-turn index refresh on one line, saying nothing when there was
 /// nothing to refresh.
-fn report_index_refresh(outcome: Result<usize>) {
+/// What the post-turn index refresh has to say, and whether it is a failure. Separated from
+/// the printing because the two callers print differently: the interactive loop must go
+/// through the UI (this runs after every editing turn, and it used to scribble straight
+/// over the frame ratatui owns), while `-p` is plain stdout by contract.
+fn index_refresh_message(outcome: Result<usize>) -> Option<(String, bool)> {
     match outcome {
-        Ok(0) => {}
-        Ok(count) => println!("(refreshed {count} file(s) in the code index)"),
-        Err(error) => eprintln!("(index refresh failed: {error:#} — /index rebuilds it)"),
+        Ok(0) => None,
+        Ok(count) => Some((
+            format!("refreshed {count} file(s) in the code index"),
+            false,
+        )),
+        // Never silent: a failed refresh leaves `search_code` quoting code that is gone.
+        Err(error) => Some((
+            format!("index refresh failed: {error:#} — /index rebuilds it"),
+            true,
+        )),
+    }
+}
+
+fn report_index_refresh(chat_ui: &mut ChatUi, outcome: Result<usize>) {
+    if let Some((text, failed)) = index_refresh_message(outcome) {
+        let _ = if failed {
+            chat_ui.error(&text)
+        } else {
+            chat_ui.notice(&text)
+        };
     }
 }
 
@@ -5297,6 +5338,29 @@ mod tests {
         assert!(summary.contains("Could not revert"), "{summary}");
         assert!(summary.contains("blocked"), "the file is named: {summary}");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_quiet_index_refresh_says_nothing() {
+        // Most turns touch no indexed file. Announcing "refreshed 0 files" every time would be
+        // noise in the transcript.
+        assert!(index_refresh_message(Ok(0)).is_none());
+    }
+
+    #[test]
+    fn index_refresh_reports_work_and_failure_differently() {
+        let (text, failed) = index_refresh_message(Ok(3)).expect("a message");
+        assert!(text.contains("3 file(s)"), "{text}");
+        assert!(!failed, "a successful refresh is not an error");
+
+        let (text, failed) = index_refresh_message(Err(anyhow::anyhow!("no embedding endpoint")))
+            .expect("a message");
+        assert!(failed, "a failed refresh is an error, not a notice");
+        assert!(
+            text.contains("no embedding endpoint"),
+            "the cause survives: {text}"
+        );
+        assert!(text.contains("/index"), "and says how to recover: {text}");
     }
 
     #[test]

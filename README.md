@@ -454,6 +454,9 @@ Highlights:
   **right-click** a cell to copy that cell (its header and outcome included, so you can tell what
   the text is). Both report what was taken. Mouse capture means drag-select belongs to Kamui, but
   most terminals still fall back to their own selection while **Shift** is held.
+- **Background jobs announce themselves** — a job started with `run_command(background: true)`
+  reports on the way back to the prompt when it ends, once, with its exit status and how long it
+  took. Previously a `cargo test` could have finished minutes ago and only `/jobs` would say so.
 - **Modes** — `Tab` cycles **build → auto → plan**, `Shift+Tab` goes back, and `/mode
   [build|auto|plan]` sets one directly. *build* asks before every command and edit; *auto*
   bypasses those approvals for the rest of the session (what `--auto-approve` starts in); *plan*

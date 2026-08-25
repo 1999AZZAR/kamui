@@ -961,6 +961,43 @@ pub(crate) struct JobEntry {
 /// not survive a restart, and any still running are killed on shutdown (see `kill_all_jobs`).
 pub type JobRegistry = Arc<Mutex<HashMap<String, Arc<JobEntry>>>>;
 
+/// Jobs that have finished since the last call, as one line each. A background job could only
+/// be discovered by polling `/jobs` or by the model calling `command_status`, so a `cargo test`
+/// started in the background could finish minutes ago and say nothing. `announced` is the
+/// caller's record of what it has already reported; ids are added to it here.
+pub fn drain_finished_jobs(
+    jobs: &JobRegistry,
+    announced: &mut std::collections::HashSet<String>,
+) -> Vec<String> {
+    let registry = jobs.lock().unwrap();
+    let mut finished: Vec<(String, String)> = registry
+        .iter()
+        .filter_map(|(id, entry)| {
+            let status = entry.state.lock().unwrap().status;
+            if status == JobStatus::Running || announced.contains(id) {
+                return None;
+            }
+            Some((
+                id.clone(),
+                format!(
+                    "job {id} {status} after {}s: {}",
+                    entry.started_at.elapsed().as_secs(),
+                    entry.command
+                ),
+            ))
+        })
+        .collect();
+    // Sorted for a stable order; a HashMap yields a different one each time.
+    finished.sort_by(|left, right| left.0.cmp(&right.0));
+    finished
+        .into_iter()
+        .map(|(id, line)| {
+            announced.insert(id);
+            line
+        })
+        .collect()
+}
+
 /// List every background job as one line each (`id  status  elapsed  command`), sorted by id for a
 /// stable order. Shared by `CommandStatusTool` (no `job_id` given) and the chat loop's `/jobs`.
 pub fn describe_jobs(jobs: &JobRegistry) -> String {
@@ -1666,6 +1703,66 @@ fn cap(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Registers one job directly in the registry with a chosen status.
+    fn job(registry: &JobRegistry, id: &str, status: JobStatus) {
+        let (kill, _) = tokio::sync::watch::channel(false);
+        registry.lock().unwrap().insert(
+            id.to_string(),
+            Arc::new(JobEntry {
+                command: format!("cargo test {id}"),
+                started_at: Instant::now(),
+                kill,
+                state: Mutex::new(JobState {
+                    status,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }),
+            }),
+        );
+    }
+
+    #[test]
+    fn finished_jobs_are_announced_once_each() {
+        let registry: JobRegistry = Arc::new(Mutex::new(HashMap::new()));
+        job(&registry, "a", JobStatus::Exited(0));
+        job(&registry, "b", JobStatus::Running);
+        let mut announced = std::collections::HashSet::new();
+
+        let first = drain_finished_jobs(&registry, &mut announced);
+        assert_eq!(first.len(), 1, "only the finished job: {first:?}");
+        assert!(first[0].contains("job a"), "{first:?}");
+        assert!(
+            first[0].contains("exited (0)"),
+            "the outcome is stated: {first:?}"
+        );
+
+        // Draining again says nothing: the same job must not be reported at every prompt.
+        assert!(drain_finished_jobs(&registry, &mut announced).is_empty());
+
+        // The job still running is announced only once it ends.
+        registry.lock().unwrap()["b"].state.lock().unwrap().status = JobStatus::Killed;
+        let second = drain_finished_jobs(&registry, &mut announced);
+        assert_eq!(second.len(), 1);
+        assert!(second[0].contains("killed"), "{second:?}");
+    }
+
+    #[test]
+    fn finished_jobs_report_in_a_stable_order() {
+        // The registry is a HashMap, so without sorting the same two jobs would be announced in
+        // a different order each run.
+        let registry: JobRegistry = Arc::new(Mutex::new(HashMap::new()));
+        for id in ["c", "a", "b"] {
+            job(&registry, id, JobStatus::Exited(0));
+        }
+        let mut announced = std::collections::HashSet::new();
+        let lines = drain_finished_jobs(&registry, &mut announced);
+        let ids: Vec<&str> = lines
+            .iter()
+            .map(|line| line.split_whitespace().nth(1).unwrap())
+            .collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
     use std::fs;
     use uuid::Uuid;
 
