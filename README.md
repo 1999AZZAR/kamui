@@ -433,13 +433,16 @@ Highlights:
 - **Steering** — keep typing while the agent works. Your message is folded into the *running*
   turn at the next tool-round boundary, so a correction reaches the model while it can still act
   on it instead of waiting for the whole turn to finish. If the turn ends before the next
-  boundary the message simply starts the next turn. **Esc interrupts** outright when you would
-  rather discard the turn than redirect it.
+  boundary the message simply starts the next turn. A steered message is labelled as one in the
+  transcript — on re-reading a session there is otherwise no way to tell which of two prompts
+  started the work. **Esc interrupts** outright when you would rather discard the turn than
+  redirect it.
 - **Loading state** — the editor stays live and keeps its caret; the run reports itself on its own
   row inside the editor box (spinner, what it is doing, `Esc interrupts`), and the spinner also
   trails the transcript where the answer will appear.
-- **Scrolling** — mouse wheel, PgUp/PgDn (full page), Ctrl+U/Ctrl+D (half page), Home/End.
-  Typing snaps back to the live tail.
+- **Scrolling** — mouse wheel, PgUp/PgDn (full page), Ctrl+U/Ctrl+D (half page),
+  `Ctrl+Home`/`Ctrl+End`. Typing snaps back to the live tail, and while you are scrolled away from
+  it the footer says how far back you are and how to return.
 - **Dialogs** — `Ctrl+K` model picker, `Ctrl+S` session switcher, `?` keybinding sheet. Bare
   `/model`, `/sessions`, and `/help` open the same overlays. Enter submits through the normal
   command path, so queueing still applies while busy.
@@ -482,7 +485,8 @@ Highlights:
   the newest cell that actually has rows folded away, so a command's own output cell never
   steals the target. Multi-line command
   output renders as proper lines instead of one run-on blob.
-- **Sidebar** — session, id, version, model (marked `· no tools` when the active profile sets
+- **Sidebar** — `Ctrl+B` hides or shows it, and it narrows from 30 to 24 columns before giving up
+  entirely on a terminal under 68 columns wide. Carries session, id, version, model (marked `· no tools` when the active profile sets
   `tools = false`, since a model offered no tools invents tool-call syntax in prose and looks
   broken rather than switched off), project, MCP servers with their live tool counts
   (a server that failed to start reads `unavailable` rather than quietly disappearing), context

@@ -168,6 +168,8 @@ struct Model {
     token_badge: Option<(String, u8)>,
     /// Open approval modal (opencode permission panel).
     permission: Option<PermissionState>,
+    /// Hidden by the user with Ctrl+B, as opposed to dropped for want of room.
+    sidebar_hidden: bool,
     /// Live transcript search (Ctrl+F). `/search` looks through saved sessions in SQLite; this
     /// looks through what is on screen right now, which is a different question.
     search: Option<SearchState>,
@@ -257,6 +259,7 @@ impl Default for Model {
             help_visible: false,
             token_badge: None,
             permission: None,
+            sidebar_hidden: false,
             search: None,
         }
     }
@@ -845,6 +848,17 @@ impl ChatUi {
 
     pub fn user(&mut self, text: &str) -> Result<()> {
         self.card(CardKind::User, "User", text)
+    }
+
+    /// A message folded into a turn that was already running. Rendered as an ordinary user
+    /// message otherwise, and on re-reading a session there was no way to tell which of two
+    /// prompts was the one that started the work.
+    pub fn user_steering(&mut self, text: &str) -> Result<()> {
+        self.card(
+            CardKind::User,
+            "steering \u{2192} added to the running turn",
+            text,
+        )
     }
 
     /// Echoes a slash command as its own transcript cell; its output lands in the same cell.
@@ -1570,7 +1584,7 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
 /// `?` overlay: the keybinding sheet.
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let width = 64.min(area.width.saturating_sub(4));
-    let height = 25.min(area.height.saturating_sub(2));
+    let height = 26.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let box_area = Rect {
@@ -1580,7 +1594,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         height,
     };
     frame.render_widget(Clear, box_area);
-    let rows: [(&str, &str); 21] = [
+    let rows: [(&str, &str); 22] = [
         ("Enter", "send message"),
         ("Shift/Ctrl+Enter", "newline without sending"),
         ("\u{2190}/\u{2192}", "move the caret"),
@@ -1590,6 +1604,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         ("Ctrl+S", "resume a session"),
         ("Ctrl+O / click", "expand or fold tool output"),
         ("Ctrl+F", "search the transcript"),
+        ("Ctrl+B", "show or hide the sidebar"),
         ("Ctrl+Y", "copy the latest answer"),
         ("Right click", "copy the cell under the pointer"),
         ("?", "toggle this help"),
@@ -1869,6 +1884,12 @@ fn input_thread(
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
             let _ = lock_screen(&screen.0).open_search();
+            continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b') {
+            let mut sc = lock_screen(&screen.0);
+            sc.model.sidebar_hidden = !sc.model.sidebar_hidden;
+            let _ = sc.draw();
             continue;
         }
 
@@ -2257,10 +2278,14 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
 
     // Sidebar rail takes the right side once the terminal is wide enough and chat is underway.
     let (transcript_area, sidebar_area) = match (&model.sidebar, model.intro) {
-        (Some(entries), false) if !entries.is_empty() && body_area.width >= 84 => {
+        (Some(entries), false)
+            if !entries.is_empty() && !model.sidebar_hidden && body_area.width >= 68 =>
+        {
+            // Narrow terminals get a narrower rail rather than none at all.
+            let rail = if body_area.width >= 84 { 30 } else { 24 };
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(0), Constraint::Length(30)])
+                .constraints([Constraint::Min(0), Constraint::Length(rail)])
                 .split(body_area);
             (cols[0], Some(cols[1]))
         }
@@ -2703,6 +2728,12 @@ fn footer_widget(model: &Model) -> Paragraph<'static> {
     if model.thinking.is_some() {
         text.push_str(" · Esc interrupts");
     }
+    if model.scroll_from_bottom > 0 {
+        text.push_str(&format!(
+            "  \u{b7} \u{2191} {} row(s) back \u{b7} End returns to live",
+            model.scroll_from_bottom
+        ));
+    }
     if model.queued_count > 0 {
         let plural = if model.queued_count == 1 { "" } else { "s" };
         text.push_str(&format!(
@@ -2939,6 +2970,16 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
 
     match card.kind {
         CardKind::User => {
+            // A plain prompt carries no header; a labelled one (steering) says so above itself.
+            if card.title != "User" && !card.title.is_empty() {
+                push_bordered(
+                    &mut out,
+                    vec![Span::styled(
+                        card.title.clone(),
+                        Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+                    )],
+                );
+            }
             for line in wrap_display(&card.body, width.saturating_sub(4)) {
                 push_bordered(&mut out, vec![Span::styled(line, body_style)]);
             }
@@ -3337,6 +3378,91 @@ mod tests {
             .iter()
             .map(|text| (Line::from(Span::raw(text.to_string())), None))
             .collect()
+    }
+
+    fn with_sidebar(width: u16, hidden: bool) -> RenderInfo {
+        let model = Model {
+            intro: false,
+            sidebar_hidden: hidden,
+            sidebar: Some(vec![("Model".into(), "orvix/auto".into())]),
+            cards: vec![Card {
+                id: 1,
+                kind: CardKind::User,
+                title: "User".into(),
+                body: "hi".into(),
+                status: None,
+                collapsed: false,
+            }],
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(width, 14);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut info = RenderInfo::default();
+        terminal
+            .draw(|frame| {
+                info = render(frame, &model);
+            })
+            .expect("draw");
+        info
+    }
+
+    #[test]
+    fn the_sidebar_narrows_before_it_disappears() {
+        // Dropping the rail outright at 84 columns took the session, model, and mode readout
+        // with it and said nothing about why.
+        assert_eq!(
+            with_sidebar(100, false).transcript_width,
+            70,
+            "wide: full 30-column rail"
+        );
+        assert_eq!(
+            with_sidebar(76, false).transcript_width,
+            52,
+            "tight: narrowed to 24"
+        );
+        assert_eq!(
+            with_sidebar(60, false).transcript_width,
+            60,
+            "too narrow for any rail: the transcript takes the whole width"
+        );
+    }
+
+    #[test]
+    fn hiding_the_sidebar_gives_its_columns_to_the_transcript() {
+        assert_eq!(with_sidebar(100, true).transcript_width, 100);
+    }
+
+    #[test]
+    fn a_steering_message_is_labelled_as_one() {
+        let steer = Card {
+            id: 1,
+            kind: CardKind::User,
+            title: "steering \u{2192} added to the running turn".into(),
+            body: "actually use the other file".into(),
+            status: None,
+            collapsed: false,
+        };
+        let rows = rendered(&steer, 60);
+        assert!(
+            rows[0].contains("steering"),
+            "the label heads the cell: {rows:?}"
+        );
+        assert!(rows[1].contains("actually use"), "{rows:?}");
+
+        // An ordinary prompt gains no header from this.
+        let plain = Card {
+            id: 2,
+            kind: CardKind::User,
+            title: "User".into(),
+            body: "hello".into(),
+            status: None,
+            collapsed: false,
+        };
+        assert_eq!(
+            rendered(&plain, 60).len(),
+            1,
+            "no header for a plain prompt"
+        );
     }
 
     #[test]

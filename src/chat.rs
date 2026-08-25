@@ -1024,7 +1024,7 @@ where
                         hub.push_prompt(line);
                         continue;
                     }
-                    chat_ui.user(&line)?;
+                    chat_ui.user_steering(&line)?;
                     let message = Message::user(&line);
                     turn_messages.push(message.clone());
                     tool_trail.push(message);
