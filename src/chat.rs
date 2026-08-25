@@ -2586,6 +2586,13 @@ fn shutdown(
     // exiting had stopped leaving any trace of the session behind.
     chat_ui.leave_fullscreen();
     let mut buf = String::new();
+    // Compact sign-off logo — same KAMUI art at ~50% height so the exit
+    // feels branded but not as dominant as the fullscreen intro.
+    for line in crate::ui::EXIT_LOGO_SMALL {
+        buf.push_str(line);
+        buf.push('\n');
+    }
+    buf.push('\n');
     if let Some(session) = session {
         print_stats(database, session, context_window, prices, &mut buf)?;
         buf.push_str(&format!(

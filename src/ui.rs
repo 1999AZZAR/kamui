@@ -28,6 +28,26 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// Braille spinner frames — the same animation the plain scrollback mode uses.
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Bouncing wall frames for the input editor while the agent is thinking.
+/// The wall (███) bounces inside a track, keeping the editor responsive
+/// without duplicating the response-area spinner.
+const BOUNCING_WALL_FRAMES: [&str; 14] = [
+    "[███-------]",
+    "[-████------]",
+    "[--████-----]",
+    "[---████----]",
+    "[----████---]",
+    "[-----████--]",
+    "[------████-]",
+    "[-------████]",
+    "[------████-]",
+    "[-----████--]",
+    "[----████---]",
+    "[---████----]",
+    "[--████-----]",
+    "[-████------]",
+];
+
 /// Welcome logo, opencode-style: block-letter art split into a muted left half and a bright,
 /// bold right half (KAM | UI) so the brand pops without shouting. Rendered centered while the
 /// transcript has no messages yet; the chat view takes over on the first message.
@@ -46,6 +66,15 @@ const LOGO_RIGHT: [&str; 6] = [
     "██║   ██║██║",
     "╚██████╔╝██║",
     " ╚═════╝ ╚═╝",
+];
+
+/// Smaller KAMUI for the exit screen — 4 rows, flat (no shadow)
+/// so the sign-off stays crisp and clearly reads KAMUI.
+pub(crate) const EXIT_LOGO_SMALL: [&str; 4] = [
+    "██  ██   ███    █   █   █   █   ███ ",
+    "██ ██   █   █   ██ ██   █   █    █  ",
+    "████    █████   █ █ █   █   █    █  ",
+    "██  ██  █   █   █   █    ███    ███ ",
 ];
 
 fn lock_screen(screen: &Mutex<FullScreen>) -> MutexGuard<'_, FullScreen> {
@@ -2566,16 +2595,17 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
         }
     };
     // Loading state: the editor keeps accepting input, so the run needs its own row here to
-    // say that something is in flight and how to stop it.
-    if let Some((frame_idx, label)) = model.thinking {
-        let dots = ".".repeat(1 + frame_idx % 9);
+    // say that something is in flight and how to stop it. The input uses a bouncing wall
+    // to avoid duplicating the response-area spinner (which stays as the spinner).
+    if let Some((frame_idx, _label)) = model.thinking {
+        let wall = BOUNCING_WALL_FRAMES[frame_idx % BOUNCING_WALL_FRAMES.len()];
         rows.push(Line::from(vec![
             Span::styled(
-                format!("  {} ", SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()]),
+                format!("  {wall} "),
                 Style::default().fg(BLUE),
             ),
             Span::styled(
-                format!("{label}{dots}"),
+                "processing".to_string(),
                 Style::default().fg(MUTED).add_modifier(Modifier::DIM),
             ),
             Span::styled(
