@@ -43,7 +43,9 @@ pub struct SessionStats {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
+    pub cached_tokens: i64,
     pub last_input_tokens: Option<i64>,
+    pub last_cached_tokens: Option<i64>,
 }
 
 /// Per-model token usage within a session, so switching models can be compared.
@@ -53,6 +55,7 @@ pub struct ModelStat {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
+    pub cached_tokens: i64,
 }
 
 pub struct MemoryEntry {
@@ -81,6 +84,7 @@ pub struct UsagePeriod {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
+    pub cached_tokens: i64,
 }
 
 #[derive(Debug)]
@@ -314,6 +318,14 @@ impl Database {
                  INSERT INTO code_chunks_fts(rowid, project, path, content)
                      SELECT id, project, path, content FROM code_chunks;
                  PRAGMA user_version = 10;",
+            )?;
+        }
+        if version < 11 {
+            connection.execute_batch(
+                "ALTER TABLE usage_records ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN plan_json TEXT;
+                 ALTER TABLE sessions ADD COLUMN plan_status TEXT CHECK (plan_status IN ('pending', 'approved'));
+                 PRAGMA user_version = 11;",
             )?;
         }
         Ok(Self { connection, path })
@@ -682,6 +694,8 @@ impl Database {
             i64::try_from(usage.completion_tokens).context("output token count overflow")?;
         let total_tokens =
             i64::try_from(usage.total_tokens).context("total token count overflow")?;
+        let cached_tokens =
+            i64::try_from(usage.cached_tokens).context("cached token count overflow")?;
         let transaction = self.connection.unchecked_transaction()?;
         for message in messages {
             let tool_calls = if message.tool_calls.is_empty() {
@@ -706,13 +720,14 @@ impl Database {
         }
         transaction.execute(
             "INSERT INTO usage_records
-             (session_id, input_tokens, output_tokens, total_tokens, finish_reason, kind, model)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'chat', ?6)",
+             (session_id, input_tokens, output_tokens, total_tokens, cached_tokens, finish_reason, kind, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'chat', ?7)",
             params![
                 session_id,
                 input_tokens,
                 output_tokens,
                 total_tokens,
+                cached_tokens,
                 finish_reason,
                 model
             ],
@@ -747,6 +762,8 @@ impl Database {
             i64::try_from(usage.completion_tokens).context("output token count overflow")?;
         let total_tokens =
             i64::try_from(usage.total_tokens).context("total token count overflow")?;
+        let cached_tokens =
+            i64::try_from(usage.cached_tokens).context("cached token count overflow")?;
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute(
             "UPDATE sessions SET title = ?2, updated_at = unixepoch() WHERE id = ?1",
@@ -754,13 +771,14 @@ impl Database {
         )?;
         transaction.execute(
             "INSERT INTO usage_records
-             (session_id, input_tokens, output_tokens, total_tokens, finish_reason, kind, model)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'title', ?6)",
+             (session_id, input_tokens, output_tokens, total_tokens, cached_tokens, finish_reason, kind, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'title', ?7)",
             params![
                 session_id,
                 input_tokens,
                 output_tokens,
                 total_tokens,
+                cached_tokens,
                 finish_reason,
                 model
             ],
@@ -772,7 +790,8 @@ impl Database {
     pub fn session_stats(&self, session_id: &str) -> Result<SessionStats> {
         let mut stats = self.connection.query_row(
             "SELECT COUNT(*) FILTER (WHERE kind = 'chat'), COALESCE(SUM(input_tokens), 0),
-                    COALESCE(SUM(output_tokens), 0), COALESCE(SUM(total_tokens), 0)
+                    COALESCE(SUM(output_tokens), 0), COALESCE(SUM(total_tokens), 0),
+                    COALESCE(SUM(cached_tokens), 0)
              FROM usage_records WHERE session_id = ?1",
             [session_id],
             |row| {
@@ -781,7 +800,9 @@ impl Database {
                     input_tokens: row.get(1)?,
                     output_tokens: row.get(2)?,
                     total_tokens: row.get(3)?,
+                    cached_tokens: row.get(4)?,
                     last_input_tokens: None,
+                    last_cached_tokens: None,
                 })
             },
         )?;
@@ -789,6 +810,15 @@ impl Database {
             .connection
             .query_row(
                 "SELECT input_tokens FROM usage_records
+                 WHERE session_id = ?1 AND kind = 'chat' ORDER BY id DESC LIMIT 1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        stats.last_cached_tokens = self
+            .connection
+            .query_row(
+                "SELECT cached_tokens FROM usage_records
                  WHERE session_id = ?1 AND kind = 'chat' ORDER BY id DESC LIMIT 1",
                 [session_id],
                 |row| row.get(0),
@@ -835,7 +865,7 @@ impl Database {
         let mut statement = self.connection.prepare(
             "SELECT COALESCE(model, '(unknown)'), COUNT(*),
                     COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
-                    COALESCE(SUM(total_tokens), 0)
+                    COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cached_tokens), 0)
              FROM usage_records
              WHERE session_id = ?1 AND kind = 'chat'
              GROUP BY model
@@ -848,6 +878,7 @@ impl Database {
                 input_tokens: row.get(2)?,
                 output_tokens: row.get(3)?,
                 total_tokens: row.get(4)?,
+                cached_tokens: row.get(5)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -857,6 +888,43 @@ impl Database {
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
         self.connection
             .execute("DELETE FROM sessions WHERE id = ?1", [session_id])?;
+        Ok(())
+    }
+
+    /// Plan Mode gate (ticket #9): pending/approved plan JSON stored per session.
+    /// `plan_json` holds the raw `update_plan` arguments (e.g. `{"plan":[...]}`),
+    /// `plan_status` is `pending` until the user approves with `y`.
+    pub fn get_plan(&self, session_id: &str) -> Result<Option<(String, String)>> {
+        self.connection
+            .query_row(
+                "SELECT plan_json, plan_status FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| {
+                    let json: Option<String> = row.get(0)?;
+                    let status: Option<String> = row.get(1)?;
+                    Ok(match (json, status) {
+                        (Some(j), Some(s)) => Some((j, s)),
+                        _ => None,
+                    })
+                },
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn set_plan(&self, session_id: &str, plan_json: &str, status: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE sessions SET plan_json = ?2, plan_status = ?3, updated_at = unixepoch() WHERE id = ?1",
+            params![session_id, plan_json, status],
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_plan(&self, session_id: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE sessions SET plan_json = NULL, plan_status = NULL, updated_at = unixepoch() WHERE id = ?1",
+            [session_id],
+        )?;
         Ok(())
     }
 
@@ -879,7 +947,7 @@ impl Database {
             "SELECT strftime(?1, created_at, 'unixepoch', 'localtime') AS period,
                     COUNT(*) FILTER (WHERE kind = 'chat'),
                     COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
-                    COALESCE(SUM(total_tokens), 0)
+                    COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cached_tokens), 0)
              FROM usage_records
              GROUP BY period
              ORDER BY period DESC
@@ -892,6 +960,7 @@ impl Database {
                 input_tokens: row.get(2)?,
                 output_tokens: row.get(3)?,
                 total_tokens: row.get(4)?,
+                cached_tokens: row.get(5)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -904,7 +973,7 @@ impl Database {
             .query_row(
                 "SELECT COUNT(*) FILTER (WHERE kind = 'chat'),
                         COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
-                        COALESCE(SUM(total_tokens), 0)
+                        COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cached_tokens), 0)
                  FROM usage_records",
                 [],
                 |row| {
@@ -914,6 +983,7 @@ impl Database {
                         input_tokens: row.get(1)?,
                         output_tokens: row.get(2)?,
                         total_tokens: row.get(3)?,
+                        cached_tokens: row.get(4)?,
                     })
                 },
             )
@@ -1417,8 +1487,8 @@ fn encode_embedding(vector: &[f32]) -> Vec<u8> {
 
 fn decode_embedding(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("chunks_exact(4) yields 4 bytes")))
+        .chunks(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("chunks(4) yields 4 bytes")))
         .collect()
 }
 
@@ -1586,6 +1656,7 @@ mod tests {
                     prompt_tokens: 10,
                     completion_tokens: 5,
                     total_tokens: 15,
+                    cached_tokens: 0,
                 },
                 "model",
                 "stop",
@@ -1635,6 +1706,7 @@ mod tests {
                     prompt_tokens: 4,
                     completion_tokens: 2,
                     total_tokens: 6,
+                    cached_tokens: 0,
                 },
                 "model",
                 "stop",
@@ -1714,6 +1786,7 @@ mod tests {
                         prompt_tokens: total,
                         completion_tokens: 0,
                         total_tokens: total,
+                        cached_tokens: 0,
                     },
                     model,
                     "stop",
@@ -1930,6 +2003,7 @@ mod tests {
                         prompt_tokens: 10,
                         completion_tokens: 5,
                         total_tokens: 15,
+                        cached_tokens: 0,
                     },
                     "m",
                     "stop",
@@ -1944,6 +2018,7 @@ mod tests {
                     prompt_tokens: 4,
                     completion_tokens: 1,
                     total_tokens: 5,
+                    cached_tokens: 0,
                 },
                 "m",
                 "stop",
@@ -1981,6 +2056,7 @@ mod tests {
                     prompt_tokens: 10,
                     completion_tokens: 5,
                     total_tokens: 15,
+                    cached_tokens: 0,
                 },
                 "gpt-5.6-sol",
                 "stop",
@@ -1994,6 +2070,7 @@ mod tests {
                     prompt_tokens: 4,
                     completion_tokens: 1,
                     total_tokens: 5,
+                    cached_tokens: 0,
                 },
                 "codeqwen:latest",
                 "stop",
@@ -2026,6 +2103,7 @@ mod tests {
                         prompt_tokens: input,
                         completion_tokens: output,
                         total_tokens: input + output,
+                        cached_tokens: 0,
                     },
                     model,
                     "stop",

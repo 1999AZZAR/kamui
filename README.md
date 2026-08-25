@@ -68,6 +68,23 @@ api_key = "ollama"                        # Ollama ignores this, but a value is 
 # tools = false                           # set this if the model rejects the tools field
 ```
 
+**Anthropic (Claude) via OpenAI-compatible proxy** (LiteLLM, `openai-to-anthropic`, etc.):
+
+```toml
+model = "claude-sonnet-4-5"               # model id as exposed by your proxy
+[provider]
+base_url = "http://localhost:4000/v1"     # shim that translates /v1/chat/completions → /v1/messages
+api_key = "sk-..."                        # proxy API key
+```
+
+Kamui drives Claude through the existing OpenAI-compatible `Provider` — no native Anthropic
+adapter. Point `base_url` at a shim that translates `POST /v1/chat/completions` to Anthropic
+`POST /v1/messages`. Cache-hit visibility works through the shim: Anthropic
+`cache_read_input_tokens` is surfaced via the same dual-path `Usage` deserializer as OpenAI
+`prompt_tokens_details.cached_tokens`, so the per-turn usage line and `/stats`/`/usage` show
+`cached_tokens` without native code. Prompt-caching `cache_control` and extended thinking remain
+native-only and are intentionally deferred (see `docs/research/anthropic-native-adapter-vs-shim.md`).
+
 Many small local models do not support tool calling and reject requests that include tools. If you
 see an error like `<model> does not support tools`, add `tools = false` to that profile — Kamui then
 chats without offering tools.
@@ -399,6 +416,35 @@ they were created, have a 30-minute safety timeout, retain capped stdout/stderr 
 and missed recurring runs are coalesced rather than replayed in a burst. This queue is separate from
 the temporary `run_command(background: true)` jobs owned by an active chat process.
 
+### Interactive transcript UI
+
+When launched from an interactive terminal, Kamui uses a fullscreen, opencode-style interface: a
+word-wrapped transcript with thick-border message rails (user = blue, assistant = brand blue with
+Markdown styling, tool calls muted, errors red), a sidebar with session info and live context
+usage, an always-live editor box with slash-command menu, and a quiet footer with keybind hints.
+
+Highlights:
+
+- **Home screen** — a two-tone block-letter KAMUI logo greets you until the first message.
+- **Live input while the agent runs** — keep typing; Enter queues your message and it runs right
+  after the current turn. **Esc interrupts** the agent at any point.
+- **Scrolling** — mouse wheel, PgUp/PgDn (full page), Ctrl+U/Ctrl+D (half page), Home/End.
+  Typing snaps back to the live tail.
+- **Dialogs** — `Ctrl+K` model picker, `Ctrl+S` session switcher, `?` keybinding sheet. Bare
+  `/model`, `/sessions`, and `/help` open the same overlays. Enter submits through the normal
+  command path, so queueing still applies while busy.
+- **Permission modal** — tool and plan approvals render as "Allow once / Always allow this
+  session / Reject" with the diff or command preview inline.
+- **Model registry** — the model dialog ends with "+ Add provider / model": enter a base URL and
+  API key, Kamui fetches the provider's live model list and registers your pick as a new profile
+  in the global config, then switches to it.
+- **Multiline input** — end a line with `\` and press Enter to continue on the next line; the
+  editor box grows as you type.
+- Tool calls fold by default to a two-line peek (`/expand` // `/collapse` toggle the latest card),
+  and multi-line command output renders as proper lines instead of one run-on blob.
+
+`-p`, pipes, redirects, and `NO_COLOR` retain the script-friendly line-oriented output path.
+
 ### Session commands
 
 | Command | Description |
@@ -420,12 +466,16 @@ the temporary `run_command(background: true)` jobs owned by an active chat proce
 | `/status` | Show project and connection status |
 | `/memory` | List facts Kamui remembers across sessions and projects |
 | `/forget <text>` | Forget one remembered fact, or `/forget all` |
+| `/expand` | Expand the latest transcript card |
+| `/collapse` | Collapse the latest transcript card |
+| `/warnings [on\|off\|details\|fix]` | Hide/show, expand details of, or hand skill warnings to Kamui as a repair task |
 | `/help` | List available commands |
 | `/exit` | Save and quit |
 
-`Ctrl+C` while a turn is running — waiting on the model, streaming, at an approval prompt, or
-running a command — cancels that turn and returns you to the prompt, killing any running command.
-The cancelled turn is not saved. At the idle prompt, `Ctrl+C` exits.
+`Ctrl+C` or `Esc` while a turn is running — waiting on the model, streaming, at an approval
+prompt, or running a command — cancels that turn and returns you to the prompt, killing any
+running command. The cancelled turn is not saved. At the idle prompt, `Ctrl+C` must be pressed
+twice within three seconds to exit (a hint appears on the first press).
 
 `/rename` accepts a session ID prefix followed by the new title; if the renamed session is the
 active one, its in-memory title updates immediately. `/search` matches message text
@@ -435,7 +485,9 @@ session ID, timestamp, title, and a snippet centered on the match.
 After each streamed response, Kamui reports time-to-first-token (`TTFT`) and total response time
 (`Time`) alongside token usage and the finish reason. The line-oriented terminal feed shows compact
 tool arguments followed by completion/failure state, elapsed time, and output size. Responses use
-light markdown styling. Styling and the thinking spinner are disabled when input/output is not a
+light markdown styling. While the model thinks, a braille spinner runs — inline on the scrollback,
+or in the fullscreen transcript's footer — so the wait never looks frozen. Styling and the thinking
+spinner are disabled when input/output is not a
 terminal; `NO_COLOR` disables colour while retaining the structured feed.
 
 `/stats` covers the current session; `/usage` zooms out to every session, reporting tokens per day

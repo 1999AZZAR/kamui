@@ -113,6 +113,30 @@ impl ToolRegistry {
         }
     }
 
+    /// Plan Mode gate (ticket #9): read-only tools plus `update_plan` only.
+    /// Used while a plan is pending approval — mutating tools are held.
+    pub fn plan_mode(project_root: PathBuf) -> Self {
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ReadFileTool {
+                root: project_root.clone(),
+            }),
+            Box::new(ListDirectoryTool {
+                root: project_root.clone(),
+            }),
+            Box::new(GrepTool {
+                root: project_root.clone(),
+            }),
+            Box::new(GlobTool {
+                root: project_root.clone(),
+            }),
+            Box::new(UpdatePlanTool),
+        ];
+        Self {
+            tools,
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
     /// The shared background-job registry, so callers that aren't going through the tool-call
     /// protocol (the chat loop's `/jobs` command, killing jobs on shutdown) can reach it directly.
     pub fn jobs(&self) -> JobRegistry {
@@ -792,6 +816,11 @@ fn parse_plan(arguments: &str) -> Result<Vec<PlanStep>> {
     Ok(arguments.plan)
 }
 
+/// Number of steps in an `update_plan` call, or `None` if it doesn't parse.
+pub fn plan_step_count(arguments: &str) -> Option<usize> {
+    parse_plan(arguments).ok().map(|plan| plan.len())
+}
+
 /// Render an `update_plan` call's raw arguments as a checklist for the chat trace, matching the
 /// existing 4-space-indent trace convention. Returns `None` if the arguments don't parse, so the
 /// caller can fall back to the generic `  → name(args)` trace line.
@@ -1099,7 +1128,7 @@ const CMD_BUILTINS: &[&str] = &[
 const SH_BUILTINS: &[&str] = &[
     ".", ":", "alias", "bg", "break", "cd", "command", "continue", "eval", "exec", "exit",
     "export", "fg", "getopts", "hash", "jobs", "local", "read", "readonly", "return", "set",
-    "shift", "source", "times", "trap", "type", "ulimit", "umask", "unalias", "unset", "wait",
+    "shift", "source", "times", "trap", "ulimit", "umask", "unalias", "unset", "wait",
 ];
 
 /// Decide whether to route a command through `rtk`. Only simple commands are routed: with shell
@@ -1561,6 +1590,44 @@ pub(crate) fn write_atomic(path: &Path, content: &str) -> Result<()> {
         let _ = std::fs::remove_file(&temp);
         format!("failed to replace {}", path.display())
     })
+}
+
+/// Runs a user-typed `!<command>` directly in the project shell. No approval flow — the human
+/// typed it — but the same timeout, output cap, and exit-code reporting as the model's
+/// `run_command` tool. Returns the formatted transcript text.
+pub async fn run_direct_command(
+    root: &std::path::Path,
+    command: &str,
+    timeout: std::time::Duration,
+) -> String {
+    let (shell, flag) = if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    };
+    let child = tokio::process::Command::new(shell)
+        .arg(flag)
+        .arg(command)
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn();
+    let child = match child {
+        Ok(child) => child,
+        Err(error) => return format!("Error: failed to start the command: {error:#}"),
+    };
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(result) => match result {
+            Ok(output) => format!("command: {command}\n{}", format_command_output(&output)),
+            Err(error) => format!("Error: failed to run the command: {error:#}"),
+        },
+        Err(_) => format!(
+            "Error: command timed out after {} seconds and was terminated",
+            timeout.as_secs()
+        ),
+    }
 }
 
 fn format_command_output(output: &Output) -> String {
