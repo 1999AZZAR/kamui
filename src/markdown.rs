@@ -143,26 +143,32 @@ pub fn render_ratatui(text: &str) -> Text<'static> {
     Text::from(lines)
 }
 
-fn ratatui_inline(text: &str) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut plain = String::new();
+/// One piece of an inline-formatted line.
+enum Segment<'a> {
+    Plain(&'a str),
+    Code(&'a str),
+    Bold(&'a str),
+}
+
+/// Scan inline markdown once. Both renderers walk this, so what counts as a code span or an
+/// emphasis marker cannot come to differ between the transcript and plain output -- they were
+/// two separate scanners that happened to agree.
+fn inline_segments(text: &str) -> Vec<Segment<'_>> {
+    let mut segments: Vec<Segment<'_>> = Vec::new();
     let bytes = text.as_bytes();
     let mut index = 0usize;
-    let flush = |spans: &mut Vec<Span<'static>>, plain: &mut String| {
-        if !plain.is_empty() {
-            spans.push(Span::raw(std::mem::take(plain)));
-        }
-    };
+    let mut plain_start = 0usize;
+
     while index < bytes.len() {
         if bytes[index] == b'`'
             && let Some(end) = text[index + 1..].find('`').map(|at| index + 1 + at)
         {
-            flush(&mut spans, &mut plain);
-            spans.push(Span::styled(
-                text[index + 1..end].to_string(),
-                Style::default().fg(Color::Cyan),
-            ));
+            if plain_start < index {
+                segments.push(Segment::Plain(&text[plain_start..index]));
+            }
+            segments.push(Segment::Code(&text[index + 1..end]));
             index = end + 1;
+            plain_start = index;
             continue;
         }
         if bytes[index] == b'*'
@@ -170,16 +176,18 @@ fn ratatui_inline(text: &str) -> Vec<Span<'static>> {
             && let Some(end) = text[index + 2..].find("**").map(|at| index + 2 + at)
         {
             let inner = &text[index + 2..end];
+            // Require non-blank, non-padded content, the standard rule that keeps `**` in code or
+            // a glob (`src/**/*.rs`) from being read as an emphasis marker.
             if !inner.is_empty()
                 && !inner.starts_with(char::is_whitespace)
                 && !inner.ends_with(char::is_whitespace)
             {
-                flush(&mut spans, &mut plain);
-                spans.push(Span::styled(
-                    inner.to_string(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ));
+                if plain_start < index {
+                    segments.push(Segment::Plain(&text[plain_start..index]));
+                }
+                segments.push(Segment::Bold(inner));
                 index = end + 2;
+                plain_start = index;
                 continue;
             }
         }
@@ -187,11 +195,26 @@ fn ratatui_inline(text: &str) -> Vec<Span<'static>> {
             .chars()
             .next()
             .expect("index is on a boundary");
-        plain.push(character);
         index += character.len_utf8();
     }
-    flush(&mut spans, &mut plain);
-    spans
+    if plain_start < text.len() {
+        segments.push(Segment::Plain(&text[plain_start..]));
+    }
+    segments
+}
+
+fn ratatui_inline(text: &str) -> Vec<Span<'static>> {
+    inline_segments(text)
+        .into_iter()
+        .map(|segment| match segment {
+            Segment::Plain(text) => Span::raw(text.to_string()),
+            Segment::Code(text) => Span::styled(text.to_string(), Style::default().fg(Color::Cyan)),
+            Segment::Bold(text) => Span::styled(
+                text.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        })
+        .collect()
 }
 
 fn is_heading(trimmed: &str) -> bool {
@@ -234,43 +257,20 @@ fn split_list_marker(line: &str) -> Option<(&str, &str)> {
 /// bold, and its contents are never reinterpreted, so a backticked `**not bold**` stays literal.
 fn inline(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let mut index = 0usize;
-
-    while index < bytes.len() {
-        if bytes[index] == b'`'
-            && let Some(end) = text[index + 1..].find('`').map(|at| index + 1 + at)
-        {
-            out.push_str(CYAN);
-            out.push_str(&text[index + 1..end]);
-            out.push_str(RESET);
-            index = end + 1;
-            continue;
-        }
-        if bytes[index] == b'*'
-            && bytes.get(index + 1) == Some(&b'*')
-            && let Some(end) = text[index + 2..].find("**").map(|at| index + 2 + at)
-        {
-            let inner = &text[index + 2..end];
-            // Require non-blank, non-padded content, the standard rule that keeps `**` in code or
-            // a glob (`src/**/*.rs`) from being read as an emphasis marker.
-            if !inner.is_empty()
-                && !inner.starts_with(char::is_whitespace)
-                && !inner.ends_with(char::is_whitespace)
-            {
-                out.push_str(BOLD);
-                out.push_str(inner);
+    for segment in inline_segments(text) {
+        match segment {
+            Segment::Plain(text) => out.push_str(text),
+            Segment::Code(text) => {
+                out.push_str(CYAN);
+                out.push_str(text);
                 out.push_str(RESET);
-                index = end + 2;
-                continue;
+            }
+            Segment::Bold(text) => {
+                out.push_str(BOLD);
+                out.push_str(text);
+                out.push_str(RESET);
             }
         }
-        let character = text[index..]
-            .chars()
-            .next()
-            .expect("index is on a boundary");
-        out.push(character);
-        index += character.len_utf8();
     }
     out
 }
@@ -281,6 +281,53 @@ mod tests {
 
     fn render(text: &str) -> String {
         Renderer::new(true).render_block(text)
+    }
+
+    /// The segments a line scans into, as plain markers, so both renderers can be checked
+    /// against the same expectation.
+    fn segments(text: &str) -> Vec<String> {
+        inline_segments(text)
+            .into_iter()
+            .map(|segment| match segment {
+                Segment::Plain(text) => format!("plain:{text}"),
+                Segment::Code(text) => format!("code:{text}"),
+                Segment::Bold(text) => format!("bold:{text}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn both_renderers_scan_a_line_the_same_way() {
+        // They were two separate scanners that happened to agree. This pins the shared rules:
+        // what is code, what is emphasis, and what is left alone.
+        assert_eq!(
+            segments("a `code` and **bold** end"),
+            vec![
+                "plain:a ",
+                "code:code",
+                "plain: and ",
+                "bold:bold",
+                "plain: end"
+            ]
+        );
+        // A glob is not emphasis, and neither is a padded pair.
+        assert_eq!(segments("src/**/*.rs"), vec!["plain:src/**/*.rs"]);
+        assert_eq!(segments("a ** b ** c"), vec!["plain:a ** b ** c"]);
+        // An unclosed marker stays literal rather than swallowing the rest of the line.
+        assert_eq!(segments("half `open"), vec!["plain:half `open"]);
+    }
+
+    #[test]
+    fn the_two_renderers_agree_on_what_they_emphasise() {
+        let line = "a `code` and **bold** end";
+        let ansi = inline(line);
+        let spans = ratatui_inline(line);
+        // Same text either way; only the styling mechanism differs.
+        let from_spans: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(from_spans, "a code and bold end");
+        assert!(ansi.contains(CYAN), "code is coloured in ANSI too");
+        assert!(ansi.contains(BOLD), "and emphasised the same way");
+        assert_eq!(spans.len(), 5, "one span per segment: {spans:?}");
     }
 
     #[test]

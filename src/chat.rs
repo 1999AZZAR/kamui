@@ -2258,7 +2258,7 @@ fn format_search_hits(hits: &[crate::storage::SearchHit], needle: &str) -> Strin
             "{}  {}  {:<30}  {speaker}: {}\n",
             short_id(&hit.session_id),
             format_timestamp(hit.created_at),
-            truncate(&hit.title, 30),
+            crate::tui::truncate_chars(&hit.title, 30),
             make_snippet(&hit.content, needle),
         ));
     }
@@ -3881,14 +3881,6 @@ fn dispatch_memory_tool(database: &Database, name: &str, arguments: &str) -> Str
     result.unwrap_or_else(|error| format!("Error: {error:#}"))
 }
 
-fn truncate(text: &str, max: usize) -> String {
-    let mut result: String = text.chars().take(max).collect();
-    if text.chars().count() > max {
-        result.push('…');
-    }
-    result
-}
-
 /// Collapsed preview: head/tail trimmed, expand hint — box truncates rows to width.
 fn preview_output(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
@@ -4155,7 +4147,7 @@ fn print_skills(
             "  {state} /{:<18} {:<18} {}{tools_hint}",
             skill.name,
             skill.source.badge(),
-            truncate(&skill.description, max_desc)
+            crate::tui::truncate_chars(&skill.description, max_desc)
         );
     }
     if !library.warnings().is_empty() {
@@ -4978,8 +4970,10 @@ mod tests {
 
     #[test]
     fn truncate_appends_ellipsis_only_when_needed() {
-        assert_eq!(truncate("hello", 10), "hello");
-        assert_eq!(truncate("hello world", 5), "hello…");
+        assert_eq!(crate::tui::truncate_chars("hello", 10), "hello");
+        // The ellipsis lives inside the budget. This used to return six columns for a
+        // budget of five, overflowing every column it was sized for.
+        assert_eq!(crate::tui::truncate_chars("hello world", 5), "hell…");
     }
 
     #[test]

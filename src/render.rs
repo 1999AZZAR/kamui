@@ -10,6 +10,7 @@
 use dialoguer::console::Term;
 
 use crate::terminal::{Style, Ui};
+use unicode_width::UnicodeWidthStr;
 
 /// Minimum box width; terminals report 0 columns when not attached.
 const MIN_WIDTH: usize = 40;
@@ -19,13 +20,6 @@ fn terminal_width() -> usize {
 }
 
 /// Truncate `line` to at most `max` characters (by char, not byte).
-fn truncate(line: &str, max: usize) -> String {
-    if line.chars().count() <= max {
-        return line.to_string();
-    }
-    line.chars().take(max).collect()
-}
-
 /// Split `text` into body rows (trailing whitespace trimmed per line).
 fn body(text: &str) -> Vec<String> {
     text.lines()
@@ -47,25 +41,36 @@ fn box_lines(
     box_style: &[Style],
 ) -> String {
     let width = width.max(MIN_WIDTH);
-    let title = truncate(title, width.saturating_sub(4));
+    // Room between the bar that opens a row and the bar that closes it.
+    let inner = width.saturating_sub(4);
+    let title = crate::tui::truncate_chars(title, inner);
     let mut out = String::new();
 
-    // ┌─ <title> ──…──┐
-    let lead = format!("┌─ {title} ─");
+    let lead = format!("\u{250c}\u{2500} {title} \u{2500}");
+    let lead_width = UnicodeWidthStr::width(lead.as_str());
     let top = format!(
-        "{lead}{}┐",
-        "─".repeat(width.saturating_sub(lead.chars().count() + 1))
+        "{lead}{}\u{2510}",
+        "\u{2500}".repeat(width.saturating_sub(lead_width + 1))
     );
     out.push_str(&ui.style(&top, title_style));
     out.push('\n');
 
     for line in body_lines {
-        let row = format!("│ {} │", truncate(line, width - 4));
+        // Padded to the same inner width as every other row. Without this the closing bar
+        // landed wherever the text happened to end, so the box had no right edge at all.
+        let text = crate::tui::truncate_chars(line, inner);
+        let padding = inner.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+        let row = format!("\u{2502} {text}{} \u{2502}", " ".repeat(padding));
         out.push_str(&ui.style(&row, box_style));
         out.push('\n');
     }
 
-    let bottom = format!("└{}┘", "─".repeat(width - 1));
+    // `width - 2`, not `width - 1`: the two corners take a column each, so the old fill made
+    // the bottom border one character wider than the top.
+    let bottom = format!(
+        "\u{2514}{}\u{2518}",
+        "\u{2500}".repeat(width.saturating_sub(2))
+    );
     out.push_str(&ui.style(&bottom, box_style));
     out.push('\n');
     out
@@ -182,7 +187,13 @@ mod tests {
         let lines: Vec<&str> = rendered.lines().collect();
         assert!(lines[0].starts_with("┌─ Tool: read_file ─"));
         assert_eq!(lines[0].chars().count(), 40);
-        assert!(lines[1].starts_with("│ short │"));
+        // Every row is the same width, so the box actually has a right edge. The bottom
+        // border used to be one column wider than the top.
+        for line in &lines {
+            assert_eq!(line.chars().count(), 40, "ragged row: {line:?}");
+        }
+        assert!(lines[1].starts_with("│ short"));
+        assert!(lines[1].ends_with("│"));
         assert!(lines[2].starts_with('└'));
         assert!(rendered.ends_with('\n'));
     }
