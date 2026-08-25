@@ -27,6 +27,18 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("warnings", "Hide/show warnings; details; fix"),
 ];
 
+/// Whether `name` is a built-in slash command, and so not a name a user command file or a
+/// skill folder may take over. Derived from `BUILTINS` rather than repeated, because the two
+/// hand-maintained copies of this list had drifted from it and from each other: neither knew
+/// about `/plan`, `/expand`, `/collapse`, or `/mode`, so a skill or command file with one of
+/// those names would quietly shadow the real command.
+pub fn is_builtin_command(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    BUILTINS.iter().any(|(builtin, _)| *builtin == name)
+        // Handled but not advertised in the menu.
+        || matches!(name.as_str(), "models" | "warning")
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Candidate {
     /// Without leading `/` (e.g. `help`, `my-skill`)
@@ -116,6 +128,30 @@ mod tests {
         .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+
+    #[test]
+    fn every_advertised_command_is_reserved() {
+        // A user command file or skill folder named after a built-in would shadow it, because
+        // expansion runs before built-in dispatch. Two stale hand-written copies of this list
+        // is how /plan, /expand, /collapse, and /mode became shadowable.
+        for (name, _) in BUILTINS {
+            assert!(
+                is_builtin_command(name),
+                "/{name} is offered but not reserved"
+            );
+        }
+        assert!(is_builtin_command("MODE"), "case is not an escape hatch");
+        assert!(is_builtin_command(" plan "), "nor is surrounding space");
+        assert!(
+            is_builtin_command("models"),
+            "unadvertised aliases count too"
+        );
+        assert!(
+            !is_builtin_command("review"),
+            "ordinary names stay available"
+        );
+        assert!(!is_builtin_command(""), "an empty name is not a command");
     }
 
     #[test]

@@ -124,12 +124,6 @@ impl SkillLibrary {
         &self.warnings
     }
 
-    const RESERVED: [&str; 20] = [
-        "help", "new", "sessions", "resume", "model", "rename", "search", "compact", "undo",
-        "jobs", "index", "delete", "stats", "status", "memory", "forget", "exit", "commands",
-        "skills", "usage",
-    ];
-
     /// Expand `/<name> [extra]` or `/skill:<name> [extra]` into the skill body.
     /// Returns `None` if the input does not match a known skill.
     /// Trailing text is appended below the body (same as `CommandLibrary::expand`).
@@ -150,7 +144,7 @@ impl SkillLibrary {
         }
         // Bare form: /<name> [args] — must not shadow a built-in.
         let (name, argument) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-        if Self::RESERVED.contains(&name.trim().to_ascii_lowercase().as_str()) {
+        if crate::tui::is_builtin_command(name) {
             return None;
         }
         let name = name.trim().to_ascii_lowercase();

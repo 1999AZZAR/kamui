@@ -3793,6 +3793,10 @@ pub(crate) fn print_help(out: &mut String) {
     );
     let _ = writeln!(
         out,
+        "/mode [name]      build / auto / plan \u{2014} what a turn may do on its own (Tab cycles)"
+    );
+    let _ = writeln!(
+        out,
         "/plan             Enter Plan Mode (gate mutating tools until plan approved)"
     );
     let _ = writeln!(out, "/skills           List discovered skills");

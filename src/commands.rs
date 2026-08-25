@@ -14,12 +14,6 @@ const GLOBAL_DIR: &str = "commands";
 
 /// Built-in chat commands a custom command may not shadow, so a stray file can never take over
 /// `/new` or `/exit`. Kept in sync with `chat::print_help` and the chat loop's own dispatch.
-const RESERVED: [&str; 21] = [
-    "help", "new", "sessions", "resume", "model", "rename", "search", "compact", "undo", "jobs",
-    "index", "delete", "stats", "status", "memory", "forget", "exit", "commands", "skills",
-    "usage", "warnings",
-];
-
 /// Where a command was loaded from. A project command shadows a global one of the same name, the
 /// same way a project `kamui.toml` overrides the global file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +113,7 @@ fn load_dir(dir: &Path, source: Source, commands: &mut Vec<CustomCommand>) {
         else {
             continue;
         };
-        if !is_valid_name(&name) || RESERVED.contains(&name.as_str()) {
+        if !is_valid_name(&name) || crate::tui::is_builtin_command(&name) {
             continue;
         }
         let Ok(content) = std::fs::read_to_string(&path) else {
