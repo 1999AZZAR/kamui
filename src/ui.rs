@@ -1245,6 +1245,22 @@ impl InputHub {
         true
     }
 
+    /// Opens the skills picker. It goes through the same dialog machinery as the model and
+    /// session pickers on purpose: the previous popup drove `console::Term` directly, reading
+    /// keys from the same stdin this hub's thread is already blocked on and painting raw ANSI
+    /// into the alternate screen ratatui owns and repaints.
+    pub fn open_skills_dialog(&self, items: Vec<(String, String)>) -> bool {
+        if items.is_empty() {
+            return false;
+        }
+        {
+            let mut s = lock_screen(&self.screen.0);
+            s.model.dialog = Some(DialogState::new("Skills", "/skills toggle ", items));
+        }
+        let _ = self.screen.draw_now();
+        true
+    }
+
     pub fn open_models_dialog(&self) -> bool {
         let items = self
             .models_src

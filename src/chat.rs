@@ -16,11 +16,11 @@ use crate::tools::ToolRegistry;
 use crate::ui::{ChatUi, HubEvent, InputHub};
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
-use dialoguer::console::{Key, Term};
+use dialoguer::console::Term;
 use futures_util::future::join_all;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -575,37 +575,71 @@ where
                 continue;
             }
             if command == "/skills" {
-                // Non-interactive (piped) fallback: plain list.
-                if !Ui::stdio().interactive() {
-                    let mut buf = String::new();
-                    print_skills(&skill_library, &disabled_skills, &mut buf);
-                    print!("{buf}");
+                let argument = argument.trim();
+                // `/skills toggle <name>` is what the picker submits on Enter, and it works
+                // typed directly too.
+                if let Some(name) = argument.strip_prefix("toggle ") {
+                    let name = name.trim();
+                    match skill_library.list().iter().find(|skill| skill.name == name) {
+                        Some(skill) => {
+                            let now_disabled = !disabled_skills.contains(&skill.name);
+                            match crate::settings::set_skill_disabled(
+                                project.root(),
+                                skill,
+                                now_disabled,
+                            ) {
+                                Ok(()) => {
+                                    disabled_skills =
+                                        crate::settings::load_disabled_skills(project.root());
+                                    chat_ui.notice(&format!(
+                                        "/{} is now {}",
+                                        skill.name,
+                                        if now_disabled { "disabled" } else { "enabled" }
+                                    ))?;
+                                }
+                                Err(error) => {
+                                    chat_ui.error(&format!("Could not save: {error:#}"))?;
+                                }
+                            }
+                        }
+                        None => chat_ui.notice(&format!("No skill named '{name}'."))?,
+                    }
                     continue;
                 }
-                let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-                if !is_tty {
+                // A picker, through the same dialog machinery the model and session pickers use.
+                // The previous popup drove `console::Term` on its own: it read keys from the
+                // stdin the input thread was already blocked on, and painted raw ANSI into the
+                // alternate screen ratatui owns and repaints over.
+                let opened = if use_tui {
+                    let items: Vec<(String, String)> = skill_library
+                        .list()
+                        .iter()
+                        .map(|skill| {
+                            let state = if disabled_skills.contains(&skill.name) {
+                                "disabled"
+                            } else {
+                                "enabled"
+                            };
+                            (
+                                skill.name.clone(),
+                                format!("[{state}] {}", skill.description),
+                            )
+                        })
+                        .collect();
+                    hub.as_ref()
+                        .map(|hub| hub.open_skills_dialog(items))
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                if !opened {
                     let mut buf = String::new();
                     print_skills(&skill_library, &disabled_skills, &mut buf);
-                    print!("{buf}");
-                    continue;
-                }
-                // Run popup on a blocking thread so the tokio runtime is not blocked.
-                // Clone the library's data for 'static; the popup needs no live borrow.
-                let skills_snapshot = skill_library.list().to_vec();
-                let warnings_snapshot = skill_library.warnings().to_vec();
-                let root = project.root().to_path_buf();
-                let root2 = root.clone();
-                let mut ds = disabled_skills.clone();
-                let changed = tokio::task::spawn_blocking(move || {
-                    let lib =
-                        crate::skills::SkillLibrary::from_parts(skills_snapshot, warnings_snapshot);
-                    run_skills_popup(&lib, &root, &mut ds)
-                })
-                .await
-                .unwrap_or(Ok(false))
-                .unwrap_or(false);
-                if changed {
-                    disabled_skills = crate::settings::load_disabled_skills(&root2);
+                    if use_tui {
+                        chat_ui.notice(buf.trim_end())?;
+                    } else {
+                        print!("{buf}");
+                    }
                 }
                 continue;
             }
@@ -2317,13 +2351,15 @@ fn print_stats(
         );
     }
     if let (Some(last_input), Some(window)) = (stats.last_input_tokens, context_window) {
+        // Buffered like every other line. `print!` here sent the report's most useful line to
+        // raw stdout, which both dropped it from `/stats` and wrote it over the frame.
         let percent = last_input as f64 / window as f64 * 100.0;
-        print!("Last context:  {last_input}/{window} ({percent:.1}%)");
+        let _ = write!(out, "Last context:  {last_input}/{window} ({percent:.1}%)");
         if let Some(cached) = stats.last_cached_tokens.filter(|cached| *cached > 0) {
             let cached_percent = (cached as f64 / last_input as f64 * 100.0).min(100.0);
-            print!(" | Cached: {cached} ({cached_percent:.0}%)");
+            let _ = write!(out, " | Cached: {cached} ({cached_percent:.0}%)");
         }
-        let _ = writeln!(out,);
+        let _ = writeln!(out);
     }
     let by_model = database.model_stats(&session.id)?;
     if by_model.len() > 1 {
@@ -4153,182 +4189,6 @@ fn print_skills(
     );
 }
 
-/// Interactive popup for `/skills`: grouped by location, arrow keys navigate, Enter toggles
-/// enable/disable (persisted to user vs project settings.json), Esc closes.
-/// Returns `Ok(true)` if any toggle was made (caller should reload `disabled_skills`).
-fn source_rank(source: crate::skills::SkillSource) -> u8 {
-    match source {
-        crate::skills::SkillSource::ProjectKamui => 0,
-        crate::skills::SkillSource::ProjectAgents => 1,
-        crate::skills::SkillSource::GlobalKamui => 2,
-        crate::skills::SkillSource::GlobalAgents => 3,
-    }
-}
-
-fn source_label(source: crate::skills::SkillSource) -> &'static str {
-    match source {
-        crate::skills::SkillSource::ProjectKamui => "project .kamui",
-        crate::skills::SkillSource::ProjectAgents => "project .agents",
-        crate::skills::SkillSource::GlobalKamui => "global .kamui",
-        crate::skills::SkillSource::GlobalAgents => "global .agents",
-    }
-}
-
-fn run_skills_popup(
-    library: &crate::skills::SkillLibrary,
-    project_root: &std::path::Path,
-    disabled: &mut std::collections::HashSet<String>,
-) -> anyhow::Result<bool> {
-    if library.list().is_empty() {
-        let mut buf = String::new();
-        print_skills(library, disabled, &mut buf);
-        print!("{buf}");
-        return Ok(false);
-    }
-
-    // Build display order: grouped by SkillSource priority, then name.
-    let mut order: Vec<usize> = (0..library.list().len()).collect();
-    order.sort_by_key(|&i| {
-        let s = &library.list()[i];
-        (source_rank(s.source), s.name.clone())
-    });
-
-    let mut selected: usize = 0;
-    let mut changed = false;
-    let term = Term::stdout();
-
-    // Fall back to a plain list when not a TTY or NO_COLOR is set (no ANSI).
-    if !Ui::stdio().interactive() || std::env::var_os("NO_COLOR").is_some() {
-        let mut buf = String::new();
-        print_skills(library, disabled, &mut buf);
-        print!("{buf}");
-        return Ok(false);
-    }
-
-    // Hide cursor
-    let _ = term.hide_cursor();
-
-    let (term_h, term_w) = term.size();
-    let visible = (term_h as usize).saturating_sub(6).clamp(5, 10);
-    let max_desc = (term_w as usize).saturating_sub(40).clamp(20, 60);
-
-    let render = |selected: usize, disabled: &std::collections::HashSet<String>| -> String {
-        let total = order.len();
-        let start = selected
-            .saturating_sub(visible / 2)
-            .min(total.saturating_sub(visible));
-        let mut out = String::new();
-        out.push_str(
-            "\x1b[1mSkills\x1b[0m · \x1b[2m↑/↓ navigate · Enter toggle · Esc close\x1b[0m\n",
-        );
-        let mut last_rank = if start > 0 {
-            Some(source_rank(library.list()[order[start - 1]].source))
-        } else {
-            None
-        };
-        for (row, &idx) in order.iter().skip(start).take(visible).enumerate() {
-            let pos = start + row;
-            let skill = &library.list()[idx];
-            let rank = source_rank(skill.source);
-            if last_rank != Some(rank) {
-                out.push_str(&format!(
-                    "\n\x1b[2m─ {} ─\x1b[0m\n",
-                    source_label(skill.source)
-                ));
-                last_rank = Some(rank);
-            }
-            let is_on = pos == selected;
-            let enabled = !disabled.contains(&skill.name);
-            let badge = if enabled { "●" } else { "○" };
-            let state = if enabled { "enabled" } else { "disabled" };
-            let prefix = if is_on { "\x1b[7m" } else { "" };
-            let suffix = if is_on { "\x1b[0m" } else { "" };
-            let dim = if enabled { "" } else { "\x1b[2m" };
-            let dim_off = if enabled { "" } else { "\x1b[0m" };
-            let desc = truncate(&skill.description, max_desc);
-            out.push_str(&format!(
-                "{prefix}{dim} {badge} /{:<18} {} [{state}]{dim_off}{suffix}\n",
-                skill.name, desc
-            ));
-        }
-        out
-    };
-
-    // Initial draw: clear below and print
-    let mut last_lines: usize = 0;
-    let draw =
-        |selected: usize, disabled: &std::collections::HashSet<String>, last_lines: &mut usize| {
-            let text = render(selected, disabled);
-            let lines = text.matches('\n').count() + 1;
-            if *last_lines > 0 {
-                // Move up and clear
-                let _ = term.write_str(&format!("\x1b[{}A\x1b[J", last_lines));
-            }
-            let _ = term.write_str(&text);
-            let _ = term.flush();
-            *last_lines = lines;
-        };
-
-    draw(selected, disabled, &mut last_lines);
-
-    #[allow(clippy::while_let_loop)]
-    loop {
-        let key = match term.read_key() {
-            Ok(k) => k,
-            Err(_) => break,
-        };
-        match key {
-            Key::ArrowUp => {
-                if selected > 0 {
-                    selected -= 1;
-                } else {
-                    selected = order.len() - 1;
-                }
-                draw(selected, disabled, &mut last_lines);
-            }
-            Key::ArrowDown => {
-                selected = (selected + 1) % order.len();
-                draw(selected, disabled, &mut last_lines);
-            }
-            Key::Enter => {
-                let idx = order[selected];
-                let skill = &library.list()[idx];
-                let was_disabled = disabled.contains(&skill.name);
-                let now_disabled = !was_disabled;
-                // Persist
-                if let Err(e) =
-                    crate::settings::set_skill_disabled(project_root, skill, now_disabled)
-                {
-                    // Show error inline then continue
-                    let _ = term.write_str(&format!("\n\x1b[31mFailed to save: {e}\x1b[0m\n"));
-                    let _ = term.flush();
-                } else {
-                    if now_disabled {
-                        disabled.insert(skill.name.clone());
-                    } else {
-                        disabled.remove(&skill.name);
-                    }
-                    changed = true;
-                }
-                draw(selected, disabled, &mut last_lines);
-            }
-            Key::Escape => break,
-            Key::Char('q') | Key::Char('Q') => break,
-            _ => {}
-        }
-    }
-
-    // Restore cursor and move to next line
-    let _ = term.show_cursor();
-    let _ = term.write_line("");
-    let _ = term.flush();
-
-    if changed {
-        println!("\nUpdated disabledSkills. Changes apply to the next turn.\n");
-    }
-    Ok(changed)
-}
-
 /// List the user's own prompt commands, or explain where to put one when there are none yet.
 fn print_commands(library: &commands::CommandLibrary, out: &mut String) {
     if library.is_empty() {
@@ -4490,6 +4350,74 @@ mod tests {
             attached_files: attached,
             omitted_files: omitted,
         }
+    }
+
+    #[test]
+    fn stats_put_the_context_line_in_the_report_not_on_stdout() {
+        // Every other line of the report is buffered into `out`; this one used `print!`, so it
+        // was missing from `/stats` in the transcript and went straight through the frame
+        // ratatui owns instead. It is also the line most worth reading.
+        let database = Database::open_in_memory_for_tests();
+        let session = database.create_session("test", "m").unwrap();
+        database
+            .save_turn(
+                &session.id,
+                &[Message::user("hi"), Message::assistant("hello")],
+                &Usage {
+                    prompt_tokens: 400,
+                    completion_tokens: 50,
+                    total_tokens: 450,
+                    cached_tokens: 0,
+                },
+                "m",
+                "stop",
+            )
+            .unwrap();
+
+        let mut out = String::new();
+        print_stats(
+            &database,
+            &session,
+            Some(1000),
+            &Prices::default(),
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(
+            out.contains("Last context:"),
+            "the line is in the report: {out:?}"
+        );
+        assert!(out.contains("400/1000"), "with the numbers: {out:?}");
+        assert!(out.contains("40.0%"), "and the percentage: {out:?}");
+    }
+
+    #[test]
+    fn stats_omit_the_context_line_when_no_window_is_configured() {
+        let database = Database::open_in_memory_for_tests();
+        let session = database.create_session("test", "m").unwrap();
+        database
+            .save_turn(
+                &session.id,
+                &[Message::user("hi"), Message::assistant("hello")],
+                &Usage {
+                    prompt_tokens: 400,
+                    completion_tokens: 50,
+                    total_tokens: 450,
+                    cached_tokens: 0,
+                },
+                "m",
+                "stop",
+            )
+            .unwrap();
+
+        let mut out = String::new();
+        print_stats(&database, &session, None, &Prices::default(), &mut out).unwrap();
+
+        assert!(
+            !out.contains("Last context:"),
+            "nothing to measure against: {out:?}"
+        );
     }
 
     #[test]

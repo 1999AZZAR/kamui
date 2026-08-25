@@ -447,7 +447,8 @@ Highlights:
   `Ctrl+Home`/`Ctrl+End`. Typing snaps back to the live tail, and while you are scrolled away from
   it the footer says how far back you are and how to return.
 - **Dialogs** — `Ctrl+K` model picker, `Ctrl+S` session switcher, `?` keybinding sheet. Bare
-  `/model`, `/sessions`, and `/help` open the same overlays. Enter submits through the normal
+  `/model`, `/sessions`, `/skills`, and `/help` open the same overlays; picking a skill toggles it
+  on or off (`/skills toggle <name>` does the same from the prompt). Enter submits through the normal
   command path, so queueing still applies while busy.
 - **Transcript search** — `Ctrl+F` searches what is on screen right now (`/search` looks through
   saved sessions in SQLite, which is a different question). Every matching row is washed, the one

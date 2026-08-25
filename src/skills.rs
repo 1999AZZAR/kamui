@@ -64,10 +64,6 @@ pub struct SkillLibrary {
 }
 
 impl SkillLibrary {
-    pub fn from_parts(skills: Vec<Skill>, warnings: Vec<String>) -> Self {
-        Self { skills, warnings }
-    }
-
     /// Discover skills from the four locations. Missing/unreadable directories are silently
     /// ignored; invalid skills are skipped with a warning (never a crash).
     pub fn load(project_root: &Path) -> Self {
