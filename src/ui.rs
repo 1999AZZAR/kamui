@@ -197,6 +197,10 @@ pub struct PermissionState {
     pub title: String,
     pub body: String,
     pub selected: usize,
+    /// First body row shown. A patch diff is routinely longer than the modal, and the body was
+    /// cut at ten rows with nothing saying so -- you were being asked to authorise a change you
+    /// could not finish reading.
+    pub scroll: usize,
 }
 
 /// A modal picker that submits an existing slash command on Enter — pure UI sugar over
@@ -933,6 +937,13 @@ impl ChatUi {
         }
     }
 
+    /// Appends a past answer as its own cell. Replay must not go through `assistant_update`:
+    /// that one *replaces* the last assistant card, because it exists to grow a card as tokens
+    /// stream in. Two stored answers in a row would overwrite each other.
+    pub fn assistant_replay(&mut self, text: &str) -> Result<()> {
+        self.card(CardKind::Output, "Assistant", text)
+    }
+
     pub fn assistant_done(&mut self) -> Result<()> {
         match self.fullscreen.as_ref() {
             Some(screen) => lock_screen(screen).draw(),
@@ -1318,6 +1329,7 @@ impl InputHub {
                 title: title.to_string(),
                 body,
                 selected: 0,
+                scroll: 0,
             });
         }
         let _ = self.screen.draw_now();
@@ -1516,11 +1528,19 @@ fn render_dialog(frame: &mut Frame<'_>, dialog: &DialogState, area: Rect) {
 /// Approval modal: preview body plus the three opencode options.
 fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) {
     let width = 64.min(area.width.saturating_sub(4));
-    let body_rows: Vec<String> = wrap_display(&perm.body, width.saturating_sub(6) as usize)
-        .into_iter()
-        .take(10)
+    let all_rows: Vec<String> = wrap_display(&perm.body, width.saturating_sub(6) as usize);
+    // Everything the box spends on chrome: blank row, options, the scroll note, the key hint.
+    let chrome = PERM_OPTIONS.len() + 5;
+    let ceiling = area.height.saturating_sub(2).max(7) as usize;
+    let capacity = ceiling.saturating_sub(chrome).max(1);
+    let scroll = perm.scroll.min(all_rows.len().saturating_sub(capacity));
+    let body_rows: Vec<String> = all_rows
+        .iter()
+        .skip(scroll)
+        .take(capacity)
+        .cloned()
         .collect();
-    let height = (body_rows.len() as u16 + PERM_OPTIONS.len() as u16 + 5)
+    let height = ((body_rows.len() + chrome) as u16)
         .min(area.height.saturating_sub(2))
         .max(7);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
@@ -1536,6 +1556,17 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
     let mut lines = Vec::new();
     for row in &body_rows {
         lines.push(Line::styled(row.clone(), Style::default().fg(TEXT)));
+    }
+    if all_rows.len() > body_rows.len() {
+        lines.push(Line::styled(
+            format!(
+                "\u{2026} showing {}-{} of {} lines \u{b7} PgUp/PgDn",
+                scroll + 1,
+                scroll + body_rows.len(),
+                all_rows.len()
+            ),
+            Style::default().fg(WARN),
+        ));
     }
     lines.push(Line::from(""));
     for (idx, (_, label)) in PERM_OPTIONS.iter().enumerate() {
@@ -1758,6 +1789,13 @@ fn input_thread(
                     }
                     KeyCode::Down => {
                         perm.selected = (perm.selected + 1) % PERM_OPTIONS.len();
+                    }
+                    // Up/Down belong to the options, so the body pages instead.
+                    KeyCode::PageUp => {
+                        perm.scroll = perm.scroll.saturating_sub(5);
+                    }
+                    KeyCode::PageDown => {
+                        perm.scroll += 5;
                     }
                     KeyCode::Enter => {
                         let answer = PERM_OPTIONS[perm.selected.min(PERM_OPTIONS.len() - 1)]
@@ -3863,6 +3901,70 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].spans[0].content, "\u{258c} ");
         assert_eq!(lines[0].spans[0].style.fg, Some(ACCENT));
+    }
+
+    #[test]
+    fn a_long_approval_body_scrolls_instead_of_being_cut() {
+        // A patch diff is routinely longer than the modal. The body was cut at ten rows with
+        // nothing saying so, which is being asked to authorise a change you cannot finish
+        // reading.
+        let body = (1..=40)
+            .map(|i| format!("+ line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let perm = PermissionState {
+            title: "Allow patch_file?".into(),
+            body,
+            selected: 0,
+            scroll: 0,
+        };
+        let backend = ratatui::backend::TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_permission(frame, &perm, area);
+            })
+            .expect("draw");
+        let screen: String = {
+            let buffer = terminal.backend().buffer().clone();
+            (0..30)
+                .map(|y| {
+                    (0..80)
+                        .map(|x| buffer[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            screen.contains("of 40 lines"),
+            "the modal admits what it hid:\n{screen}"
+        );
+        assert!(screen.contains("PgUp/PgDn"), "and says how to see the rest");
+        assert!(screen.contains("line 1"), "the body starts at the top");
+
+        // Scrolled down, later lines come into view.
+        let scrolled = PermissionState { scroll: 20, ..perm };
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_permission(frame, &scrolled, area);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let screen: String = (0..30)
+            .map(|y| {
+                (0..80)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("line 30"),
+            "scrolling reaches later lines:\n{screen}"
+        );
     }
 
     #[test]

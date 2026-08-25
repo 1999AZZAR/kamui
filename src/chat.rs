@@ -29,6 +29,8 @@ use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
 const RESUME_PREVIEW_MESSAGES: usize = 6;
+/// How many stored messages `/resume` replays into the transcript.
+const RESUME_REPLAY_MESSAGES: usize = 10;
 /// Upper bound on model/tool round-trips within a single user turn, to stop runaway tool loops.
 /// Generous enough for multi-file edits while still bounding a stuck loop.
 const MAX_TOOL_ROUNDS: usize = 25;
@@ -742,9 +744,8 @@ where
             if command == "/undo" {
                 match last_turn_snapshot.take() {
                     Some(snapshot) => {
-                        let reverted = revert_snapshot(&snapshot);
                         chat_ui
-                            .notice(&format!("Reverted {reverted} file(s) from the last turn."))?;
+                            .notice(&revert_snapshot(&snapshot).summary("from the last turn"))?;
                     }
                     None => chat_ui.notice("Nothing to undo.")?,
                 }
@@ -1059,20 +1060,20 @@ where
                     Err(error) => {
                         stop_spinner(&mut spinner, &mut chat_ui).await;
                         chat_ui.error(&format!("Request failed: {error:#}"))?;
-                        revert_on_cancel(&turn_snapshot);
+                        revert_on_cancel(&mut chat_ui, &turn_snapshot);
                         continue 'chat;
                     }
                 },
                 signal = tokio::signal::ctrl_c() => {
                     stop_spinner(&mut spinner, &mut chat_ui).await;
                     signal.context("failed to listen for Ctrl+C")?;
-                    revert_on_cancel(&turn_snapshot);
+                    revert_on_cancel(&mut chat_ui, &turn_snapshot);
                     chat_ui.notice("interrupted — back to prompt")?;
                     continue 'chat;
                 },
                 () = wait_interrupt(&interrupt) => {
                     stop_spinner(&mut spinner, &mut chat_ui).await;
-                    revert_on_cancel(&turn_snapshot);
+                    revert_on_cancel(&mut chat_ui, &turn_snapshot);
                     chat_ui.notice("interrupted — back to prompt")?;
                     continue 'chat;
                 }
@@ -1095,7 +1096,7 @@ where
                         } else {
                             print!("{}", renderer.finish());
                         }
-                        revert_on_cancel(&turn_snapshot);
+                        revert_on_cancel(&mut chat_ui, &turn_snapshot);
                         chat_ui.notice("interrupted — back to prompt")?;
                         continue 'chat;
                     }
@@ -1106,7 +1107,7 @@ where
                         } else {
                             print!("{}", renderer.finish());
                         }
-                        revert_on_cancel(&turn_snapshot);
+                        revert_on_cancel(&mut chat_ui, &turn_snapshot);
                         chat_ui.notice("interrupted — back to prompt")?;
                         continue 'chat;
                     }
@@ -1153,7 +1154,7 @@ where
                                 render::render_error(&format!("Request failed: {error:#}"), ui)
                             );
                         }
-                        revert_on_cancel(&turn_snapshot);
+                        revert_on_cancel(&mut chat_ui, &turn_snapshot);
                         continue 'chat;
                     }
                     None => {
@@ -1170,7 +1171,7 @@ where
                                 )
                             );
                         }
-                        revert_on_cancel(&turn_snapshot);
+                        revert_on_cancel(&mut chat_ui, &turn_snapshot);
                         continue 'chat;
                     }
                 }
@@ -1253,7 +1254,7 @@ where
                     ) => output,
                     signal = tokio::signal::ctrl_c() => {
                         signal.context("failed to listen for Ctrl+C")?;
-                        revert_on_cancel(&turn_snapshot);
+                        revert_on_cancel(&mut chat_ui, &turn_snapshot);
                         chat_ui.notice("interrupted — back to prompt")?;
                         continue 'chat;
                     }
@@ -1320,7 +1321,7 @@ where
                         () = wait_interrupt(&interrupt) => None,
                             signal = tokio::signal::ctrl_c() => {
                                 signal.context("failed to listen for Ctrl+C")?;
-                                revert_on_cancel(&turn_snapshot);
+                                revert_on_cancel(&mut chat_ui, &turn_snapshot);
                                 chat_ui.notice("interrupted — back to prompt")?;
                                 continue 'chat;
                             }
@@ -1360,12 +1361,12 @@ where
                         output = ask_user(&mut input_rx, use_tui, &call.arguments, hub.as_mut()) => output?,
                         signal = tokio::signal::ctrl_c() => {
                             signal.context("failed to listen for Ctrl+C")?;
-                            revert_on_cancel(&turn_snapshot);
+                            revert_on_cancel(&mut chat_ui, &turn_snapshot);
                             chat_ui.notice("interrupted — back to prompt")?;
                             continue 'chat;
                         }
                         () = wait_interrupt(&interrupt) => {
-                            revert_on_cancel(&turn_snapshot);
+                            revert_on_cancel(&mut chat_ui, &turn_snapshot);
                             chat_ui.notice("interrupted — back to prompt")?;
                             continue 'chat;
                         }
@@ -1388,7 +1389,7 @@ where
                                 ) => output,
                                 signal = tokio::signal::ctrl_c() => {
                                     signal.context("failed to listen for Ctrl+C")?;
-                                    revert_on_cancel(&turn_snapshot);
+                                    revert_on_cancel(&mut chat_ui, &turn_snapshot);
                                     chat_ui.notice("interrupted — back to prompt")?;
                                     continue 'chat;
                                 }
@@ -1419,7 +1420,7 @@ where
                         () = wait_interrupt(&interrupt) => None,
                         signal = tokio::signal::ctrl_c() => {
                             signal.context("failed to listen for Ctrl+C")?;
-                            revert_on_cancel(&turn_snapshot);
+                            revert_on_cancel(&mut chat_ui, &turn_snapshot);
                             chat_ui.notice("interrupted — back to prompt")?;
                             continue 'chat;
                         }
@@ -1446,7 +1447,7 @@ where
                             output = tools.dispatch(call) => output,
                             signal = tokio::signal::ctrl_c() => {
                                 signal.context("failed to listen for Ctrl+C")?;
-                                revert_on_cancel(&turn_snapshot);
+                                revert_on_cancel(&mut chat_ui, &turn_snapshot);
                                 chat_ui.notice("interrupted — back to prompt")?;
                                 continue 'chat;
                             }
@@ -1467,7 +1468,7 @@ where
                         output = tools.dispatch(call) => output,
                         signal = tokio::signal::ctrl_c() => {
                             signal.context("failed to listen for Ctrl+C")?;
-                            revert_on_cancel(&turn_snapshot);
+                            revert_on_cancel(&mut chat_ui, &turn_snapshot);
                             chat_ui.notice("interrupted — back to prompt")?;
                             continue 'chat;
                         }
@@ -2037,12 +2038,20 @@ fn handle_command(
             if let Some(ui) = tui.as_deref_mut() {
                 // Replay the last few user/assistant turns as transcript cards; raw text
                 // would print straight into the frame the TUI owns.
-                let skip = messages.len().saturating_sub(10);
+                let skip = messages.len().saturating_sub(RESUME_REPLAY_MESSAGES);
+                if skip > 0 {
+                    // Say what is missing. The omitted messages are still sent to the model, so
+                    // a transcript that starts mid-conversation with no note reads as the whole
+                    // of it -- and the model then appears to know things it was never told.
+                    ui.notice(&format!(
+                        "{skip} earlier message(s) not replayed \u{2014} still in context"
+                    ))?;
+                }
                 for message in &messages[skip..] {
                     match message.role {
                         Role::User => ui.user(&message.content)?,
                         Role::Assistant if !message.content.is_empty() => {
-                            ui.assistant_update(&message.content)?
+                            ui.assistant_replay(&message.content)?
                         }
                         _ => {}
                     }
@@ -2554,9 +2563,49 @@ fn snapshot_patch_target(
 /// content, or delete a file that did not exist before the turn. Best-effort — a failure on one
 /// file is reported but does not stop the rest from being reverted. Returns how many files were
 /// successfully reverted.
-fn revert_snapshot(snapshot: &HashMap<PathBuf, Option<String>>) -> usize {
-    let mut reverted = 0;
-    for (path, original) in snapshot {
+/// What reverting a turn's file snapshot actually did: which files came back, and which would
+/// not. A bare count says neither, and a failure used to go to stderr -- straight through the
+/// frame ratatui owns, where it corrupts the display instead of being read.
+#[derive(Debug, Default)]
+struct RevertOutcome {
+    reverted: Vec<String>,
+    failed: Vec<String>,
+}
+
+impl RevertOutcome {
+    fn is_empty(&self) -> bool {
+        self.reverted.is_empty() && self.failed.is_empty()
+    }
+
+    /// A report that names the files. `context` says which turn they belong to.
+    fn summary(&self, context: &str) -> String {
+        let mut out = if self.reverted.is_empty() {
+            format!("Nothing reverted {context}.")
+        } else {
+            format!(
+                "Reverted {} file(s) {context}: {}",
+                self.reverted.len(),
+                self.reverted.join(", ")
+            )
+        };
+        if !self.failed.is_empty() {
+            // Surfaced, never swallowed: a file that would not revert is still changed on disk.
+            out.push_str(&format!(
+                "\nCould not revert {}: {}",
+                self.failed.len(),
+                self.failed.join("; ")
+            ));
+        }
+        out
+    }
+}
+
+fn revert_snapshot(snapshot: &HashMap<PathBuf, Option<String>>) -> RevertOutcome {
+    let mut outcome = RevertOutcome::default();
+    // Sorted, so the same revert reads the same way twice: a HashMap yields no fixed order.
+    let mut entries: Vec<(&PathBuf, &Option<String>)> = snapshot.iter().collect();
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (path, original) in entries {
         let result = match original {
             Some(content) => tools::write_atomic(path, content),
             None => match std::fs::remove_file(path) {
@@ -2566,22 +2615,26 @@ fn revert_snapshot(snapshot: &HashMap<PathBuf, Option<String>>) -> usize {
             },
         };
         match result {
-            Ok(()) => reverted += 1,
-            Err(error) => eprintln!("    ! could not revert {}: {error:#}", display_path(path)),
+            Ok(()) => outcome.reverted.push(display_path(path)),
+            Err(error) => outcome
+                .failed
+                .push(format!("{} ({error:#})", display_path(path))),
         }
     }
-    reverted
+    outcome
 }
 
 /// If this turn touched any files, revert them and report how many. Called right before
 /// abandoning a cancelled or failed turn so a Ctrl+C (or a dropped request) never leaves a
 /// multi-file edit half-applied with no trace in session history.
-fn revert_on_cancel(snapshot: &HashMap<PathBuf, Option<String>>) {
+fn revert_on_cancel(chat_ui: &mut ChatUi, snapshot: &HashMap<PathBuf, Option<String>>) {
     if snapshot.is_empty() {
         return;
     }
-    let reverted = revert_snapshot(snapshot);
-    println!("(reverted {reverted} file(s) changed before this turn was interrupted)");
+    let outcome = revert_snapshot(snapshot);
+    if !outcome.is_empty() {
+        let _ = chat_ui.notice(&outcome.summary("from the interrupted turn"));
+    }
 }
 
 fn print_history_preview(messages: &[Message]) {
@@ -5200,9 +5253,15 @@ mod tests {
         snapshot.insert(root.join("edited.txt"), Some("original".to_string()));
         snapshot.insert(root.join("created.txt"), None);
 
-        let reverted = revert_snapshot(&snapshot);
+        let outcome = revert_snapshot(&snapshot);
 
-        assert_eq!(reverted, 2);
+        assert_eq!(outcome.reverted.len(), 2);
+        assert!(outcome.failed.is_empty());
+        // The report names the files, so you can see what came back rather than how many did.
+        let summary = outcome.summary("from the last turn");
+        assert!(summary.contains("edited.txt"), "{summary}");
+        assert!(summary.contains("created.txt"), "{summary}");
+        assert!(summary.contains("from the last turn"), "{summary}");
         assert_eq!(
             fs::read_to_string(root.join("edited.txt")).unwrap(),
             "original"
@@ -5217,8 +5276,38 @@ mod tests {
         let mut snapshot = HashMap::new();
         snapshot.insert(root.join("never-written.txt"), None);
 
-        assert_eq!(revert_snapshot(&snapshot), 1);
+        assert_eq!(revert_snapshot(&snapshot).reverted.len(), 1);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_will_not_revert_is_reported_not_swallowed() {
+        // A directory cannot be overwritten with file content, so this stands in for any
+        // revert that fails. The file is still changed on disk, which is the part worth saying.
+        let root = temporary_directory();
+        fs::create_dir(root.join("blocked")).unwrap();
+        let mut snapshot = HashMap::new();
+        snapshot.insert(root.join("blocked"), Some("original".to_string()));
+
+        let outcome = revert_snapshot(&snapshot);
+
+        assert!(outcome.reverted.is_empty());
+        assert_eq!(outcome.failed.len(), 1);
+        let summary = outcome.summary("from the last turn");
+        assert!(summary.contains("Could not revert"), "{summary}");
+        assert!(summary.contains("blocked"), "the file is named: {summary}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_empty_revert_says_so_rather_than_claiming_success() {
+        let outcome = RevertOutcome::default();
+        assert!(outcome.is_empty());
+        assert!(
+            outcome
+                .summary("from the last turn")
+                .starts_with("Nothing reverted")
+        );
     }
 
     #[test]

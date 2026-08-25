@@ -461,7 +461,10 @@ Highlights:
   sidebar. Tab still accepts a slash completion while the command menu is open, so the two never
   compete for the key.
 - **Permission modal** — tool and plan approvals render as "Allow once / Always allow this
-  session / Reject" with the diff or command preview inline.
+  session / Reject" with the diff or command preview inline. The preview fills the room the
+  terminal has and pages with `PgUp`/`PgDn`, always saying which lines of how many you are
+  looking at — a diff longer than the box must never be cut without saying so, since the point
+  of the modal is that you can read what you are agreeing to.
 - **Model registry** — the model dialog ends with "+ Add provider / model": enter a base URL and
   API key, Kamui fetches the provider's live model list and registers your pick as a new profile
   in the global config, then switches to it.
