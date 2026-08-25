@@ -99,6 +99,14 @@ where
     }
     let ui = Ui::stdio();
     let mcp_sidebar = mcp_sidebar_value(&mcp_statuses);
+    // `--auto-approve` is now the starting point of a cycle rather than a fixed property of the
+    // session: Tab / Shift+Tab move between build, auto, and plan while it runs.
+    let mut mode = if auto_approve {
+        Mode::Auto
+    } else {
+        Mode::Build
+    };
+    let mut auto_approve = auto_approve;
     if let Some(note) = tools_disabled_note(&active) {
         chat_ui.warning(&note)?;
     }
@@ -179,6 +187,7 @@ where
         &mut chat_ui,
         session.as_ref(),
         &model_label(&active),
+        mode.label(),
         env!("CARGO_PKG_VERSION"),
         project,
         &mcp_sidebar,
@@ -424,6 +433,7 @@ where
                         &mut chat_ui,
                         session.as_ref(),
                         &model_label(&active),
+                        mode.label(),
                         env!("CARGO_PKG_VERSION"),
                         project,
                         &mcp_sidebar,
@@ -674,6 +684,56 @@ where
                 }
                 continue;
             }
+            // Tab / Shift+Tab in the editor submit `/mode next` and `/mode prev`, so cycling
+            // reuses the ordinary command path instead of needing its own event.
+            if command == "/mode" {
+                let requested = match argument.trim() {
+                    "" => Some(mode),
+                    "next" => Some(mode.next()),
+                    "prev" | "previous" => Some(mode.prev()),
+                    other => Mode::parse(other),
+                };
+                let Some(requested) = requested else {
+                    chat_ui.notice(&format!(
+                        "usage: /mode [build|auto|plan|next|prev] (got \"{argument}\")"
+                    ))?;
+                    continue;
+                };
+                if requested != mode {
+                    mode = requested;
+                    match mode {
+                        Mode::Build | Mode::Auto => {
+                            auto_approve = mode == Mode::Auto;
+                            plan_requested = false;
+                            // Leaving Plan Mode has to clear the stored plan too, or resuming
+                            // this session would drop straight back into it.
+                            if plan_mode.take().is_some()
+                                && let Some(session) = session.as_ref()
+                            {
+                                let _ = database.set_plan(&session.id, "{}", "approved");
+                            }
+                        }
+                        Mode::Plan => {
+                            auto_approve = false;
+                            plan_requested = true;
+                        }
+                    }
+                }
+                chat_ui.notice(&format!("Mode: {}", mode.describe()))?;
+                update_sidebar(
+                    &mut chat_ui,
+                    session.as_ref(),
+                    &model_label(&active),
+                    mode.label(),
+                    env!("CARGO_PKG_VERSION"),
+                    project,
+                    &mcp_sidebar,
+                    None,
+                    context_window,
+                    None,
+                );
+                continue;
+            }
             if command == "/plan" {
                 plan_requested = true;
                 chat_ui.notice("Plan Mode requested — next turn will require a plan.")?;
@@ -756,6 +816,7 @@ where
                     &mut chat_ui,
                     session.as_ref(),
                     &model_label(&active),
+                    mode.label(),
                     env!("CARGO_PKG_VERSION"),
                     project,
                     &mcp_sidebar,
@@ -952,9 +1013,19 @@ where
             // waiting for the whole turn to finish. Round 1 is skipped: nothing has run yet, so
             // there is nothing to steer, and the prompt itself is already in `turn_messages`.
             if let Some(hub) = hub.as_ref().filter(|_| round > 1) {
-                while let Some(steer) = hub.pop_queue() {
-                    chat_ui.user(&steer)?;
-                    let message = Message::user(&steer);
+                // Drain fully first: a slash command is a UI action, not something to say to
+                // the model, so it goes back on the queue and runs once the turn is over.
+                let mut queued = Vec::new();
+                while let Some(line) = hub.pop_queue() {
+                    queued.push(line);
+                }
+                for line in queued {
+                    if line.trim_start().starts_with('/') {
+                        hub.push_prompt(line);
+                        continue;
+                    }
+                    chat_ui.user(&line)?;
+                    let message = Message::user(&line);
                     turn_messages.push(message.clone());
                     tool_trail.push(message);
                 }
@@ -1130,6 +1201,7 @@ where
                     &mut chat_ui,
                     session.as_ref(),
                     &model_label(&active),
+                    mode.label(),
                     env!("CARGO_PKG_VERSION"),
                     project,
                     &mcp_sidebar,
@@ -1143,6 +1215,7 @@ where
                     &mut chat_ui,
                     session.as_ref(),
                     &model_label(&active),
+                    mode.label(),
                     env!("CARGO_PKG_VERSION"),
                     project,
                     &mcp_sidebar,
@@ -2587,6 +2660,60 @@ fn refresh_session_source(database: &Database, hub: &InputHub) {
 /// The sidebar's MCP block: one row per configured server with its live tool count, and an
 /// explicit "unavailable" for one that failed to start. A server that simply vanishes from the
 /// rail is indistinguishable from one that was never configured.
+/// How much a turn is allowed to do on its own. Kamui already had all three behaviours -- Plan
+/// Mode, ordinary approvals, and `--auto-approve` -- but only as a command, a default, and a
+/// launch flag, so there was no way to see which was in force or to move between them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// Approvals required for anything that mutates. The default.
+    Build,
+    /// Approvals bypassed for the rest of the session (what `--auto-approve` starts in).
+    Auto,
+    /// Read-only tools plus `update_plan` until a plan is approved.
+    Plan,
+}
+
+impl Mode {
+    const CYCLE: [Mode; 3] = [Mode::Build, Mode::Auto, Mode::Plan];
+
+    fn next(self) -> Self {
+        let index = Self::CYCLE.iter().position(|m| *m == self).unwrap_or(0);
+        Self::CYCLE[(index + 1) % Self::CYCLE.len()]
+    }
+
+    fn prev(self) -> Self {
+        let index = Self::CYCLE.iter().position(|m| *m == self).unwrap_or(0);
+        Self::CYCLE[(index + Self::CYCLE.len() - 1) % Self::CYCLE.len()]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Mode::Build => "build",
+            Mode::Auto => "auto",
+            Mode::Plan => "plan",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "build" | "normal" => Some(Mode::Build),
+            "auto" | "auto-approve" | "bypass" => Some(Mode::Auto),
+            "plan" => Some(Mode::Plan),
+            _ => None,
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Mode::Build => "build \u{2014} every command and edit asks first",
+            Mode::Auto => {
+                "auto \u{2014} commands and edits run without asking, for this session only"
+            }
+            Mode::Plan => "plan \u{2014} read-only until you approve a plan",
+        }
+    }
+}
+
 /// The sidebar's model row. A profile with `tools = false` says so here: without tools the
 /// agent cannot read a file or run a command, and a model that is never offered any will
 /// happily invent tool-call syntax in plain prose instead, which reads as the agent being
@@ -2635,6 +2762,7 @@ fn update_sidebar(
     chat_ui: &mut ChatUi,
     session: Option<&Session>,
     model: &str,
+    mode: &str,
     version: &str,
     project: &ProjectContext,
     mcp: &str,
@@ -2657,6 +2785,7 @@ fn update_sidebar(
     }
     entries.push(("Version".to_string(), format!("v{version}")));
     entries.push(("Model".to_string(), model.to_string()));
+    entries.push(("Mode".to_string(), mode.to_string()));
     entries.push(("Project".to_string(), display_path(project.root())));
     if !mcp.is_empty() {
         entries.push(("MCP".to_string(), mcp.to_string()));
@@ -4357,6 +4486,66 @@ mod tests {
             tools,
             embedding_model: None,
         }
+    }
+
+    #[test]
+    fn tab_cycles_forward_through_every_mode_and_back() {
+        let mut mode = Mode::Build;
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            mode = mode.next();
+            seen.push(mode);
+        }
+        assert_eq!(
+            seen,
+            vec![Mode::Auto, Mode::Plan, Mode::Build],
+            "the cycle closes"
+        );
+        // Shift+Tab retraces it exactly.
+        assert_eq!(Mode::Build.prev(), Mode::Plan);
+        assert_eq!(Mode::Plan.prev(), Mode::Auto);
+        assert_eq!(Mode::Auto.prev(), Mode::Build);
+    }
+
+    #[test]
+    fn modes_are_addressable_by_name() {
+        assert_eq!(Mode::parse("plan"), Some(Mode::Plan));
+        assert_eq!(
+            Mode::parse("  AUTO "),
+            Some(Mode::Auto),
+            "case and space are forgiven"
+        );
+        assert_eq!(
+            Mode::parse("bypass"),
+            Some(Mode::Auto),
+            "what it does, not just its name"
+        );
+        assert_eq!(Mode::parse("normal"), Some(Mode::Build));
+        assert_eq!(Mode::parse("yolo"), None);
+    }
+
+    #[test]
+    fn every_mode_says_what_it_permits() {
+        // The label is what the rail shows; the description is what the switch announces, and
+        // it has to state the consequence, not just repeat the name.
+        for mode in Mode::CYCLE {
+            assert!(
+                mode.describe().starts_with(mode.label()),
+                "{}",
+                mode.describe()
+            );
+            assert!(
+                mode.describe().len() > mode.label().len() + 10,
+                "{} explains nothing",
+                mode.label()
+            );
+        }
+        assert!(Mode::Auto.describe().contains("without asking"));
+        assert!(
+            Mode::Auto.describe().contains("this session"),
+            "the blast radius is stated"
+        );
+        assert!(Mode::Plan.describe().contains("read-only"));
     }
 
     #[test]

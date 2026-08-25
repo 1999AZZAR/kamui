@@ -1480,7 +1480,7 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
 /// `?` overlay: the keybinding sheet.
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let width = 64.min(area.width.saturating_sub(4));
-    let height = 22.min(area.height.saturating_sub(2));
+    let height = 24.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let box_area = Rect {
@@ -1490,7 +1490,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         height,
     };
     frame.render_widget(Clear, box_area);
-    let rows: [(&str, &str); 19] = [
+    let rows: [(&str, &str); 20] = [
         ("Enter", "send message"),
         ("Shift/Ctrl+Enter", "newline without sending"),
         ("\u{2190}/\u{2192}", "move the caret"),
@@ -1502,7 +1502,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         ("Ctrl+Y", "copy the latest answer"),
         ("Right click", "copy the cell under the pointer"),
         ("?", "toggle this help"),
-        ("Tab", "accept slash completion"),
+        ("Tab / Shift+Tab", "cycle mode (build / auto / plan)"),
+        ("Tab", "accept slash completion, when the menu is open"),
         ("\u{2191}/\u{2193}", "history / menu navigation"),
         ("PgUp/PgDn", "scroll transcript"),
         ("Ctrl+Home/End", "jump to top/bottom"),
@@ -1840,7 +1841,28 @@ fn input_thread(
                         caret = buf.len();
                         selected = 0;
                     }
+                } else {
+                    // opencode cycles agents with Tab. Completion keeps first claim on the key
+                    // while the slash menu is open, so the two never compete for it.
+                    submit_line(
+                        &screen,
+                        &tx,
+                        &requester,
+                        &busy,
+                        &queue,
+                        "/mode next".to_string(),
+                    );
                 }
+            }
+            KeyCode::BackTab => {
+                submit_line(
+                    &screen,
+                    &tx,
+                    &requester,
+                    &busy,
+                    &queue,
+                    "/mode prev".to_string(),
+                );
             }
             // Caret motion. Alt jumps by word, plain arrows by character.
             KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {

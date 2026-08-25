@@ -22,6 +22,7 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("collapse", "Collapse the last transcript card"),
     ("exit", "Save and quit"),
     ("plan", "Enter Plan Mode"),
+    ("mode", "Cycle build / auto / plan (also Tab)"),
     ("skills", "List discovered skills"),
     ("warnings", "Hide/show warnings; details; fix"),
 ];

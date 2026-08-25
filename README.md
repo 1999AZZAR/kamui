@@ -447,6 +447,12 @@ Highlights:
   **right-click** a cell to copy that cell (its header and outcome included, so you can tell what
   the text is). Both report what was taken. Mouse capture means drag-select belongs to Kamui, but
   most terminals still fall back to their own selection while **Shift** is held.
+- **Modes** — `Tab` cycles **build → auto → plan**, `Shift+Tab` goes back, and `/mode
+  [build|auto|plan]` sets one directly. *build* asks before every command and edit; *auto*
+  bypasses those approvals for the rest of the session (what `--auto-approve` starts in); *plan*
+  restricts the agent to read-only tools until you approve a plan. The active mode is on the
+  sidebar. Tab still accepts a slash completion while the command menu is open, so the two never
+  compete for the key.
 - **Permission modal** — tool and plan approvals render as "Allow once / Always allow this
   session / Reject" with the diff or command preview inline.
 - **Model registry** — the model dialog ends with "+ Add provider / model": enter a base URL and
@@ -505,6 +511,7 @@ Highlights:
 | `/forget <text>` | Forget one remembered fact, or `/forget all` |
 | `/expand` | Expand the latest transcript card |
 | `/collapse` | Collapse the latest transcript card |
+| `/mode [build\|auto\|plan\|next\|prev]` | Show or change what a turn may do on its own; `Tab` / `Shift+Tab` cycle it |
 | `/warnings [on\|off\|details\|fix]` | Hide/show, expand details of, or hand skill warnings to Kamui as a repair task. After a `fix` turn Kamui reloads the skill loader and reports what actually changed — how many folders now load, how many still fail, and whether the repair broke a folder that used to work — rather than leaving the old warning banner in place |
 | `/help` | List available commands |
 | `/exit` | Save and quit |
