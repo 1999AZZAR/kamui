@@ -426,8 +426,18 @@ usage, an always-live editor box with slash-command menu, and a quiet footer wit
 Highlights:
 
 - **Home screen** — a two-tone block-letter KAMUI logo greets you until the first message.
-- **Live input while the agent runs** — keep typing; Enter queues your message and it runs right
-  after the current turn. **Esc interrupts** the agent at any point.
+- **Everything is a cell** — user messages, tool calls, answers, and command output all render as
+  transcript cells in the order they happened. A slash command opens a cell headed by the command
+  you typed and its output lands inside it, so `/sessions` output is attributed and stays put
+  instead of sinking into a flat run of status lines below every card.
+- **Steering** — keep typing while the agent works. Your message is folded into the *running*
+  turn at the next tool-round boundary, so a correction reaches the model while it can still act
+  on it instead of waiting for the whole turn to finish. If the turn ends before the next
+  boundary the message simply starts the next turn. **Esc interrupts** outright when you would
+  rather discard the turn than redirect it.
+- **Loading state** — the editor stays live and keeps its caret; the run reports itself on its own
+  row inside the editor box (spinner, what it is doing, `Esc interrupts`), and the spinner also
+  trails the transcript where the answer will appear.
 - **Scrolling** — mouse wheel, PgUp/PgDn (full page), Ctrl+U/Ctrl+D (half page), Home/End.
   Typing snaps back to the live tail.
 - **Dialogs** — `Ctrl+K` model picker, `Ctrl+S` session switcher, `?` keybinding sheet. Bare

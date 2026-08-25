@@ -76,6 +76,10 @@ pub enum CardKind {
     Tool,
     Output,
     Error,
+    /// Command output and status lines. These used to live in a separate six-entry ring that
+    /// rendered below every card, so they lost their place in the conversation and older ones
+    /// silently fell off the end.
+    Note,
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +112,6 @@ impl Card {
 struct Model {
     header: String,
     cards: Vec<Card>,
-    notices: Vec<String>,
     footer: String,
     /// Transcript viewport offset in wrapped rows counted from the bottom; 0 means "follow
     /// the tail". PageUp/PageDown/Home/End move it, typing snaps back.
@@ -195,7 +198,6 @@ impl Default for Model {
         Self {
             header: String::from("Kamui"),
             cards: Vec::new(),
-            notices: Vec::new(),
             footer: String::from(
                 "! shell · / commands · Tab · \u{2191} history · Ctrl+O expand · PgUp/PgDn scroll · Ctrl+C cancel",
             ),
@@ -320,7 +322,9 @@ impl FullScreen {
         title: impl Into<String>,
         body: impl Into<String>,
     ) -> Result<()> {
-        self.model.intro = false;
+        if !matches!(kind, CardKind::Note) {
+            self.model.intro = false;
+        }
         let title = title.into();
         let body = body.into();
         // Agent noise starts folded: every tool call collapses to a two-line peek, and any
@@ -441,11 +445,46 @@ impl FullScreen {
         Ok(true)
     }
 
+    /// Appends to the note cell that is already open, or starts one. Consecutive lines from a
+    /// single command stay in one cell; anything else pushed in between ends it naturally.
     fn add_notice(&mut self, text: impl Into<String>) -> Result<()> {
-        self.model.notices.push(text.into());
-        if self.model.notices.len() > 6 {
-            self.model.notices.remove(0);
+        let text = text.into();
+        match self.model.cards.last_mut() {
+            Some(card) if matches!(card.kind, CardKind::Note) => {
+                if !card.body.is_empty() {
+                    card.body.push('\n');
+                }
+                card.body.push_str(&text);
+            }
+            _ => {
+                let id = self.take_card_id();
+                self.model.cards.push(Card {
+                    id,
+                    kind: CardKind::Note,
+                    title: String::new(),
+                    body: text,
+                    status: None,
+                    collapsed: false,
+                });
+            }
         }
+        self.trim_history();
+        self.draw()
+    }
+
+    /// Opens a fresh cell headed by the command the user ran, so its output is attributed
+    /// instead of merging into whatever was printed before it.
+    fn add_command(&mut self, command: String) -> Result<()> {
+        let id = self.take_card_id();
+        self.model.cards.push(Card {
+            id,
+            kind: CardKind::Note,
+            title: command,
+            body: String::new(),
+            status: None,
+            collapsed: false,
+        });
+        self.trim_history();
         self.draw()
     }
 
@@ -639,6 +678,14 @@ impl ChatUi {
 
     pub fn user(&mut self, text: &str) -> Result<()> {
         self.card(CardKind::User, "User", text)
+    }
+
+    /// Echoes a slash command as its own transcript cell; its output lands in the same cell.
+    pub fn command_echo(&mut self, command: &str) -> Result<()> {
+        match self.fullscreen.as_ref() {
+            Some(screen) => lock_screen(screen).add_command(command.to_string()),
+            None => Ok(()),
+        }
     }
 
     pub fn tool_call(&mut self, name: &str, args: &str) -> Result<()> {
@@ -854,6 +901,11 @@ impl ChatUi {
                     ),
                     CardKind::Output => crate::render::render_tool_output(&body, self.plain),
                     CardKind::Error => crate::render::render_error(&body, self.plain),
+                    // Plain mode has no cells; a note is just a line of output.
+                    CardKind::Note => format!(
+                        "{body}
+"
+                    ),
                 };
                 print!("{rendered}");
                 Ok(())
@@ -1635,9 +1687,7 @@ fn input_thread(
                     interrupt.notify_one();
                     buf.clear();
                     selected = 0;
-                    let mut s = lock_screen(&screen.0);
-                    s.model.notices.push("interrupt requested".to_string());
-                    let _ = s.draw();
+                    let _ = lock_screen(&screen.0).add_notice("interrupt requested");
                 } else {
                     buf.clear();
                     selected = 0;
@@ -1665,11 +1715,8 @@ fn input_thread(
                     return;
                 } else {
                     last_ctrl_c = Some(std::time::Instant::now());
-                    let mut sc = lock_screen(&screen.0);
-                    sc.model
-                        .notices
-                        .push("Press Ctrl+C again within 3s to quit.".to_string());
-                    let _ = sc.draw();
+                    let _ =
+                        lock_screen(&screen.0).add_notice("Press Ctrl+C again within 3s to quit.");
                 }
             }
             KeyCode::Char(c) => {
@@ -1720,9 +1767,8 @@ fn submit_line(
             .push_back(line.clone());
         let mut s = lock_screen(&screen.0);
         s.model.queued_count = queue.lock().unwrap_or_else(PoisonError::into_inner).len();
-        s.model.notices.push(format!("queued: {line}"));
+        let _ = s.add_notice(format!("queued: {line}"));
         drop(s);
-        let _ = screen.draw_now();
     } else {
         let _ = tx.send(HubEvent::Line(line));
     }
@@ -1771,7 +1817,8 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     // Split the same way `editor_widget` does: `lines()` drops a trailing empty segment, which
     // would leave the caret a row below the text after the buffer ends with a newline.
     let input_lines = model.input.split('\n').count().max(1);
-    let editor_rows = (input_lines.min(EDITOR_VISIBLE_LINES) as u16) + 2;
+    let editor_rows =
+        (input_lines.min(EDITOR_VISIBLE_LINES) as u16) + 2 + u16::from(model.thinking.is_some());
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1799,7 +1846,12 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     };
 
     let mut card_rows: Vec<(u16, u64)> = Vec::new();
-    if model.intro && model.cards.is_empty() {
+    let home = model.intro
+        && model
+            .cards
+            .iter()
+            .all(|card| matches!(card.kind, CardKind::Note));
+    if home {
         frame.render_widget(intro_paragraph(model, body_area), body_area);
     } else {
         // Wrap every row ourselves so viewport math is exact (Paragraph's own wrap happens
@@ -1837,7 +1889,7 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     // Terminal cursor sits at the end of the typed text whenever the editor owns input. This
     // includes the home screen: ratatui hides the cursor on any frame that sets no position,
     // so skipping it there left the first thing a user types with no visible caret.
-    if model.thinking.is_none() {
+    {
         let inner = editor_area.width.saturating_sub(4).max(1) as usize;
         let segments: Vec<&str> = model.input.split('\n').collect();
         let last = segments.last().copied().unwrap_or("");
@@ -1870,11 +1922,7 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     }
 
     RenderInfo {
-        viewport_rows: if model.intro && model.cards.is_empty() {
-            0
-        } else {
-            body_area.height as usize
-        },
+        viewport_rows: if home { 0 } else { body_area.height as usize },
         card_rows,
     }
 }
@@ -1886,25 +1934,22 @@ const EDITOR_VISIBLE_LINES: usize = 5;
 /// buffer, and the caret sitting at the end of the buffer.
 fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
     // Horizontal viewport: keep the caret (always at the end of the buffer) on screen.
-    let rows: Vec<Line<'static>> = match model.thinking {
-        Some((frame_idx, label)) => vec![Line::from(vec![
-            Span::styled(
-                format!("{} ", SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()]),
-                Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(label.to_string(), Style::default().fg(MUTED)),
-        ])],
-        None if model.input.is_empty() => vec![Line::from(vec![
+    let mut rows: Vec<Line<'static>> = match () {
+        _ if model.input.is_empty() => vec![Line::from(vec![
             Span::styled(
                 "\u{276f} ".to_string(),
                 Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "type a message, or / for commands".to_string(),
+                if model.thinking.is_some() {
+                    "type to steer \u{2014} your message joins the running turn".to_string()
+                } else {
+                    "type a message, or / for commands".to_string()
+                },
                 Style::default().add_modifier(Modifier::DIM),
             ),
         ])],
-        None => {
+        _ => {
             // One row per newline segment, newest rows kept in view. Joining the segments into
             // a single Line (as this did) collapsed a multi-line buffer onto one row while the
             // caret was still placed per segment, so the two disagreed about where text was.
@@ -1941,6 +1986,25 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
                 .collect()
         }
     };
+    // Loading state: the editor keeps accepting input, so the run needs its own row here to
+    // say that something is in flight and how to stop it.
+    if let Some((frame_idx, label)) = model.thinking {
+        let dots = ".".repeat(1 + frame_idx % 9);
+        rows.push(Line::from(vec![
+            Span::styled(
+                format!("  {} ", SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()]),
+                Style::default().fg(BLUE),
+            ),
+            Span::styled(
+                format!("{label}{dots}"),
+                Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                "  \u{b7} Enter steers \u{b7} Esc interrupts".to_string(),
+                Style::default().fg(BORDER).add_modifier(Modifier::DIM),
+            ),
+        ]));
+    }
     Paragraph::new(Text::from(rows))
         .style(Style::default().bg(BG_ELEMENT))
         .block(
@@ -2078,8 +2142,8 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
         ),
     ]));
     // Startup notices still belong on the home screen — the logo must never hide them.
-    for notice in &model.notices {
-        for row in notice.split('\n') {
+    for card in &model.cards {
+        for row in card.title.lines().chain(card.body.lines()) {
             lines.push(Line::from(""));
             lines.push(Line::styled(row.to_string(), Style::default().fg(MUTED)));
         }
@@ -2146,16 +2210,21 @@ fn transcript_rows(model: &Model, width: u16) -> Vec<(Line<'static>, Option<u64>
         }
         lines.push((Line::from(""), None));
     }
-    // Status notes render as quiet plain lines, opencode-style. Split on newlines here:
-    // ratatui Span content silently drops embedded newlines, so they must become
-    // separate Lines before construction.
-    for notice in &model.notices {
-        for row in notice.split('\n') {
-            lines.push((
-                Line::styled(row.to_string(), Style::default().fg(MUTED)),
-                None,
-            ));
-        }
+    // The agent's own progress reads as the next thing in the conversation, directly under the
+    // last message, instead of as a label bolted onto the editor the user is typing in.
+    if let Some((frame_idx, label)) = model.thinking {
+        lines.push((
+            Line::from(vec![
+                Span::styled(THICK_BORDER.to_string(), Style::default().fg(BLUE)),
+                Span::styled(
+                    format!("{} ", SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()]),
+                    Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(label.to_string(), Style::default().fg(MUTED)),
+            ]),
+            None,
+        ));
+        lines.push((Line::from(""), None));
     }
     if model.warnings_visible {
         for warning in &model.warnings {
@@ -2205,6 +2274,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
             CardKind::Tool => (MUTED, Style::default().fg(MUTED)),
             CardKind::Output => (MUTED, Style::default().fg(MUTED)),
             CardKind::Error => (RED, Style::default().fg(RED)),
+            CardKind::Note => (BORDER, Style::default().fg(NOTICE_FG)),
         }
     };
 
@@ -2233,7 +2303,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
 
     // Tool cards lead with their own header row. Without it a finished call reduced to a
     // bare outcome ("completed - 0ms - 332 chars") that never said which tool produced it.
-    if matches!(card.kind, CardKind::Tool) && !card.title.is_empty() {
+    if matches!(card.kind, CardKind::Tool | CardKind::Note) && !card.title.is_empty() {
         push_bordered(
             &mut out,
             vec![Span::styled(
@@ -2493,6 +2563,126 @@ mod tests {
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.to_string()).collect())
             .collect()
+    }
+
+    fn note(id: u64, title: &str, body: &str) -> Card {
+        Card {
+            id,
+            kind: CardKind::Note,
+            title: title.to_string(),
+            body: body.to_string(),
+            status: None,
+            collapsed: false,
+        }
+    }
+
+    #[test]
+    fn a_command_and_its_output_render_as_one_cell() {
+        let card = note(1, "/sessions", "row one\nrow two");
+        let rows = rendered(&card, 60);
+        assert_eq!(rows.len(), 3, "header plus both rows: {rows:?}");
+        assert!(
+            rows[0].contains("/sessions"),
+            "the command heads the cell: {rows:?}"
+        );
+        assert!(
+            rows[1].contains("row one") && rows[2].contains("row two"),
+            "{rows:?}"
+        );
+        for row in &rows {
+            assert!(
+                row.starts_with('\u{258c}'),
+                "every row carries the cell rail: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_cells_keep_their_place_in_the_transcript() {
+        // Notices used to render after every card regardless of when they happened, so command
+        // output always sank to the bottom instead of sitting where it was produced.
+        let model = Model {
+            intro: false,
+            cards: vec![
+                note(1, "/model ornith", "Now using ornith:latest (ornith)."),
+                Card {
+                    id: 2,
+                    kind: CardKind::User,
+                    title: "User".into(),
+                    body: "halo".into(),
+                    status: None,
+                    collapsed: false,
+                },
+                note(3, "/compact", "Not enough history to compact yet."),
+            ],
+            ..Default::default()
+        };
+        let rows: Vec<String> = transcript_rows(&model, 60)
+            .iter()
+            .map(|(line, _)| line.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        let position = |needle: &str| {
+            rows.iter()
+                .position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing from {rows:?}"))
+        };
+        assert!(position("/model ornith") < position("halo"));
+        assert!(position("halo") < position("/compact"));
+    }
+
+    #[test]
+    fn a_running_turn_reports_itself_under_the_transcript() {
+        // The spinner belongs where the answer will appear, not welded to the editor row.
+        let model = Model {
+            intro: false,
+            cards: vec![note(1, "", "earlier output")],
+            thinking: Some((0, "Thinking...")),
+            ..Default::default()
+        };
+        let rows: Vec<String> = transcript_rows(&model, 60)
+            .iter()
+            .map(|(line, _)| line.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        let spinner = rows
+            .iter()
+            .position(|row| row.contains("Thinking..."))
+            .expect("spinner row present");
+        let output = rows
+            .iter()
+            .position(|row| row.contains("earlier output"))
+            .expect("earlier output present");
+        assert!(spinner > output, "the run trails the transcript: {rows:?}");
+    }
+
+    #[test]
+    fn the_editor_stays_usable_while_a_turn_runs() {
+        let model = Model {
+            intro: false,
+            input: "steer me".into(),
+            thinking: Some((3, "Thinking...")),
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &model);
+            })
+            .expect("draw");
+        let caret = terminal.get_cursor_position().expect("caret");
+        let buffer = terminal.backend().buffer().clone();
+        let row: String = (0..80).map(|x| buffer[(x, caret.y)].symbol()).collect();
+        // The buffer is still shown and the caret still sits at its end, rather than the editor
+        // being replaced by a status label for the duration of the turn.
+        assert!(row.contains("steer me"), "buffer stays visible: {row:?}");
+        assert_eq!(caret.x, "\u{2502}\u{276f} steer me".chars().count() as u16);
+        let all: Vec<String> = (0..14)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        assert!(
+            all.iter().any(|row| row.contains("Esc interrupts")),
+            "the loading row says how to stop: {all:?}"
+        );
     }
 
     #[test]
@@ -2809,14 +2999,29 @@ mod line_tests {
     #[test]
     fn multiline_notices_become_separate_lines() {
         let model = Model {
-            notices: vec!["line one\nline two".to_string()],
+            intro: false,
+            cards: vec![Card {
+                id: 1,
+                kind: CardKind::Note,
+                title: String::new(),
+                body: "line one\nline two".to_string(),
+                status: None,
+                collapsed: false,
+            }],
             ..Model::default()
         };
         let rendered: Vec<String> = transcript_rows(&model, 80)
             .iter()
             .map(|(line, _)| line.spans.iter().map(|sp| sp.content.as_ref()).collect())
             .collect();
-        assert!(rendered.contains(&"line one".to_string()));
-        assert!(rendered.contains(&"line two".to_string()));
+        // Each source line becomes its own row (the leading span is the cell's rail).
+        assert!(
+            rendered.iter().any(|row| row.ends_with("line one")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|row| row.ends_with("line two")),
+            "{rendered:?}"
+        );
     }
 }

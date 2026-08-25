@@ -347,6 +347,9 @@ where
         }
         if expanded.is_none() && input.starts_with('/') {
             let (command, argument) = input.split_once(' ').unwrap_or((input, ""));
+            // Open a cell headed by the command so its output is attributed to it rather than
+            // merging into the flat run of status lines that used to sit below every card.
+            chat_ui.command_echo(input)?;
             if command == "/help" && use_tui {
                 chat_ui.toggle_help()?;
                 continue;
@@ -935,6 +938,18 @@ where
         let _busy = hub.as_ref().map(|h| h.busy_guard());
         let assistant_message = 'agent: loop {
             round += 1;
+            // Steering. Anything typed while the turn runs is folded into it here, between two
+            // rounds, so a correction reaches the model while it can still act on it instead of
+            // waiting for the whole turn to finish. Round 1 is skipped: nothing has run yet, so
+            // there is nothing to steer, and the prompt itself is already in `turn_messages`.
+            if let Some(hub) = hub.as_ref().filter(|_| round > 1) {
+                while let Some(steer) = hub.pop_queue() {
+                    chat_ui.user(&steer)?;
+                    let message = Message::user(&steer);
+                    turn_messages.push(message.clone());
+                    tool_trail.push(message);
+                }
+            }
             if round > MAX_TOOL_ROUNDS {
                 chat_ui.notice(&format!(
                     "Stopped after {MAX_TOOL_ROUNDS} tool rounds without a final answer."
