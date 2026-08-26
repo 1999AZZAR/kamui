@@ -20,7 +20,7 @@ use ratatui::{
 use std::{
     collections::VecDeque,
     io::{self, Stdout, Write},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
     time::Duration,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -84,6 +84,52 @@ const BOUNCING_WALL_FRAMES: [&str; 16] = [
     "[──███─────]",
     "[─███──────]",
 ];
+
+struct WrappedCache {
+    width: u16,
+    fp: u64,
+    rows: Vec<(Line<'static>, Option<u64>)>,
+}
+
+static WRAPPED_CACHE: OnceLock<Mutex<Option<WrappedCache>>> = OnceLock::new();
+
+fn wrapped_fingerprint(model: &Model) -> u64 {
+    let mut fp: u64 = 146959;
+    fp = fp.wrapping_mul(31).wrapping_add(model.cards.len() as u64);
+    for card in &model.cards {
+        fp = fp.wrapping_mul(31).wrapping_add(card.id);
+        fp = fp.wrapping_mul(31).wrapping_add(card.body.len() as u64);
+        fp = fp.wrapping_mul(31).wrapping_add(card.title.len() as u64);
+        fp = fp.wrapping_mul(31).wrapping_add(card.collapsed as u64);
+        fp = fp.wrapping_mul(31).wrapping_add(match card.kind {
+            CardKind::User => 1,
+            CardKind::Tool => 2,
+            CardKind::Output => 3,
+            CardKind::Error => 4,
+            CardKind::Note => 5,
+        });
+        if let Some((status, ok)) = &card.status {
+            fp = fp.wrapping_mul(31).wrapping_add(status.len() as u64);
+            fp = fp.wrapping_add(*ok as u64 + 7);
+        }
+    }
+    if let Some((frame, _)) = model.thinking {
+        fp = fp.wrapping_mul(31).wrapping_add(frame as u64 + 11);
+    }
+    fp = fp
+        .wrapping_mul(31)
+        .wrapping_add(model.warnings.len() as u64);
+    fp = fp
+        .wrapping_mul(31)
+        .wrapping_add(model.warnings_visible as u64);
+    fp = fp
+        .wrapping_mul(31)
+        .wrapping_add(model.warning_details.len() as u64);
+    fp = fp
+        .wrapping_mul(31)
+        .wrapping_add(model.warning_details_visible as u64);
+    fp
+}
 
 /// Welcome logo, opencode-style: block-letter art split into a muted left half and a bright,
 /// bold right half (KAM | UI) so the brand pops without shouting. Rendered centered while the
@@ -845,7 +891,7 @@ impl ChatUi {
         let stop = Arc::new(tokio::sync::Notify::new());
         let stop_task = stop.clone();
         let task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(80));
+            let mut interval = tokio::time::interval(Duration::from_millis(50));
             loop {
                 tokio::select! {
                     _ = stop_task.notified() => break,
@@ -1637,7 +1683,19 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
     frame.render_widget(Clear, box_area);
     let mut lines = Vec::new();
     for row in &body_rows {
-        lines.push(Line::styled(row.clone(), Style::default().fg(TEXT)));
+        let trimmed = row.trim_start();
+        let style = if trimmed.starts_with("- ") {
+            Style::default().fg(RED)
+        } else if trimmed.starts_with("+ ") {
+            Style::default().fg(GREEN)
+        } else if trimmed.starts_with("--- ") {
+            Style::default().fg(BLUE).add_modifier(Modifier::BOLD)
+        } else if trimmed.starts_with("…") {
+            Style::default().fg(MUTED).add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(TEXT)
+        };
+        lines.push(Line::styled(row.clone(), style));
     }
     if all_rows.len() > body_rows.len() {
         lines.push(Line::styled(
@@ -2638,8 +2696,10 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
         let mut wall_line: Vec<Span<'static>> = vec![Span::raw("  ".to_string())];
         wall_line.extend(bouncing_wall_spans(frame_idx));
         wall_line.push(Span::raw(" ".to_string()));
+        // pulse the label so the bar never looks frozen — wall moves, dots breathe
+        let dots = ".".repeat(frame_idx % 4);
         wall_line.push(Span::styled(
-            "processing".to_string(),
+            format!("processing{dots}"),
             Style::default().fg(MUTED).add_modifier(Modifier::DIM),
         ));
         wall_line.push(Span::styled(
@@ -2878,11 +2938,27 @@ fn footer_widget(model: &Model) -> Paragraph<'static> {
 /// row still carrying its owning card. Search re-uses this so the row it counts is the row that
 /// gets rendered.
 fn wrapped_transcript(model: &Model, width: u16) -> Vec<(Line<'static>, Option<u64>)> {
+    let fp = wrapped_fingerprint(model);
+    let cache = WRAPPED_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.as_ref()
+        && cached.width == width
+        && cached.fp == fp
+    {
+        return cached.rows.clone();
+    }
     let mut rows = Vec::new();
     for (line, owner) in transcript_rows(model, width) {
         for row in wrap_spans(&line.spans, width.max(1) as usize) {
             rows.push((Line::from(row), owner));
         }
+    }
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(WrappedCache {
+            width,
+            fp,
+            rows: rows.clone(),
+        });
     }
     rows
 }
@@ -3006,8 +3082,16 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
     } else {
         match card.kind {
             CardKind::User => (ACCENT, Style::default().fg(TEXT)),
-            CardKind::Tool => (MUTED, Style::default().fg(MUTED)),
-            CardKind::Output => (MUTED, Style::default().fg(MUTED)),
+            CardKind::Tool => match &card.status {
+                None => (WARN, Style::default().fg(MUTED)),
+                Some((_, true)) => (GREEN, Style::default().fg(MUTED)),
+                Some((_, false)) => (RED, Style::default().fg(RED)),
+            },
+            CardKind::Output => match &card.status {
+                Some((_, false)) => (RED, Style::default().fg(RED)),
+                Some((_, true)) => (GREEN, Style::default().fg(MUTED)),
+                None => (GREEN, Style::default().fg(MUTED)),
+            },
             CardKind::Error => (RED, Style::default().fg(RED)),
             CardKind::Note => (BORDER, Style::default().fg(NOTICE_FG)),
         }
