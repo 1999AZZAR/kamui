@@ -28,24 +28,61 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// Braille spinner frames — the same animation the plain scrollback mode uses.
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Bouncing wall frames for the input editor while the agent is thinking.
-/// The wall (███) bounces inside a track, keeping the editor responsive
-/// without duplicating the response-area spinner.
-const BOUNCING_WALL_FRAMES: [&str; 14] = [
-    "[███-------]",
-    "[-████------]",
-    "[--████-----]",
-    "[---████----]",
-    "[----████---]",
-    "[-----████--]",
-    "[------████-]",
-    "[-------████]",
-    "[------████-]",
-    "[-----████--]",
-    "[----████---]",
-    "[---████----]",
-    "[--████-----]",
-    "[-████------]",
+/// Bouncing wall for the input editor while the agent is thinking.
+/// A 3-cell bright wall (███) glides on a muted track (─), pausing
+/// briefly at each end for eased ping-pong. A one-cell fade tail (▓)
+/// trails behind the direction of travel for a subtle motion-blur.
+const WALL_TRACK_LEN: usize = 10;
+const WALL_LEN: usize = 3;
+const WALL_POS: [usize; 16] = [0, 0, 1, 2, 3, 4, 5, 6, 7, 7, 6, 5, 4, 3, 2, 1];
+
+fn bouncing_wall_spans(frame_idx: usize) -> Vec<Span<'static>> {
+    let pos = WALL_POS[frame_idx % WALL_POS.len()];
+    // first half of the cycle moves right, second half moves left
+    let moving_right = (frame_idx % WALL_POS.len()) < 8;
+    let mut spans = Vec::with_capacity(WALL_TRACK_LEN + 2);
+    spans.push(Span::styled("[", Style::default().fg(MUTED)));
+    for i in 0..WALL_TRACK_LEN {
+        let in_wall = i >= pos && i < pos + WALL_LEN;
+        let is_tail = if moving_right {
+            pos > 0 && i + 1 == pos
+        } else {
+            i == pos + WALL_LEN && i < WALL_TRACK_LEN
+        };
+        if in_wall {
+            spans.push(Span::styled(
+                "█",
+                Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+            ));
+        } else if is_tail {
+            spans.push(Span::styled("▓", Style::default().fg(BLUE)));
+        } else {
+            spans.push(Span::styled("─", Style::default().fg(BORDER)));
+        }
+    }
+    spans.push(Span::styled("]", Style::default().fg(MUTED)));
+    spans
+}
+
+// kept for tests / plain-mode fallback — now consistent width, thin track
+#[allow(dead_code)]
+const BOUNCING_WALL_FRAMES: [&str; 16] = [
+    "[███───────]",
+    "[███───────]",
+    "[─███──────]",
+    "[──███─────]",
+    "[───███────]",
+    "[────███───]",
+    "[─────███──]",
+    "[──────███─]",
+    "[───────███]",
+    "[───────███]",
+    "[──────███─]",
+    "[─────███──]",
+    "[────███───]",
+    "[───███────]",
+    "[──███─────]",
+    "[─███──────]",
 ];
 
 /// Welcome logo, opencode-style: block-letter art split into a muted left half and a bright,
@@ -2598,21 +2635,18 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
     // say that something is in flight and how to stop it. The input uses a bouncing wall
     // to avoid duplicating the response-area spinner (which stays as the spinner).
     if let Some((frame_idx, _label)) = model.thinking {
-        let wall = BOUNCING_WALL_FRAMES[frame_idx % BOUNCING_WALL_FRAMES.len()];
-        rows.push(Line::from(vec![
-            Span::styled(
-                format!("  {wall} "),
-                Style::default().fg(BLUE),
-            ),
-            Span::styled(
-                "processing".to_string(),
-                Style::default().fg(MUTED).add_modifier(Modifier::DIM),
-            ),
-            Span::styled(
-                "  \u{b7} Enter steers \u{b7} Esc interrupts".to_string(),
-                Style::default().fg(BORDER).add_modifier(Modifier::DIM),
-            ),
-        ]));
+        let mut wall_line: Vec<Span<'static>> = vec![Span::raw("  ".to_string())];
+        wall_line.extend(bouncing_wall_spans(frame_idx));
+        wall_line.push(Span::raw(" ".to_string()));
+        wall_line.push(Span::styled(
+            "processing".to_string(),
+            Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+        ));
+        wall_line.push(Span::styled(
+            "  \u{b7} Enter steers \u{b7} Esc interrupts".to_string(),
+            Style::default().fg(BORDER).add_modifier(Modifier::DIM),
+        ));
+        rows.push(Line::from(wall_line));
     }
     Paragraph::new(Text::from(rows))
         .style(Style::default().bg(BG_ELEMENT))
