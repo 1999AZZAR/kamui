@@ -169,7 +169,7 @@ const TEXT: Color = Color::Rgb(0xee, 0xee, 0xee);
 const MUTED: Color = Color::Rgb(0x80, 0x80, 0x80);
 const BORDER: Color = Color::Rgb(0x48, 0x48, 0x48);
 const BG_ELEMENT: Color = Color::Rgb(0x1e, 0x1e, 0x1e);
-const BG_PANEL: Color = Color::Rgb(0x14, 0x14, 0x14);
+const BG_PANEL: Color = Color::Rgb(0x10, 0x10, 0x10);
 const BLUE: Color = Color::Rgb(0x5c, 0x9c, 0xf5);
 /// Opaque near-black for every overlay so nothing bleeds through.
 const POPUP_BG: Color = Color::Rgb(0x0a, 0x0a, 0x0a);
@@ -2440,35 +2440,43 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     let input_lines = model.input.split('\n').count().max(1);
     let editor_rows =
         (input_lines.min(EDITOR_VISIBLE_LINES) as u16) + 2 + u16::from(model.thinking.is_some());
-    let rows = Layout::default()
+    let screen_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+    let main_area = screen_rows[0];
+    let footer_area = screen_rows[1];
+
+    // Sidebar rail takes the right side once the terminal is wide enough and chat is underway.
+    let (left_area, sidebar_area) = match (&model.sidebar, model.intro) {
+        (Some(entries), false)
+            if !entries.is_empty() && !model.sidebar_hidden && main_area.width >= 68 =>
+        {
+            // Narrow terminals get a narrower rail rather than none at all.
+            let rail = if main_area.width >= 84 { 30 } else { 24 };
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(0), Constraint::Length(rail)])
+                .split(main_area);
+            (cols[0], Some(cols[1]))
+        }
+        _ => (main_area, None),
+    };
+
+    let left_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(popup_height),
             Constraint::Length(editor_rows),
-            Constraint::Length(1),
         ])
-        .split(frame.area());
-    let body_area = rows[0];
-    let popup_area = rows[1];
-    let editor_area = rows[2];
-    let footer_area = rows[3];
-
-    // Sidebar rail takes the right side once the terminal is wide enough and chat is underway.
-    let (transcript_area, sidebar_area) = match (&model.sidebar, model.intro) {
-        (Some(entries), false)
-            if !entries.is_empty() && !model.sidebar_hidden && body_area.width >= 68 =>
-        {
-            // Narrow terminals get a narrower rail rather than none at all.
-            let rail = if body_area.width >= 84 { 30 } else { 24 };
-            let cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(0), Constraint::Length(rail)])
-                .split(body_area);
-            (cols[0], Some(cols[1]))
-        }
-        _ => (body_area, None),
-    };
+        .split(left_area);
+    let transcript_area = left_rows[0];
+    let popup_area = left_rows[1];
+    let editor_area = left_rows[2];
 
     let mut card_rows: Vec<(u16, u64)> = Vec::new();
     let home = model.intro
@@ -2477,7 +2485,7 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
             .iter()
             .all(|card| matches!(card.kind, CardKind::Note));
     if home {
-        frame.render_widget(intro_paragraph(model, body_area), body_area);
+        frame.render_widget(intro_paragraph(model, transcript_area), transcript_area);
     } else {
         // Wrap every row ourselves so viewport math is exact (Paragraph's own wrap happens
         // after scroll offsets, which makes bottom-follow drift on long wrapped lines).
@@ -2555,7 +2563,7 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     }
 
     RenderInfo {
-        viewport_rows: if home { 0 } else { body_area.height as usize },
+        viewport_rows: if home { 0 } else { transcript_area.height as usize },
         card_rows,
         transcript_width: transcript_area.width,
     }
@@ -2826,11 +2834,14 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
             lines.push(Line::from(""));
         }
     }
-    Paragraph::new(Text::from(lines)).block(
-        Block::default()
-            .borders(Borders::LEFT)
-            .border_style(Style::default().fg(BORDER)),
-    )
+    Paragraph::new(Text::from(lines))
+        .style(Style::default().bg(BG_PANEL))
+        .block(
+            Block::default()
+                .borders(Borders::LEFT)
+                .border_style(Style::default().fg(BORDER))
+                .style(Style::default().bg(BG_PANEL)),
+        )
 }
 
 /// The home screen: two-tone block-letter logo centered above the version/model line and the
