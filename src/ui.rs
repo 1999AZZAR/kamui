@@ -25,9 +25,6 @@ use std::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Braille spinner frames — the same animation the plain scrollback mode uses.
-const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
 /// Bouncing wall for the input editor while the agent is thinking.
 /// A 3-cell bright wall (███) glides on a muted track (─), pausing
 /// briefly at each end for eased ping-pong. A one-cell fade tail (▓)
@@ -64,27 +61,6 @@ fn bouncing_wall_spans(frame_idx: usize) -> Vec<Span<'static>> {
     spans
 }
 
-// kept for tests / plain-mode fallback — now consistent width, thin track
-#[allow(dead_code)]
-const BOUNCING_WALL_FRAMES: [&str; 16] = [
-    "[███───────]",
-    "[███───────]",
-    "[─███──────]",
-    "[──███─────]",
-    "[───███────]",
-    "[────███───]",
-    "[─────███──]",
-    "[──────███─]",
-    "[───────███]",
-    "[───────███]",
-    "[──────███─]",
-    "[─────███──]",
-    "[────███───]",
-    "[───███────]",
-    "[──███─────]",
-    "[─███──────]",
-];
-
 struct WrappedCache {
     width: u16,
     fp: u64,
@@ -112,9 +88,6 @@ fn wrapped_fingerprint(model: &Model) -> u64 {
             fp = fp.wrapping_mul(31).wrapping_add(status.len() as u64);
             fp = fp.wrapping_add(*ok as u64 + 7);
         }
-    }
-    if let Some((frame, _)) = model.thinking {
-        fp = fp.wrapping_mul(31).wrapping_add(frame as u64 + 11);
     }
     fp = fp
         .wrapping_mul(31)
@@ -354,9 +327,7 @@ impl Default for Model {
         Self {
             header: String::from("Kamui"),
             cards: Vec::new(),
-            footer: String::from(
-                "! shell · / commands · Tab · \u{2191} history · Ctrl+O expand · Ctrl+Y copy · PgUp/PgDn scroll · Ctrl+C cancel",
-            ),
+            footer: String::from("? help"),
             scroll_from_bottom: 0,
             prompt_visible: true,
             thinking: None,
@@ -494,11 +465,13 @@ impl FullScreen {
         let title = title.into();
         let body = body.into();
         // Agent noise starts folded: every tool call collapses to a two-line peek, and any
-        // output longer than two lines joins it. Ctrl+O, a click, or `/expand` // `/collapse`
-        // toggle it; answers and errors always show in full.
+        // output longer than two lines joins it. Long error dumps fold to a headline so they
+        // cannot collide with the editor. Ctrl+O, a click, or `/expand` / `/collapse` toggle
+        // it; answers always show in full.
         let collapsed = match kind {
             CardKind::Tool => true,
             CardKind::Output => title != "Assistant" && body.lines().count() > 2,
+            CardKind::Error => error_should_fold(&body),
             _ => false,
         };
         let id = self.take_card_id();
@@ -876,8 +849,8 @@ impl ChatUi {
         )
     }
 
-    /// Start the frea-style loading animation in the footer while the model thinks. No-op outside
-    /// fullscreen mode; plain mode keeps its inline spinner.
+    /// Start the bouncing-wall loading animation in the editor while the model thinks. No-op
+    /// outside fullscreen mode; plain mode keeps its inline spinner.
     pub fn thinking_start(&mut self, label: &'static str) -> Result<()> {
         if !self.is_fullscreen() || self.thinking.is_some() {
             return Ok(());
@@ -2442,10 +2415,7 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         (input_lines.min(EDITOR_VISIBLE_LINES) as u16) + 2 + u16::from(model.thinking.is_some());
     let screen_rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(frame.area());
     let main_area = screen_rows[0];
     let footer_area = screen_rows[1];
@@ -2506,10 +2476,19 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
             .as_ref()
             .filter(|_| !hits.is_empty())
             .map(|search| hits[search.current % hits.len()]);
+        let shown: Vec<(Line<'static>, Option<u64>)> =
+            rows.into_iter().skip(start).take(visible).collect();
+        // Short transcripts pad at the top so messages sit just above the editor, matching
+        // opencode. Pad rows are display-only: they are not click targets and they are not
+        // injected into the wrap cache, so search indices stay aligned with wrapped rows.
+        let pad = visible.saturating_sub(shown.len());
         let mut window: Vec<Line<'static>> = Vec::with_capacity(visible);
-        for (offset, (line, owner)) in rows.into_iter().skip(start).take(visible).enumerate() {
+        for _ in 0..pad {
+            window.push(Line::from(""));
+        }
+        for (offset, (line, owner)) in shown.into_iter().enumerate() {
             if let Some(id) = owner {
-                card_rows.push((transcript_area.y + offset as u16, id));
+                card_rows.push((transcript_area.y + (pad + offset) as u16, id));
             }
             let absolute = start + offset;
             let line = if Some(absolute) == current_hit {
@@ -2563,7 +2542,11 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     }
 
     RenderInfo {
-        viewport_rows: if home { 0 } else { transcript_area.height as usize },
+        viewport_rows: if home {
+            0
+        } else {
+            transcript_area.height as usize
+        },
         card_rows,
         transcript_width: transcript_area.width,
     }
@@ -2698,16 +2681,16 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
         }
     };
     // Loading state: the editor keeps accepting input, so the run needs its own row here to
-    // say that something is in flight and how to stop it. The input uses a bouncing wall
-    // to avoid duplicating the response-area spinner (which stays as the spinner).
-    if let Some((frame_idx, _label)) = model.thinking {
+    // say that something is in flight and how to stop it. The bouncing wall is the sole
+    // in-flight indicator; the transcript does not duplicate it.
+    if let Some((frame_idx, label)) = model.thinking {
         let mut wall_line: Vec<Span<'static>> = vec![Span::raw("  ".to_string())];
         wall_line.extend(bouncing_wall_spans(frame_idx));
         wall_line.push(Span::raw(" ".to_string()));
         // pulse the label so the bar never looks frozen — wall moves, dots breathe
         let dots = ".".repeat(frame_idx % 4);
         wall_line.push(Span::styled(
-            format!("processing{dots}"),
+            format!("{label}{dots}"),
             Style::default().fg(MUTED).add_modifier(Modifier::DIM),
         ));
         wall_line.push(Span::styled(
@@ -3032,22 +3015,6 @@ fn transcript_rows(model: &Model, width: u16) -> Vec<(Line<'static>, Option<u64>
         }
         lines.push((Line::from(""), None));
     }
-    // The agent's own progress reads as the next thing in the conversation, directly under the
-    // last message, instead of as a label bolted onto the editor the user is typing in.
-    if let Some((frame_idx, label)) = model.thinking {
-        lines.push((
-            Line::from(vec![
-                Span::styled(THICK_BORDER.to_string(), Style::default().fg(BLUE)),
-                Span::styled(
-                    format!("{} ", SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()]),
-                    Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(label.to_string(), Style::default().fg(MUTED)),
-            ]),
-            None,
-        ));
-        lines.push((Line::from(""), None));
-    }
     if model.warnings_visible {
         for warning in &model.warnings {
             lines.push((
@@ -3085,6 +3052,20 @@ fn tool_header(name: &str, args: &str) -> String {
     } else {
         format!("{name}  {compact}")
     }
+}
+
+/// Fold a dumped error so a URL/serde wall cannot collide with the editor. Short messages stay
+/// open. The wrap width is not known at insert time, so a typical inner width is the cutoff.
+fn error_should_fold(body: &str) -> bool {
+    let mut n = 0usize;
+    for line in body.lines() {
+        n += 1;
+        if n > 2 || UnicodeWidthStr::width(line) > 80 {
+            return true;
+        }
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("http") && lower.contains("error decoding")
 }
 
 fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
@@ -3127,6 +3108,56 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
                 .map(|span| Span::styled(span.content.to_string(), span.style.patch(body_style)))
                 .collect();
             push_bordered(&mut out, spans);
+        }
+        return out;
+    }
+
+    if matches!(card.kind, CardKind::Error) {
+        let title = if card.title.is_empty() {
+            "Error".to_string()
+        } else {
+            card.title.clone()
+        };
+        push_bordered(
+            &mut out,
+            vec![Span::styled(
+                title,
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            )],
+        );
+        if let Some((status, ok)) = &card.status {
+            push_bordered(
+                &mut out,
+                vec![Span::styled(
+                    format!("{} {status}", if *ok { "\u{2713}" } else { "\u{2717}" }),
+                    Style::default().fg(if *ok { GREEN } else { RED }),
+                )],
+            );
+        }
+        let wrap_width = width.saturating_sub(4).max(1);
+        if card.collapsed {
+            let first = card.body.lines().next().unwrap_or("").trim();
+            let headline = crate::tui::truncate_chars(first, wrap_width);
+            if !headline.is_empty() {
+                push_bordered(&mut out, vec![Span::styled(headline.clone(), body_style)]);
+            }
+            let wrapped = wrap_display(&card.body, wrap_width);
+            let extra = wrapped.len().saturating_sub(1);
+            if !card.body.trim().is_empty() && (extra > 0 || headline != first) {
+                let hint = if extra > 0 {
+                    format!("\u{2026} {extra} more line(s) \u{b7} ctrl+o or click")
+                } else {
+                    "\u{2026} ctrl+o or click".to_string()
+                };
+                push_bordered(
+                    &mut out,
+                    vec![Span::styled(hint, Style::default().fg(GREEN))],
+                );
+            }
+            return out;
+        }
+        for line in wrap_display(&card.body, wrap_width) {
+            push_bordered(&mut out, vec![Span::styled(line, body_style)]);
         }
         return out;
     }
@@ -3193,11 +3224,6 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
                     )],
                 );
             }
-            for line in wrap_display(&card.body, width.saturating_sub(4)) {
-                push_bordered(&mut out, vec![Span::styled(line, body_style)]);
-            }
-        }
-        CardKind::Error => {
             for line in wrap_display(&card.body, width.saturating_sub(4)) {
                 push_bordered(&mut out, vec![Span::styled(line, body_style)]);
             }
@@ -3531,8 +3557,9 @@ mod tests {
     }
 
     #[test]
-    fn a_running_turn_reports_itself_under_the_transcript() {
-        // The spinner belongs where the answer will appear, not welded to the editor row.
+    fn a_running_turn_reports_itself_in_the_editor_not_the_transcript() {
+        // The bouncing wall in the editor is the sole in-flight indicator. Duplicating a
+        // spinner under the last message made the wait look like two agents.
         let model = Model {
             intro: false,
             cards: vec![note(1, "", "earlier output")],
@@ -3543,15 +3570,31 @@ mod tests {
             .iter()
             .map(|(line, _)| line.spans.iter().map(|s| s.content.to_string()).collect())
             .collect();
-        let spinner = rows
-            .iter()
-            .position(|row| row.contains("Thinking..."))
-            .expect("spinner row present");
-        let output = rows
-            .iter()
-            .position(|row| row.contains("earlier output"))
-            .expect("earlier output present");
-        assert!(spinner > output, "the run trails the transcript: {rows:?}");
+        assert!(
+            rows.iter().any(|row| row.contains("earlier output")),
+            "earlier output present"
+        );
+        assert!(
+            rows.iter().all(|row| !row.contains("Thinking")),
+            "the transcript does not repeat the thinking label: {rows:?}"
+        );
+
+        let backend = ratatui::backend::TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &model);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let all: Vec<String> = (0..14)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        assert!(
+            all.iter()
+                .any(|row| row.contains("Thinking") && row.contains("Esc interrupts")),
+            "the editor wall names the run and how to stop it: {all:?}"
+        );
     }
 
     #[test]
@@ -4181,6 +4224,165 @@ mod tests {
         let text: String = last.spans.iter().map(|s| s.content.to_string()).collect();
         assert!(text.contains("13 more line(s)"));
         assert!(text.contains("ctrl+o"), "fold hint names the key: {text:?}");
+    }
+
+    #[test]
+    fn a_long_error_folds_to_a_headline_and_hint() {
+        let body = "error decoding response body for url (https://aisurplus.io/v1/chat/completions): invalid type: null, expected a sequence";
+        assert!(
+            error_should_fold(body),
+            "URL + decode noise is a dump, not a one-liner"
+        );
+        let card = Card {
+            id: 1,
+            kind: CardKind::Error,
+            title: "Error".into(),
+            body: body.into(),
+            status: None,
+            collapsed: true,
+        };
+        let rows = rendered(&card, 40);
+        assert!(
+            rows[0].contains("Error"),
+            "the card is headed as an error: {rows:?}"
+        );
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains("ctrl+o"),
+            "folded detail names how to expand: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| !row.contains("expected a sequence")),
+            "the serde dump stays behind the fold: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains('\u{2026}')),
+            "the headline is truncated: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_error_stays_open() {
+        assert!(!error_should_fold("file not found"));
+        let card = Card {
+            id: 1,
+            kind: CardKind::Error,
+            title: "Error".into(),
+            body: "file not found".into(),
+            status: None,
+            collapsed: false,
+        };
+        let rows = rendered(&card, 40);
+        assert!(rows.iter().any(|row| row.contains("Error")), "{rows:?}");
+        assert!(
+            rows.iter().any(|row| row.contains("file not found")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| !row.contains("ctrl+o")),
+            "nothing to expand: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn an_expanded_error_wraps_instead_of_dumping_one_row() {
+        let body = "error decoding response body for url (https://aisurplus.io/v1/chat/completions): invalid type: null, expected a sequence";
+        let card = Card {
+            id: 1,
+            kind: CardKind::Error,
+            title: "Error".into(),
+            body: body.into(),
+            status: None,
+            collapsed: false,
+        };
+        let rows = rendered(&card, 40);
+        assert!(rows.len() > 2, "the body wraps across rows: {rows:?}");
+        for row in &rows {
+            assert!(row.chars().count() <= 42, "no full-width dump row: {row:?}");
+        }
+    }
+
+    #[test]
+    fn the_default_footer_is_a_quiet_help_hint() {
+        let model = Model {
+            intro: false,
+            cards: vec![Card {
+                id: 1,
+                kind: CardKind::User,
+                title: "User".into(),
+                body: "hi".into(),
+                status: None,
+                collapsed: false,
+            }],
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(60, 16);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &model);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let footer: String = (0..60).map(|x| buffer[(x, 15)].symbol()).collect();
+        assert!(
+            footer.contains("? help"),
+            "the idle footer points at help: {footer:?}"
+        );
+        assert!(
+            !footer.contains("! shell") && !footer.contains("Ctrl+O expand"),
+            "the keymap dump is gone: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_transcript_sits_just_above_the_editor() {
+        let model = Model {
+            intro: false,
+            cards: vec![Card {
+                id: 1,
+                kind: CardKind::User,
+                title: "User".into(),
+                body: "hello".into(),
+                status: None,
+                collapsed: false,
+            }],
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut info = RenderInfo::default();
+        terminal
+            .draw(|frame| {
+                info = render(frame, &model);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..20)
+            .map(|y| (0..60).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        let text_y = rows
+            .iter()
+            .position(|row| row.contains("hello"))
+            .expect("message is drawn");
+        let editor_y = rows
+            .iter()
+            .position(|row| row.contains('\u{276f}'))
+            .expect("editor is drawn");
+        assert!(
+            text_y > 0,
+            "a short transcript must not stick to the top: {rows:?}"
+        );
+        assert!(text_y < editor_y, "message sits above the editor");
+        assert!(
+            editor_y - text_y <= 3,
+            "content sits just above the editor (text_y={text_y}, editor_y={editor_y}): {rows:?}"
+        );
+        assert!(
+            info.card_rows.iter().all(|(y, _)| *y >= text_y as u16),
+            "top pad rows are not click targets: {:?}",
+            info.card_rows
+        );
     }
 }
 

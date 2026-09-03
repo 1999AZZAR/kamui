@@ -1950,8 +1950,8 @@ struct PlainSpinner {
     width: usize,
 }
 
-/// The waiting indicator for a turn: inline on the scrollback, a footer animation in the
-/// fullscreen TUI (the frea-inspired loading state), or nothing when output is piped.
+/// The waiting indicator for a turn: inline on the scrollback in plain mode, a bouncing
+/// wall in the fullscreen editor, or nothing when output is piped.
 enum Spinner {
     None,
     Plain(PlainSpinner),
@@ -2676,7 +2676,7 @@ fn revert_snapshot(snapshot: &HashMap<PathBuf, Option<String>>) -> RevertOutcome
     let mut outcome = RevertOutcome::default();
     // Sorted, so the same revert reads the same way twice: a HashMap yields no fixed order.
     let mut entries: Vec<(&PathBuf, &Option<String>)> = snapshot.iter().collect();
-    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    entries.sort_by_key(|(left, _)| *left);
     for (path, original) in entries {
         let result = match original {
             Some(content) => tools::write_atomic(path, content),

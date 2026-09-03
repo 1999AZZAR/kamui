@@ -428,7 +428,7 @@ the temporary `run_command(background: true)` jobs owned by an active chat proce
 When launched from an interactive terminal, Kamui uses a fullscreen, opencode-style interface: a
 word-wrapped transcript with thick-border message rails (user = blue, assistant = brand blue with
 Markdown styling, tool calls muted, errors red), a sidebar with session info and live context
-usage, an always-live editor box with slash-command menu, and a quiet footer with keybind hints.
+usage, an always-live editor box with slash-command menu, and a quiet footer (`?` opens the keymap).
 
 Highlights:
 
@@ -444,9 +444,9 @@ Highlights:
   transcript — on re-reading a session there is otherwise no way to tell which of two prompts
   started the work. **Esc interrupts** outright when you would rather discard the turn than
   redirect it.
-- **Loading state** — the editor stays live and keeps its caret; the run reports itself on its own
-  row inside the editor box (spinner, what it is doing, `Esc interrupts`), and the spinner also
-  trails the transcript where the answer will appear.
+- **Loading state** — the editor stays live and keeps its caret; a bouncing wall inside the
+  editor box reports what the run is doing (`Esc interrupts`). The transcript does not
+  duplicate that spinner.
 - **Scrolling** — mouse wheel, PgUp/PgDn (full page), Ctrl+U/Ctrl+D (half page),
   `Ctrl+Home`/`Ctrl+End`. Typing snaps back to the live tail, and while you are scrolled away from
   it the footer says how far back you are and how to return.

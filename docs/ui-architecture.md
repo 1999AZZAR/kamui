@@ -15,7 +15,7 @@ line-oriented renderer and never touches the alternate screen.
 ┌ editor (❯ input, live cursor) ───────────┐ │ Project │
 │ meta: version · model · path             │ │ Context │
 └──────────────────────────────────────────┘ │ Last turn│
-footer hints · token badge · queued count    └─────────┘
+? help · token badge · queued/scroll hints   └─────────┘
 ```
 
 - **Home screen** — until the first message, the body shows the two-tone block-letter KAMUI
