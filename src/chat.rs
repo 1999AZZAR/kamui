@@ -1232,18 +1232,16 @@ where
                 context_window,
             );
             if chat_ui.is_fullscreen() {
-                // Structured per-metric lines read better in the narrow rail.
-                let mut lt = format!("Token : {}", usage.total_tokens);
-                lt.push_str(&format!("\n  in : {}", usage.prompt_tokens));
-                lt.push_str(&format!("\n  out : {}", usage.completion_tokens));
+                // Structured per-metric lines read better in the narrow rail. Tab separates
+                // the fixed-width label from the value so the sidebar can style them apart.
+                let mut lt = format!("tok\t{}", usage.total_tokens);
+                lt.push_str(&format!("\nin\t{}", usage.prompt_tokens));
+                lt.push_str(&format!("\nout\t{}", usage.completion_tokens));
                 if let Some(t) = ttft {
-                    lt.push_str(&format!(
-                        "\n  lat : {}",
-                        crate::terminal::format_duration(t)
-                    ));
+                    lt.push_str(&format!("\nlat\t{}", crate::terminal::format_duration(t)));
                 }
                 lt.push_str(&format!(
-                    "\n  time : {}",
+                    "\ntime\t{}",
                     crate::terminal::format_duration(started.elapsed())
                 ));
                 update_sidebar(

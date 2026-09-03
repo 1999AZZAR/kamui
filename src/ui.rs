@@ -2410,7 +2410,13 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     // Multiline editor: grows with the buffer's newlines (backslash-newline continuation).
     // Split the same way `editor_widget` does: `lines()` drops a trailing empty segment, which
     // would leave the caret a row below the text after the buffer ends with a newline.
-    let input_lines = model.input.split('\n').count().max(1);
+    // While thinking with an empty buffer the placeholder row is omitted, so count zero content
+    // rows and let the wall occupy the only text line.
+    let input_lines = if model.input.is_empty() && model.thinking.is_some() {
+        0
+    } else {
+        model.input.split('\n').count().max(1)
+    };
     let editor_rows =
         (input_lines.min(EDITOR_VISIBLE_LINES) as u16) + 2 + u16::from(model.thinking.is_some());
     let screen_rows = Layout::default()
@@ -2638,18 +2644,16 @@ const EDITOR_VISIBLE_LINES: usize = 5;
 /// buffer, and the caret sitting at the end of the buffer.
 fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
     // Horizontal viewport: keep the caret (always at the end of the buffer) on screen.
+    // Empty + thinking: skip the placeholder — the bouncing wall already says a turn is live.
     let mut rows: Vec<Line<'static>> = match () {
+        _ if model.input.is_empty() && model.thinking.is_some() => Vec::new(),
         _ if model.input.is_empty() => vec![Line::from(vec![
             Span::styled(
                 "\u{276f} ".to_string(),
                 Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                if model.thinking.is_some() {
-                    "type to steer \u{2014} your message joins the running turn".to_string()
-                } else {
-                    "type a message, or / for commands".to_string()
-                },
+                "type a message, or / for commands".to_string(),
                 Style::default().add_modifier(Modifier::DIM),
             ),
         ])],
@@ -2800,6 +2804,8 @@ fn popup_widget(model: &Model) -> Paragraph<'static> {
 
 fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // Left border eats one column; keep a little padding so values never kiss the rail.
+    let max = area.width.saturating_sub(3).max(1) as usize;
     if let Some(entries) = &model.sidebar {
         for (key, value) in entries {
             lines.push(Line::from(Span::styled(
@@ -2807,12 +2813,32 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             )));
             // Values may carry newlines (Last turn metrics); ratatui strips them inside
-            // spans, so split before styling.
+            // spans, so split before styling. Tab-separated metric rows keep label/value
+            // contrast; project paths truncate from the left so the leaf stays readable.
             for value_line in value.split('\n') {
-                lines.push(Line::styled(
-                    crate::tui::truncate_chars(value_line, area.width.saturating_sub(4) as usize),
-                    Style::default().fg(NOTICE_FG),
-                ));
+                if key == "Last turn"
+                    && let Some((label, rest)) = value_line.split_once('\t')
+                {
+                    let label_w = 4usize;
+                    let value_max = max.saturating_sub(label_w + 1);
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{label:<label_w$} "),
+                            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            crate::tui::truncate_chars(rest, value_max),
+                            Style::default().fg(NOTICE_FG),
+                        ),
+                    ]));
+                    continue;
+                }
+                let truncated = if key == "Project" {
+                    crate::tui::truncate_left_chars(value_line, max)
+                } else {
+                    crate::tui::truncate_chars(value_line, max)
+                };
+                lines.push(Line::styled(truncated, Style::default().fg(NOTICE_FG)));
             }
             lines.push(Line::from(""));
         }
@@ -3010,12 +3036,27 @@ fn transcript_rows(model: &Model, width: u16) -> Vec<(Line<'static>, Option<u64>
     let mut lines: Vec<(Line<'static>, Option<u64>)> = Vec::new();
     for card in &model.cards {
         let owner = (card.foldable_rows() > 0).then_some(card.id);
-        for line in card_lines(card, inner_width) {
+        let mut card_out = card_lines(card, inner_width);
+        // Drop trailing blank content rows so the single swimlane separator stays single.
+        while card_out
+            .last()
+            .is_some_and(|line| line.spans.iter().all(|s| s.content.trim().is_empty()))
+        {
+            card_out.pop();
+        }
+        for line in card_out {
             lines.push((line, owner));
         }
         lines.push((Line::from(""), None));
     }
+    // No blank padding under the last card — bottom-align already sits the stack on the editor.
+    if !model.cards.is_empty() {
+        lines.pop();
+    }
     if model.warnings_visible {
+        if !lines.is_empty() {
+            lines.push((Line::from(""), None));
+        }
         for warning in &model.warnings {
             lines.push((
                 Line::styled(format!("\u{26a0} {warning}"), Style::default().fg(WARN)),
@@ -3068,6 +3109,38 @@ fn error_should_fold(body: &str) -> bool {
     lower.contains("http") && lower.contains("error decoding")
 }
 
+/// One-line card title for a folded error: human summary, not the raw reqwest sentence. The
+/// full body (URL included) stays available on expand.
+fn error_headline(body: &str) -> String {
+    let first = body.lines().next().unwrap_or("").trim();
+    if first.is_empty() {
+        return String::new();
+    }
+    let lower = first.to_ascii_lowercase();
+    if lower.contains("error decoding response body")
+        || lower.contains("invalid type:")
+        || lower.contains("expected a sequence")
+    {
+        return "provider returned an invalid response".to_string();
+    }
+    if lower.contains("error sending request") || lower.contains("connection refused") {
+        return "provider request failed".to_string();
+    }
+    if let Some(idx) = first.find(" for url ") {
+        let clause = first[..idx].trim().trim_end_matches(':').trim();
+        if !clause.is_empty() {
+            return clause.to_string();
+        }
+    }
+    if let Some(idx) = lower.find(" (http") {
+        let clause = first[..idx].trim().trim_end_matches(':').trim();
+        if !clause.is_empty() {
+            return clause.to_string();
+        }
+    }
+    first.to_string()
+}
+
 fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
     let (border, body_style) = if card.title == "Assistant" {
         (BLUE, Style::default().fg(TEXT))
@@ -3084,7 +3157,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
                 Some((_, true)) => (GREEN, Style::default().fg(MUTED)),
                 None => (GREEN, Style::default().fg(MUTED)),
             },
-            CardKind::Error => (RED, Style::default().fg(RED)),
+            CardKind::Error => (RED, Style::default().fg(TEXT)),
             CardKind::Note => (BORDER, Style::default().fg(NOTICE_FG)),
         }
     };
@@ -3136,22 +3209,17 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
         }
         let wrap_width = width.saturating_sub(4).max(1);
         if card.collapsed {
-            let first = card.body.lines().next().unwrap_or("").trim();
-            let headline = crate::tui::truncate_chars(first, wrap_width);
+            let headline = crate::tui::truncate_chars(&error_headline(&card.body), wrap_width);
             if !headline.is_empty() {
-                push_bordered(&mut out, vec![Span::styled(headline.clone(), body_style)]);
+                push_bordered(&mut out, vec![Span::styled(headline, body_style)]);
             }
-            let wrapped = wrap_display(&card.body, wrap_width);
-            let extra = wrapped.len().saturating_sub(1);
-            if !card.body.trim().is_empty() && (extra > 0 || headline != first) {
-                let hint = if extra > 0 {
-                    format!("\u{2026} {extra} more line(s) \u{b7} ctrl+o or click")
-                } else {
-                    "\u{2026} ctrl+o or click".to_string()
-                };
+            if !card.body.trim().is_empty() {
                 push_bordered(
                     &mut out,
-                    vec![Span::styled(hint, Style::default().fg(GREEN))],
+                    vec![Span::styled(
+                        "\u{2026} ctrl+o or click".to_string(),
+                        Style::default().fg(GREEN),
+                    )],
                 );
             }
             return out;
@@ -3626,6 +3694,43 @@ mod tests {
         assert!(
             all.iter().any(|row| row.contains("Esc interrupts")),
             "the loading row says how to stop: {all:?}"
+        );
+        assert!(
+            all.iter().all(|row| !row.contains("type to steer")),
+            "steering copy is not a second row when the buffer already shows the steer: {all:?}"
+        );
+    }
+
+    #[test]
+    fn empty_thinking_editor_drops_the_placeholder() {
+        let model = Model {
+            intro: false,
+            thinking: Some((1, "Thinking...")),
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &model);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let all: Vec<String> = (0..14)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        assert!(
+            all.iter().all(|row| !row.contains("type to steer")),
+            "wall + hint are enough; no steer placeholder: {all:?}"
+        );
+        assert!(
+            all.iter().all(|row| !row.contains("type a message")),
+            "idle placeholder stays off while thinking: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .any(|row| row.contains("Thinking") && row.contains("Esc interrupts")),
+            "the wall still names the run: {all:?}"
         );
     }
 
@@ -4233,6 +4338,10 @@ mod tests {
             error_should_fold(body),
             "URL + decode noise is a dump, not a one-liner"
         );
+        assert_eq!(
+            error_headline(body),
+            "provider returned an invalid response"
+        );
         let card = Card {
             id: 1,
             kind: CardKind::Error,
@@ -4246,18 +4355,31 @@ mod tests {
             rows[0].contains("Error"),
             "the card is headed as an error: {rows:?}"
         );
+        assert_eq!(
+            rows[0].chars().next(),
+            Some('\u{258c}'),
+            "rail grammar: {rows:?}"
+        );
         let joined = rows.join("\n");
         assert!(
             joined.contains("ctrl+o"),
             "folded detail names how to expand: {rows:?}"
         );
         assert!(
+            joined.contains("provider returned"),
+            "headline is human, not the reqwest sentence: {rows:?}"
+        );
+        assert!(
             rows.iter().all(|row| !row.contains("expected a sequence")),
             "the serde dump stays behind the fold: {rows:?}"
         );
         assert!(
+            rows.iter().all(|row| !row.contains("https://")),
+            "the URL is not the title: {rows:?}"
+        );
+        assert!(
             rows.iter().any(|row| row.contains('\u{2026}')),
-            "the headline is truncated: {rows:?}"
+            "the expand hint carries an ellipsis: {rows:?}"
         );
     }
 

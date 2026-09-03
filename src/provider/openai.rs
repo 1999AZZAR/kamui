@@ -255,8 +255,19 @@ fn embeddings_into_vectors(
         .collect())
 }
 
+/// Some OpenAI-compatible providers send JSON `null` for empty arrays. `#[serde(default)]`
+/// alone only covers a missing field, not an explicit null.
+fn null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize)]
 struct OpenAIResponse {
+    #[serde(default, deserialize_with = "null_as_empty_vec")]
     choices: Vec<Choice>,
     #[serde(default)]
     usage: Usage,
@@ -273,7 +284,7 @@ struct Choice {
 struct ResponseMessage {
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty_vec")]
     tool_calls: Vec<ResponseToolCall>,
 }
 
@@ -314,7 +325,7 @@ fn response_into_chat(mut response: OpenAIResponse) -> Result<ChatResponse> {
 
 #[derive(Debug, Deserialize)]
 struct OpenAIStreamChunk {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty_vec")]
     choices: Vec<StreamChoice>,
     #[serde(default)]
     usage: Option<Usage>,
@@ -329,7 +340,7 @@ struct StreamChoice {
 #[derive(Debug, Deserialize)]
 struct StreamDelta {
     content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty_vec")]
     tool_calls: Vec<StreamToolCallDelta>,
 }
 
@@ -824,5 +835,34 @@ mod tests {
         assert_eq!(chat.tool_calls[0].name, "read_file");
         assert_eq!(chat.tool_calls[0].arguments, r#"{"path":"a.rs"}"#);
         assert_eq!(chat.usage.total_tokens, 10);
+    }
+
+    #[test]
+    fn null_tool_calls_deserialize_as_empty_on_response() {
+        let json = r#"{
+            "choices": [{
+                "message": { "content": "ok", "tool_calls": null },
+                "finish_reason": "stop"
+            }]
+        }"#;
+        let response: OpenAIResponse = serde_json::from_str(json).unwrap();
+        let chat = response_into_chat(response).unwrap();
+        assert_eq!(chat.content, "ok");
+        assert!(chat.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn null_choices_deserialize_as_empty_on_response() {
+        let response: OpenAIResponse = serde_json::from_str(r#"{"choices":null}"#).unwrap();
+        assert!(response.choices.is_empty());
+        assert!(response_into_chat(response).is_err());
+    }
+
+    #[test]
+    fn null_tool_calls_deserialize_as_empty_on_stream_delta() {
+        let delta: StreamDelta =
+            serde_json::from_str(r#"{"content":"hi","tool_calls":null}"#).unwrap();
+        assert_eq!(delta.content.as_deref(), Some("hi"));
+        assert!(delta.tool_calls.is_empty());
     }
 }

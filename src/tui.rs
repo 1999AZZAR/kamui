@@ -95,6 +95,24 @@ pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
     format!("{cut}\u{2026}")
 }
 
+/// Like [`truncate_chars`], but drops the start so a long path keeps its leaf:
+/// `/Users/…/GitHub/kamui` rather than `/Users/ericjulianto/Docum…`.
+pub(crate) fn truncate_left_chars(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    if max == 1 {
+        return "\u{2026}".to_string();
+    }
+    let skip = count - (max - 1);
+    let keep: String = text.chars().skip(skip).collect();
+    format!("\u{2026}{keep}")
+}
+
 pub(crate) fn filter_candidates<'a>(
     candidates: &'a [Candidate],
     needle: &str,
@@ -180,5 +198,16 @@ mod tests {
             2
         );
         assert_eq!(truncate_chars("abc", 5), "abc");
+    }
+
+    #[test]
+    fn truncate_left_keeps_the_path_leaf() {
+        let path = "/Users/ericjulianto/Documents/GitHub/kamui";
+        let short = truncate_left_chars(path, 18);
+        assert!(short.starts_with('\u{2026}'), "{short}");
+        assert!(short.ends_with("kamui"), "{short}");
+        assert_eq!(short.chars().count(), 18);
+        assert_eq!(truncate_left_chars("short", 18), "short");
+        assert_eq!(truncate_left_chars("abcdef", 1), "\u{2026}");
     }
 }

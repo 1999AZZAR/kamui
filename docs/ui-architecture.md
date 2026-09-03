@@ -21,14 +21,17 @@ line-oriented renderer and never touches the alternate screen.
 - **Home screen** — until the first message, the body shows the two-tone block-letter KAMUI
   logo (muted left half, bright blue right half) with startup notices below.
 - **Transcript** — every message is a thick left border (`▌`) with no background fill: user =
-  secondary blue, assistant = brand blue with Markdown styling, tool calls muted, errors red.
-  Tool output folds by default to a two-line peek with a green `/expand` hint; `/expand` and
-  `/collapse` toggle the latest card.
-- **Sidebar** — Session title, Id, Model, Project, Context pressure, and the Last turn metrics,
-  one per line. Hidden under 84 columns and during the intro screen.
+  secondary blue, assistant = brand blue with Markdown styling, tool calls muted, errors red
+  rail with normal text (not a full-width red smear). Tool output folds by default to a
+  two-line peek; long errors fold to a short headline. One blank swimlane between cards.
+  Short transcripts pad at the top so the stack sits just above the editor.
+- **Sidebar** — Session title, Id, Model, Project (left-truncated so the leaf stays visible),
+  Context pressure, and Last turn metrics, one per line. Hidden under 84 columns and during
+  the intro screen.
 - **Editor** — left-accent bordered box holding the live buffer with a real terminal cursor.
-  Enter submits, `\` + Enter continues on a new line (the box grows up to six lines), and the
-  meta line shows version/model/path.
+  While a turn runs, a bouncing wall row is the sole in-flight indicator (no transcript
+  spinner; empty-buffer placeholder is omitted). Enter submits, `\` + Enter continues on a
+  new line, and the meta line shows version/model/path.
 - **Slash menu** — appears above the editor while typing `/`; an eight-row sliding window with
   an n/total counter. Tab accepts, arrows navigate, Enter picks or submits.
 - **Footer** — one quiet hint line plus the token badge (amber at ≥ 80 % context) and queued
