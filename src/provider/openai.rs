@@ -25,10 +25,6 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
-    pub fn new(api_key: String, base_url: String) -> Self {
-        Self::with_options(api_key, base_url, None, false)
-    }
-
     pub fn with_options(
         api_key: String,
         base_url: String,

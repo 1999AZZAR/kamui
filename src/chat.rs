@@ -1727,7 +1727,7 @@ where
         .cloned()
         .unwrap_or_else(|| config.default().clone());
     let provider = build_provider(&active);
-    let mut session = if active.send_session_id {
+    let session = if active.send_session_id {
         Some(database.create_session(provider.name(), &active.model)?)
     } else {
         None
