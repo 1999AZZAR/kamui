@@ -67,7 +67,12 @@ impl OpenAIProvider {
         if !self.send_session_id {
             return Ok(None);
         }
-        match request.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        match request
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(id) => Ok(Some(id)),
             None => bail!(
                 "this provider requires session_id (Orvix Coding Plan); no active Kamui session id was provided"
@@ -113,7 +118,11 @@ fn origin_of(base: &str) -> Option<String> {
     let scheme_sep = trimmed.find("://")?;
     let after_scheme = &trimmed[scheme_sep + 3..];
     let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
-    Some(format!("{}{}", &trimmed[..scheme_sep + 3], &after_scheme[..host_end]))
+    Some(format!(
+        "{}{}",
+        &trimmed[..scheme_sep + 3],
+        &after_scheme[..host_end]
+    ))
 }
 
 #[derive(Deserialize)]
@@ -838,7 +847,7 @@ mod tests {
             model: "m".to_string(),
             messages: vec![Message::system("be brief"), Message::user("hi")],
             tools: Vec::new(),
-        session_id: None,
+            session_id: None,
         };
         let body = OpenAIRequest {
             model: &request.model,
