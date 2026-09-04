@@ -553,8 +553,8 @@ session ID, timestamp, title, and a snippet centered on the match.
 After each streamed response, Kamui reports time-to-first-token (`TTFT`) and total response time
 (`Time`) alongside token usage and the finish reason. The line-oriented terminal feed shows compact
 tool arguments followed by completion/failure state, elapsed time, and output size. Responses use
-light markdown styling. While the model thinks, a braille spinner runs — inline on the scrollback,
-or in the fullscreen transcript's footer — so the wait never looks frozen. Styling and the thinking
+light markdown styling. While the model thinks, a braille spinner runs inline on the scrollback;
+in fullscreen TUI a bouncing wall in the editor is the in-flight indicator. Styling and the thinking
 spinner are disabled when input/output is not a
 terminal; `NO_COLOR` disables colour while retaining the structured feed.
 

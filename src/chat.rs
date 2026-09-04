@@ -3193,17 +3193,19 @@ async fn ask_user(
         return Ok("Error: ask_user requires a non-empty 'question' argument".to_string());
     }
 
-    println!("  ? {}", arguments.question);
-    for (index, option) in arguments.options.iter().enumerate() {
-        println!("    {}. {option}", index + 1);
-    }
-    print!("    > ");
-    io::stdout().flush()?;
-
     let answer = if use_tui {
         let hub = hub.expect("tui implies hub");
-        hub.request_line().await.unwrap_or_default()
+        hub.open_ask_modal(&arguments.question, arguments.options.clone());
+        let answer = hub.request_line().await.unwrap_or_default();
+        hub.close_ask_modal();
+        answer
     } else {
+        println!("  ? {}", arguments.question);
+        for (index, option) in arguments.options.iter().enumerate() {
+            println!("    {}. {option}", index + 1);
+        }
+        print!("    > ");
+        io::stdout().flush()?;
         input_rx.as_mut().unwrap().recv().await.unwrap_or_default()
     };
     let answer = answer.trim();

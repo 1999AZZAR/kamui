@@ -8,14 +8,15 @@ line-oriented renderer and never touches the alternate screen.
 ## Layout
 
 ```
-┌ transcript (thick-border message rails) ─┐ ┌ sidebar ┐
-│                                          │ │ Session │
-└──────────────────────────────────────────┘ │ Id      │
-[ slash-command menu overlay ]               │ Model   │
-┌ editor (❯ input, live cursor) ───────────┐ │ Project │
-│ meta: version · model · path             │ │ Context │
-└──────────────────────────────────────────┘ │ Last turn│
-? help · token badge · queued/scroll hints   └─────────┘
+┌ transcript (slightly lifted bg) ─────────┐ ┌ sidebar ┐
+│ thick-border message rails               │ │ Session │
+└──────────────────────────────────────────┘ │ Model   │
+[ slash-command menu overlay ]               │ Project │
+┌ editor (brighter surface, ❯ + caret) ────┐ │ Context │
+│ bouncing wall while a turn runs          │ │ Last turn│
+└──────────────────────────────────────────┘ └─────────┘
+? help · Ctrl+End to live · token badge
+  overlays: permission (y/a/n) · ask_user · help · dialogs
 ```
 
 - **Home screen** — until the first message, the body shows the two-tone block-letter KAMUI
@@ -31,11 +32,10 @@ line-oriented renderer and never touches the alternate screen.
 - **Editor** — left-accent bordered box holding the live buffer with a real terminal cursor.
   While a turn runs, a bouncing wall row is the sole in-flight indicator (no transcript
   spinner; empty-buffer placeholder is omitted). Enter submits, `\` + Enter continues on a
-  new line, and the meta line shows version/model/path.
+  new line. Up/Down move between buffer lines; history only at the first/last line.
 - **Slash menu** — appears above the editor while typing `/`; an eight-row sliding window with
   an n/total counter. Tab accepts, arrows navigate, Enter picks or submits.
-- **Footer** — one quiet hint line plus the token badge (amber at ≥ 80 % context) and queued
-  count while the agent runs.
+- **Footer** — `? help` plus scroll/queue hints (Ctrl+End returns to live) and the token badge.
 
 ## InputHub
 
@@ -47,8 +47,9 @@ FullScreen>>` lets the thread redraw the editor on every keystroke.
   and queued lines run in order when the turn finishes.
 - Esc (or Ctrl+C while busy) raises an interrupt through a `tokio::sync::Notify` raced inside
   every await point: request, stream events, tool dispatch, plan approval, and ask_user.
-- Approval ([y/N/a]) and ask_user answers travel through one-shot requester channels so they can
-  never collide with the editor or the queue.
+- Approval ([y/N/a] / arrows) and ask_user answers travel through one-shot requester channels so they can
+  never collide with the editor or the queue. In fullscreen, ask_user is a modal — never `println` onto
+  the alternate screen.
 - Ctrl+C at an idle prompt must be pressed twice within three seconds to quit.
 
 Dialogs (Ctrl+K models, Ctrl+S sessions, `?` help, bare `/model`, `/sessions`, `/help`) are modal

@@ -141,11 +141,12 @@ fn lock_screen(screen: &Mutex<FullScreen>) -> MutexGuard<'_, FullScreen> {
 const TEXT: Color = Color::Rgb(0xee, 0xee, 0xee);
 const MUTED: Color = Color::Rgb(0x80, 0x80, 0x80);
 const BORDER: Color = Color::Rgb(0x48, 0x48, 0x48);
-const BG_ELEMENT: Color = Color::Rgb(0x1e, 0x1e, 0x1e);
-const BG_PANEL: Color = Color::Rgb(0x10, 0x10, 0x10);
+const BG_CHAT: Color = Color::Rgb(0x0c, 0x0c, 0x0c);
+const BG_ELEMENT: Color = Color::Rgb(0x22, 0x22, 0x22);
+const BG_PANEL: Color = Color::Rgb(0x14, 0x14, 0x14);
 const BLUE: Color = Color::Rgb(0x5c, 0x9c, 0xf5);
-/// Opaque near-black for every overlay so nothing bleeds through.
-const POPUP_BG: Color = Color::Rgb(0x0a, 0x0a, 0x0a);
+/// Overlay panels sit *above* the transcript: a hair brighter than chat, still opaque.
+const POPUP_BG: Color = Color::Rgb(0x1a, 0x1a, 0x1a);
 /// Search hits: every match gets a quiet wash, the one in view a brighter one.
 const MATCH_BG: Color = Color::Rgb(0x33, 0x2d, 0x14);
 const MATCH_CURRENT_BG: Color = Color::Rgb(0x6b, 0x55, 0x12);
@@ -253,6 +254,8 @@ struct Model {
     token_badge: Option<(String, u8)>,
     /// Open approval modal (opencode permission panel).
     permission: Option<PermissionState>,
+    /// `ask_user` overlay — never `println` onto the alternate screen.
+    ask: Option<AskState>,
     /// Hidden by the user with Ctrl+B, as opposed to dropped for want of room.
     sidebar_hidden: bool,
     /// Live transcript search (Ctrl+F). `/search` looks through saved sessions in SQLite; this
@@ -270,12 +273,21 @@ pub struct SearchState {
     pub total: usize,
 }
 
-/// Approval modal options, opencode labels.
+/// Approval modal options, opencode labels. First field is the typed hotkey (`y`/`a`/`n`).
 pub const PERM_OPTIONS: [(&str, &str); 3] = [
     ("y", "Allow once"),
     ("a", "Always allow this session"),
     ("n", "Reject"),
 ];
+
+fn perm_hotkey(ch: char) -> Option<&'static str> {
+    match ch.to_ascii_lowercase() {
+        'y' => Some("y"),
+        'a' => Some("a"),
+        'n' => Some("n"),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PermissionState {
@@ -286,6 +298,15 @@ pub struct PermissionState {
     /// cut at ten rows with nothing saying so -- you were being asked to authorise a change you
     /// could not finish reading.
     pub scroll: usize,
+}
+
+/// Clarifying question from the model (`ask_user`), rendered as a modal like permission.
+#[derive(Debug, Clone)]
+pub struct AskState {
+    pub question: String,
+    pub options: Vec<String>,
+    pub selected: usize,
+    pub typed: String,
 }
 
 /// A modal picker that submits an existing slash command on Enter — pure UI sugar over
@@ -346,6 +367,7 @@ impl Default for Model {
             help_visible: false,
             token_badge: None,
             permission: None,
+            ask: None,
             sidebar_hidden: false,
             search: None,
         }
@@ -864,7 +886,7 @@ impl ChatUi {
         let stop = Arc::new(tokio::sync::Notify::new());
         let stop_task = stop.clone();
         let task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(50));
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
             loop {
                 tokio::select! {
                     _ = stop_task.notified() => break,
@@ -1443,6 +1465,27 @@ impl InputHub {
         }
         let _ = self.screen.draw_now();
     }
+
+    pub fn open_ask_modal(&self, question: &str, options: Vec<String>) {
+        {
+            let mut s = lock_screen(&self.screen.0);
+            s.model.ask = Some(AskState {
+                question: question.to_string(),
+                options,
+                selected: 0,
+                typed: String::new(),
+            });
+        }
+        let _ = self.screen.draw_now();
+    }
+
+    pub fn close_ask_modal(&self) {
+        {
+            let mut s = lock_screen(&self.screen.0);
+            s.model.ask = None;
+        }
+        let _ = self.screen.draw_now();
+    }
 }
 
 /// RAII marker telling the keyboard thread the agent is running.
@@ -1536,6 +1579,48 @@ fn line_end(buf: &str, caret: usize) -> usize {
         .find('\n')
         .map(|offset| caret + offset)
         .unwrap_or(buf.len())
+}
+
+fn line_display_col(buf: &str, caret: usize) -> usize {
+    let start = line_start(buf, caret);
+    buf[start..caret.min(buf.len())].chars().count()
+}
+
+fn offset_at_display_col(line: &str, col: usize) -> usize {
+    let mut remaining = col;
+    for (index, _) in line.char_indices() {
+        if remaining == 0 {
+            return index;
+        }
+        remaining -= 1;
+    }
+    line.len()
+}
+
+/// Previous buffer line, same display column. `None` on the first line (history takes over).
+fn line_up(buf: &str, caret: usize) -> Option<usize> {
+    let start = line_start(buf, caret);
+    if start == 0 {
+        return None;
+    }
+    let col = line_display_col(buf, caret);
+    let prev_end = start - 1;
+    let prev_start = line_start(buf, prev_end);
+    let prev_line = &buf[prev_start..prev_end];
+    Some(prev_start + offset_at_display_col(prev_line, col))
+}
+
+/// Next buffer line, same display column. `None` on the last line (history takes over).
+fn line_down(buf: &str, caret: usize) -> Option<usize> {
+    let end = line_end(buf, caret);
+    if end >= buf.len() {
+        return None;
+    }
+    let col = line_display_col(buf, caret);
+    let next_start = end + 1;
+    let next_end = line_end(buf, next_start);
+    let next_line = &buf[next_start..next_end];
+    Some(next_start + offset_at_display_col(next_line, col))
 }
 
 fn page_rows(screen: &ScreenHandle) -> i64 {
@@ -1682,13 +1767,19 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
         ));
     }
     lines.push(Line::from(""));
-    for (idx, (_, label)) in PERM_OPTIONS.iter().enumerate() {
+    for (idx, (hotkey, label)) in PERM_OPTIONS.iter().enumerate() {
         let is_on = idx == perm.selected;
         let prefix = if is_on { "\u{276f} " } else { "  " };
         lines.push(Line::from(vec![
             Span::styled(
                 prefix.to_string(),
                 Style::default().fg(if is_on { BLUE } else { BORDER }),
+            ),
+            Span::styled(
+                format!("{hotkey}  "),
+                Style::default()
+                    .fg(if is_on { BLUE } else { MUTED })
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 (*label).to_string(),
@@ -1708,8 +1799,8 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
         ]));
     }
     lines.push(Line::from(Span::styled(
-        "Enter confirm \u{b7} Esc rejects".to_string(),
-        Style::default().fg(BORDER),
+        "y / a / n  \u{b7}  Enter confirm  \u{b7}  Esc rejects".to_string(),
+        Style::default().fg(MUTED),
     )));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -1725,10 +1816,14 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
     );
 }
 
-/// `?` overlay: the keybinding sheet.
-fn render_help(frame: &mut Frame<'_>, area: Rect) {
+fn render_ask(frame: &mut Frame<'_>, ask: &AskState, area: Rect) {
     let width = 64.min(area.width.saturating_sub(4));
-    let height = 26.min(area.height.saturating_sub(2));
+    let question_rows = wrap_display(&ask.question, width.saturating_sub(6) as usize);
+    let option_rows = ask.options.len();
+    let chrome = 5;
+    let height = ((question_rows.len() + option_rows + chrome) as u16)
+        .min(area.height.saturating_sub(2))
+        .max(7);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let box_area = Rect {
@@ -1738,6 +1833,85 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         height,
     };
     frame.render_widget(Clear, box_area);
+    let mut lines: Vec<Line<'static>> = question_rows
+        .into_iter()
+        .map(|row| Line::styled(row, Style::default().fg(TEXT)))
+        .collect();
+    lines.push(Line::from(""));
+    for (idx, option) in ask.options.iter().enumerate() {
+        let is_on = idx == ask.selected && ask.typed.is_empty();
+        let prefix = if is_on { "\u{276f} " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(
+                prefix.to_string(),
+                Style::default().fg(if is_on { BLUE } else { BORDER }),
+            ),
+            Span::styled(
+                format!("{}  ", idx + 1),
+                Style::default()
+                    .fg(if is_on { BLUE } else { MUTED })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                option.clone(),
+                Style::default()
+                    .fg(if is_on { TEXT } else { MUTED })
+                    .add_modifier(if is_on {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+        ]));
+    }
+    let prompt = if ask.typed.is_empty() && !ask.options.is_empty() {
+        "type to answer freely".to_string()
+    } else if ask.typed.is_empty() {
+        "type an answer".to_string()
+    } else {
+        ask.typed.clone()
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "\u{276f} ".to_string(),
+            Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            prompt,
+            if ask.typed.is_empty() {
+                Style::default().fg(MUTED).add_modifier(Modifier::DIM)
+            } else {
+                Style::default().fg(TEXT)
+            },
+        ),
+    ]));
+    let hint = if ask.options.is_empty() {
+        "Enter send  \u{b7}  Esc skip"
+    } else {
+        "1-4 pick  \u{b7}  Enter  \u{b7}  Esc skip"
+    };
+    lines.push(Line::from(Span::styled(
+        hint.to_string(),
+        Style::default().fg(MUTED),
+    )));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().bg(POPUP_BG))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(BLUE))
+                    .title(" Ask ")
+                    .title_style(Style::default().fg(BLUE).add_modifier(Modifier::BOLD)),
+            ),
+        box_area,
+    );
+}
+
+/// `?` overlay: the keybinding sheet.
+fn render_help(frame: &mut Frame<'_>, area: Rect) {
+    let width = 64.min(area.width.saturating_sub(4));
     let rows: [(&str, &str); 22] = [
         ("Enter", "send message"),
         ("Shift/Ctrl+Enter", "newline without sending"),
@@ -1754,7 +1928,10 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         ("?", "toggle this help"),
         ("Tab / Shift+Tab", "cycle mode (build / auto / plan)"),
         ("Tab", "accept slash completion, when the menu is open"),
-        ("\u{2191}/\u{2193}", "history / menu navigation"),
+        (
+            "\u{2191}/\u{2193}",
+            "line in the editor; history on first/last line",
+        ),
         ("PgUp/PgDn", "scroll transcript"),
         ("Ctrl+Home/End", "jump to top/bottom"),
         ("!<command>", "run a shell command"),
@@ -1762,6 +1939,18 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         ("Esc", "interrupt the agent"),
         ("Ctrl+C x 2", "quit"),
     ];
+    let height = ((rows.len() as u16) + 3)
+        .min(area.height.saturating_sub(2))
+        .max(8);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let box_area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, box_area);
     let mut lines = vec![Line::from(Span::styled(
         "Keybindings",
         Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
@@ -1925,6 +2114,20 @@ fn input_thread(
                         }
                         continue;
                     }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Some(answer) = perm_hotkey(c) {
+                            s.model.permission = None;
+                            drop(s);
+                            if let Some(tx) = requester
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .take()
+                            {
+                                let _ = tx.send(answer.to_string());
+                            }
+                            continue;
+                        }
+                    }
                     KeyCode::Esc => {
                         s.model.permission = None;
                         drop(s);
@@ -1936,6 +2139,81 @@ fn input_thread(
                             let _ = tx.send("n".to_string());
                         }
                         continue;
+                    }
+                    _ => {}
+                }
+                drop(s);
+                let _ = screen.draw_now();
+                continue;
+            }
+            drop(s);
+        }
+
+        // --- ask_user modal owns the keys while open ---
+        {
+            let mut s = lock_screen(&screen.0);
+            if let Some(ask) = s.model.ask.as_mut() {
+                match key.code {
+                    KeyCode::Up if ask.options.len() > 1 && ask.typed.is_empty() => {
+                        ask.selected = ask.selected.checked_sub(1).unwrap_or(ask.options.len() - 1);
+                    }
+                    KeyCode::Down if ask.options.len() > 1 && ask.typed.is_empty() => {
+                        ask.selected = (ask.selected + 1) % ask.options.len();
+                    }
+                    KeyCode::Enter => {
+                        let answer = if !ask.typed.is_empty() {
+                            ask.typed.clone()
+                        } else if !ask.options.is_empty() {
+                            (ask.selected + 1).to_string()
+                        } else {
+                            String::new()
+                        };
+                        s.model.ask = None;
+                        drop(s);
+                        if let Some(tx) = requester
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .take()
+                        {
+                            let _ = tx.send(answer);
+                        }
+                        continue;
+                    }
+                    KeyCode::Esc => {
+                        s.model.ask = None;
+                        drop(s);
+                        if let Some(tx) = requester
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .take()
+                        {
+                            let _ = tx.send(String::new());
+                        }
+                        continue;
+                    }
+                    KeyCode::Backspace => {
+                        ask.typed.pop();
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if ask.typed.is_empty()
+                            && let Some(digit) = c.to_digit(10)
+                            && digit >= 1
+                        {
+                            let index = (digit as usize).saturating_sub(1);
+                            if index < ask.options.len() {
+                                s.model.ask = None;
+                                drop(s);
+                                if let Some(tx) = requester
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .take()
+                                {
+                                    let _ = tx.send(digit.to_string());
+                                }
+                                continue;
+                            }
+                        }
+                        ask.typed.push(c);
                     }
                     _ => {}
                 }
@@ -2104,6 +2382,8 @@ fn input_thread(
                     if total > 0 {
                         selected = selected.checked_sub(1).unwrap_or(total - 1);
                     }
+                } else if let Some(next) = line_up(&buf, caret) {
+                    caret = next;
                 } else if history_idx > 0 {
                     if history_idx == history.len() {
                         saved_buf = buf.clone();
@@ -2120,6 +2400,8 @@ fn input_thread(
                     if total > 0 {
                         selected = (selected + 1) % total;
                     }
+                } else if let Some(next) = line_down(&buf, caret) {
+                    caret = next;
                 } else if history_idx < history.len() {
                     history_idx += 1;
                     buf = if history_idx == history.len() {
@@ -2506,7 +2788,10 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
             };
             window.push(line);
         }
-        frame.render_widget(Paragraph::new(Text::from(window)), transcript_area);
+        frame.render_widget(
+            Paragraph::new(Text::from(window)).style(Style::default().bg(BG_CHAT)),
+            transcript_area,
+        );
     }
     if let Some(area) = sidebar_area {
         frame.render_widget(sidebar_paragraph(model, area), area);
@@ -2539,6 +2824,9 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
 
     if let Some(perm) = &model.permission {
         render_permission(frame, perm, frame.area());
+    }
+    if let Some(ask) = &model.ask {
+        render_ask(frame, ask, frame.area());
     }
     if model.help_visible {
         render_help(frame, frame.area());
@@ -2699,7 +2987,7 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
         ));
         wall_line.push(Span::styled(
             "  \u{b7} Enter steers \u{b7} Esc interrupts".to_string(),
-            Style::default().fg(BORDER).add_modifier(Modifier::DIM),
+            Style::default().fg(MUTED).add_modifier(Modifier::DIM),
         ));
         rows.push(Line::from(wall_line));
     }
@@ -2807,7 +3095,8 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
     // Left border eats one column; keep a little padding so values never kiss the rail.
     let max = area.width.saturating_sub(3).max(1) as usize;
     if let Some(entries) = &model.sidebar {
-        for (key, value) in entries {
+        let compact = area.height < (entries.len() as u16).saturating_mul(4);
+        for (i, (key, value)) in entries.iter().enumerate() {
             lines.push(Line::from(Span::styled(
                 format!("{key} "),
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -2840,7 +3129,9 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
                 };
                 lines.push(Line::styled(truncated, Style::default().fg(NOTICE_FG)));
             }
-            lines.push(Line::from(""));
+            if !compact && i + 1 < entries.len() {
+                lines.push(Line::from(""));
+            }
         }
     }
     Paragraph::new(Text::from(lines))
@@ -2848,7 +3139,7 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
         .block(
             Block::default()
                 .borders(Borders::LEFT)
-                .border_style(Style::default().fg(BORDER))
+                .border_style(Style::default().fg(MUTED))
                 .style(Style::default().bg(BG_PANEL)),
         )
 }
@@ -2928,7 +3219,7 @@ fn footer_widget(model: &Model) -> Paragraph<'static> {
     }
     if model.scroll_from_bottom > 0 {
         text.push_str(&format!(
-            "  \u{b7} \u{2191} {} row(s) back \u{b7} End returns to live",
+            "  \u{b7} \u{2191} {} row(s) back \u{b7} Ctrl+End returns to live",
             model.scroll_from_bottom
         ));
     }
@@ -2940,7 +3231,7 @@ fn footer_widget(model: &Model) -> Paragraph<'static> {
         ));
     }
     // opencode status bar: a filled token badge that turns amber past 80% context.
-    let mut spans = vec![Span::styled(text, Style::default().fg(BORDER))];
+    let mut spans = vec![Span::styled(text, Style::default().fg(MUTED))];
     if let Some((badge_text, pct)) = &model.token_badge {
         spans.push(Span::raw("    "));
         spans.push(Span::styled(
@@ -3218,7 +3509,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
                     &mut out,
                     vec![Span::styled(
                         "\u{2026} ctrl+o or click".to_string(),
-                        Style::default().fg(GREEN),
+                        Style::default().fg(MUTED),
                     )],
                 );
             }
@@ -3947,6 +4238,19 @@ mod tests {
     }
 
     #[test]
+    fn up_and_down_move_between_buffer_lines_then_stop() {
+        let buf = "first\nsecond\nthird";
+        let on_second = buf.find("second").unwrap() + 3; // 'o' of second, col 3
+        let up = line_up(buf, on_second).expect("not on first line");
+        assert_eq!(&buf[line_start(buf, up)..line_end(buf, up)], "first");
+        assert_eq!(line_display_col(buf, up), 3);
+        assert!(line_up(buf, 2).is_none(), "first line yields to history");
+        let down = line_down(buf, on_second).expect("not on last line");
+        assert_eq!(&buf[line_start(buf, down)..line_end(buf, down)], "third");
+        assert!(line_down(buf, buf.len()).is_none());
+    }
+
+    #[test]
     fn a_long_line_scrolls_to_keep_the_caret_visible() {
         // Editing in the middle of a line longer than the box must not push the caret off it.
         let buf = "x".repeat(200);
@@ -4265,6 +4569,10 @@ mod tests {
             "the modal admits what it hid:\n{screen}"
         );
         assert!(screen.contains("PgUp/PgDn"), "and says how to see the rest");
+        assert!(
+            screen.contains("y") && screen.contains("Allow once"),
+            "hotkeys are visible:\n{screen}"
+        );
         assert!(screen.contains("line 1"), "the body starts at the top");
 
         // Scrolled down, later lines come into view.

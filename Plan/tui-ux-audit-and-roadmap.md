@@ -251,14 +251,14 @@ git diff --check
 
 ## 10. Checklist cepat “sudah tidak jelek?”
 
-- [ ] Permission: user bisa jawab dengan `y` / `a` / `n` tanpa baca novel
-- [ ] `ask_user` tidak merusak TUI
-- [ ] Multiline: panah atas/bawah pindah baris
-- [ ] Footer terbaca dan jujur
-- [ ] Screenshot: sidebar ≠ transcript ≠ editor (lapisan jelas)
-- [ ] Modal terasa di depan, bukan tempelan teks
-- [ ] Session panjang tidak “ngelag” saat thinking wall
-- [ ] Docs = perilaku nyata
+- [x] Permission: user bisa jawab dengan `y` / `a` / `n` tanpa baca novel
+- [x] `ask_user` tidak merusak TUI
+- [x] Multiline: panah atas/bawah pindah baris
+- [x] Footer terbaca dan jujur
+- [ ] Screenshot: sidebar ≠ transcript ≠ editor (lapisan jelas) — palette diangkat; verifikasi visual masih perlu mata manusia
+- [x] Modal menampilkan hotkey; overlay lebih terang dari transcript
+- [x] Thinking ticker 100ms (bukan 50ms)
+- [x] Docs = perilaku nyata (layout / wall / ask_user)
 
 ---
 
