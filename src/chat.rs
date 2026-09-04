@@ -197,7 +197,9 @@ where
         project,
         &mcp_sidebar,
         None,
+        None,
         context_window,
+        None,
         None,
     );
     // Restore pending plan on resume/startup.
@@ -247,6 +249,31 @@ where
     let mut pending_add: Option<(String, String)> = None;
     // Background jobs already reported as finished, so each is announced once.
     let mut announced_jobs: HashSet<String> = HashSet::new();
+    // One fixed tool array per Session (prefix-cache stability): computed once from the
+    // profile, never swapped per Turn. Plan Mode pending holds mutating tools at execution
+    // time (`is_mutating_held`) instead of shrinking the roster, so the `tools` suffix of
+    // the request prefix stays byte-identical across Turns. Reset on profile switch and
+    // whenever a command replaces the session (same points that reset plan/compaction state).
+    // ponytail: full roster in pending Plan Mode (model may call held tools, gets a hold
+    // message); subset roster if the hold-message round-trips prove wasteful.
+    let mut session_tools: Option<Vec<crate::provider::ToolDefinition>> = None;
+    // Frozen request head per Session (prefix-cache stability): the base system prompt,
+    // memory snapshot, and skill block are each their own message, computed once and
+    // reused across Turns. Only the rolling Compaction summary (which grows by design)
+    // is re-rendered per Turn, as the last head message before history.
+    // `cached_memory_snapshot` holds the last rendered memory block; `memory_dirty`
+    // flips when a memory Tool runs, so the next Turn re-reads the DB once instead of
+    // every Turn — while a skill toggle rebuilds the head around the same snapshot.
+    let mut head_messages: Option<Vec<Message>> = None;
+    let mut cached_memory_snapshot = String::new();
+    let mut memory_dirty = true;
+    // Previous turn's cache + model for miss detection (`cache_miss_label`): a drop
+    // beyond the noise floor means the prefix broke. `head_rebuilt_this_turn` marks
+    // turns where we intentionally rebuilt the head (memory/skill change) so the
+    // label names the cause. Model identity is tracked to label model-switch misses.
+    let mut prev_cached: Option<u64> = None;
+    let mut prev_model: Option<String> = None;
+    let mut head_rebuilt_this_turn = false;
 
     'chat: loop {
         // A background job that ended could previously only be found by polling `/jobs`. Report
@@ -464,7 +491,9 @@ where
                         project,
                         &mcp_sidebar,
                         None,
+                        None,
                         context_window,
+                        None,
                         None,
                     );
                     chat_ui.notice(&format!("Added & switched to {rest} (profile {name})."))?;
@@ -608,6 +637,9 @@ where
                                 Ok(()) => {
                                     disabled_skills =
                                         crate::settings::load_disabled_skills(project.root());
+                                    // Skill block is part of the frozen head: refresh next turn.
+                                    head_messages = None;
+                                    head_rebuilt_this_turn = true;
                                     chat_ui.notice(&format!(
                                         "/{} is now {}",
                                         skill.name,
@@ -689,6 +721,10 @@ where
                         display_path(project.root())
                     ))?;
                 }
+                // Profile switch may flip tools/embedding_model/system: recompute fixed state.
+                session_tools = None;
+                head_messages = None;
+                memory_dirty = true;
                 continue;
             }
             if command == "/status" {
@@ -796,7 +832,9 @@ where
                     project,
                     &mcp_sidebar,
                     None,
+                    None,
                     context_window,
+                    None,
                     None,
                 );
                 continue;
@@ -891,7 +929,9 @@ where
                     project,
                     &mcp_sidebar,
                     None,
+                    None,
                     context_window,
+                    None,
                     None,
                 );
             }
@@ -933,6 +973,13 @@ where
                 // A different conversation gets a different prefix by design, so the first turn
                 // after it is a warm-up, not drift worth reporting.
                 prefix_guard.reset();
+            }
+            // The fixed tool array + frozen head are session-scoped: a new/resumed session
+            // may carry a different plan state or profile, so recompute on the next turn.
+            if prev_session_id != session.as_ref().map(|s| s.id.clone()) {
+                session_tools = None;
+                head_messages = None;
+                memory_dirty = true;
             }
             continue;
         }
@@ -976,23 +1023,22 @@ where
             plan_requested = false;
         }
         // Some models/endpoints reject the `tools` field; a profile can opt out so plain chat works.
-        // In Plan Mode (pending), only read-only + update_plan + ask_user/search_code/spawn_agent.
-        let is_plan_pending = plan_mode
-            .as_ref()
-            .is_some_and(|s| s.status == PlanStatus::Pending);
-        let tool_definitions = if active.tools {
-            if is_plan_pending {
-                plan_mode_definitions(project.root(), active.embedding_model.is_some())
-            } else {
+        // Fixed per Session (prefix-cache stability): computed once, reused every turn.
+        // Pending Plan Mode does NOT shrink the roster — mutating calls are held at execution
+        // time with an explanatory message (`is_mutating_held`), so the wire `tools` array
+        // never flips shape mid-session.
+        if session_tools.is_none() {
+            session_tools = Some(if active.tools {
                 let mut defs = tools.definitions();
                 if active.embedding_model.is_some() {
                     defs.push(tools::search_code_definition());
                 }
                 defs
-            }
-        } else {
-            Vec::new()
-        };
+            } else {
+                Vec::new()
+            });
+        }
+        let tool_definitions = session_tools.as_ref().expect("computed above").clone();
 
         // Auto-compact older history once the recent portion grows past the threshold.
         summarized_upto = summarized_upto.min(messages.len());
@@ -1041,26 +1087,38 @@ where
             }
         }
 
-        // Working conversation for this turn: the agentic system prompt (plus project
-        // instructions), the un-summarized recent history, the volatile tail, and the expanded
-        // prompt. Intermediate tool messages live here only; they are not persisted. Memory is read
-        // fresh every turn (unlike Kumo's frozen-at-startup snapshot): Kamui is a single
-        // interactive process, not a server shared across many chats, so a fact remembered in this
-        // turn should be visible on the very next one without needing a restart.
-        let skills_eager = skill_library.eager_block_filtered(&disabled_skills);
-        let system = prompt::build(
-            active.tools,
-            project.system_message().as_deref(),
-            skills_eager.as_deref(),
-        );
-        // Prompt-cache contract (see `src/cache.rs`): the system message and the tool definitions
-        // are the session's stable prefix, so anything that changes on its own has to ride behind
-        // them. Memory is still read fresh every turn -- a fact remembered this turn is visible on
-        // the next one -- and the running summary is still current, but both now travel in a tail
-        // message placed immediately before the new user turn instead of being folded into the
-        // system message, where a single `remember` call used to reset the cached prefix for the
-        // rest of the session.
-        if let Some(notice) = prefix_guard.check(&system, &tool_definitions) {
+        // Working conversation for this turn (prompt-cache contract, see `src/cache.rs`):
+        //
+        //     [head]     base system + project instructions, then the eager skill list
+        //     [history]  the un-summarized conversation, unchanged
+        //     [tail]     memory snapshot + rolling summary
+        //     [user]     the new turn
+        //
+        // The head is computed once per Session and cloned per Turn: its inputs are fixed at
+        // startup or change only on an explicit user action (`/model`, a skill toggle), which
+        // resets `head_messages`.
+        //
+        // Memory and the summary sit *behind* the history rather than in the head. Both are read
+        // fresh -- a fact remembered this turn is visible on the next one -- so putting them in
+        // front would mean one `remember` call moved byte zero and re-read the whole conversation
+        // at full price. Behind it, the divergence point is only ever the previous turn's tail.
+        // Intermediate tool messages live here only; they are not persisted.
+        if head_messages.is_none() {
+            let skills_eager = skill_library.eager_block_filtered(&disabled_skills);
+            let base = prompt::build(active.tools, project.system_message().as_deref(), None);
+            head_messages = Some(build_head_messages(base, skills_eager.as_deref()));
+        }
+        let head = head_messages.as_ref().expect("built above");
+        // The tail re-reads the database only after a memory tool ran; between those turns the
+        // previous snapshot is reused, which saves a round trip per turn rather than protecting
+        // the prefix -- the tail is free to change without costing a cache hit.
+        if memory_dirty {
+            cached_memory_snapshot = render_memory_snapshot(&database.list_memory()?);
+            memory_dirty = false;
+        }
+        // Guard the frozen part. Nothing above should ever move without an explicit user action;
+        // when it does, say so, because otherwise a collapsed hit rate has no visible cause.
+        if let Some(notice) = prefix_guard.check(&cache::head_text(head), &tool_definitions) {
             chat_ui.notice(&notice)?;
         }
         // Say what was attached. The prompt text only ever shows what was typed (`@clipboard`,
@@ -1069,11 +1127,10 @@ where
         if let Some(note) = describe_attachments(&expanded) {
             chat_ui.notice(&note)?;
         }
-        let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
         let mut turn_messages = cache::turn_messages(
-            &system,
+            head,
             &messages[summarized_upto..],
-            cache::volatile_tail(&memory_snapshot, summary.as_deref()),
+            cache::volatile_tail(&cached_memory_snapshot, summary.as_deref()),
             Message::user_with_images(expanded.text, expanded.images),
         );
 
@@ -1261,6 +1318,13 @@ where
                     }
                 }
             };
+            let miss_label = cache_miss_label(
+                prev_cached,
+                usage.cached_tokens,
+                usage.prompt_tokens,
+                prev_model.as_deref() != Some(active.model.as_str()),
+                head_rebuilt_this_turn,
+            );
             let usage_line = format_usage(
                 usage.prompt_tokens,
                 usage.completion_tokens,
@@ -1271,13 +1335,20 @@ where
                 ttft,
                 started.elapsed(),
                 context_window,
+                miss_label,
             );
             if chat_ui.is_fullscreen() {
                 // Structured per-metric lines read better in the narrow rail. Tab separates
                 // the fixed-width label from the value so the sidebar can style them apart.
                 let mut lt = format!("tok\t{}", usage.total_tokens);
                 lt.push_str(&format!("\nin\t{}", usage.prompt_tokens));
-                lt.push_str(&format!("\nout\t{}", usage.completion_tokens));
+                if usage.cached_tokens > 0 && usage.prompt_tokens > 0 {
+                    let hit = (usage.cached_tokens as f64 / usage.prompt_tokens as f64 * 100.0)
+                        .min(100.0);
+                    lt.push_str(&format!("\ncache\t{} ({hit:.0}%)", usage.cached_tokens));
+                } else if let Some(miss) = miss_label {
+                    lt.push_str(&format!("\ncache\t{miss}"));
+                }
                 if let Some(t) = ttft {
                     lt.push_str(&format!("\nlat\t{}", crate::terminal::format_duration(t)));
                 }
@@ -1285,6 +1356,17 @@ where
                     "\ntime\t{}",
                     crate::terminal::format_duration(started.elapsed())
                 ));
+                let activity = {
+                    let mut a = format!("tools\t{}", tool_calls.len());
+                    if let Some(t) = ttft {
+                        a.push_str(&format!("\nlat\t{}", crate::terminal::format_duration(t)));
+                    }
+                    a.push_str(&format!(
+                        "\ntime\t{}",
+                        crate::terminal::format_duration(started.elapsed())
+                    ));
+                    a
+                };
                 update_sidebar(
                     &mut chat_ui,
                     session.as_ref(),
@@ -1294,8 +1376,10 @@ where
                     project,
                     &mcp_sidebar,
                     Some(usage.prompt_tokens),
+                    Some(usage.cached_tokens),
                     context_window,
                     Some(lt),
+                    Some(activity),
                 );
             } else {
                 println!("{usage_line}");
@@ -1308,13 +1392,21 @@ where
                     project,
                     &mcp_sidebar,
                     Some(usage.prompt_tokens),
+                    Some(usage.cached_tokens),
                     context_window,
+                    None,
                     None,
                 );
             }
             accumulate_usage(&mut final_usage, &usage);
             final_finish = finish_reason;
             last_content = content.clone();
+            // Feed miss detection for the next round: the last round's counts are what
+            // the next request's prefix is measured against. Reset the rebuild flag —
+            // it only names the turn where the rebuild happened.
+            prev_cached = Some(usage.cached_tokens);
+            prev_model = Some(active.model.clone());
+            head_rebuilt_this_turn = false;
 
             if tool_calls.is_empty() {
                 break 'agent Message::assistant(content);
@@ -1491,6 +1583,11 @@ where
                             .to_string(),
                     }
                 } else if is_memory_tool(&call.name) {
+                    // Memory changed: re-read it for the next turn's tail, so the new fact is
+                    // visible immediately (same guarantee as the old read-fresh-every-turn).
+                    // The head is untouched — memory does not live there, which is exactly why a
+                    // `remember` call no longer costs the session its cached prefix.
+                    memory_dirty = true;
                     dispatch_memory_tool(database, &call.name, &call.arguments)
                 } else if tools.requires_confirmation_for(&call.name, &call.arguments)
                     && !auto_approve
@@ -1781,20 +1878,17 @@ where
     }
 
     let skills_eager = skill_library.eager_block_filtered(&disabled_skills);
-    let system = prompt::build(
-        active.tools,
-        project.system_message().as_deref(),
-        skills_eager.as_deref(),
-    );
-    // Same prefix shape as an interactive turn (see `src/cache.rs`): stable system message first,
-    // volatile memory tail last, so a session driven through `-p` shares the cached prefix an
-    // interactive turn of the same session would build.
+    // Same shape as an interactive turn (see `src/cache.rs`): frozen head first, volatile memory
+    // tail last, so a session driven through `-p` builds the prefix an interactive turn of the
+    // same session would.
+    let base = prompt::build(active.tools, project.system_message().as_deref(), None);
+    let head = build_head_messages(base, skills_eager.as_deref());
     if let Some(note) = describe_attachments(&expanded) {
         println!("{note}");
     }
     let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
     let mut turn_messages = cache::turn_messages(
-        &system,
+        &head,
         &[],
         cache::volatile_tail(&memory_snapshot, None),
         Message::user_with_images(expanded.text, expanded.images),
@@ -3004,38 +3098,41 @@ fn update_sidebar(
     project: &ProjectContext,
     mcp: &str,
     last_input_tokens: Option<u64>,
+    last_cached_tokens: Option<u64>,
     context_window: Option<u64>,
     last_turn: Option<String>,
+    activity: Option<String>,
 ) {
     if !chat_ui.is_fullscreen() {
         return;
     }
-    let mut entries = vec![(
-        "Session".to_string(),
-        match session {
-            Some(session) => session.title.clone(),
-            None => "New chat".to_string(),
-        },
-    )];
+    let mut entries: Vec<(String, String)> = Vec::new();
+    // Groups mirror the prototype pick: Session identity, Runtime (model/mode/git/project),
+    // Context with a variant-C usage bar, then Activity + Last turn metrics.
+    let mut session_value = match session {
+        Some(session) => session.title.clone(),
+        None => "New chat".to_string(),
+    };
     if let Some(session) = session {
-        entries.push(("Id".to_string(), short_id(&session.id).to_string()));
+        session_value.push_str(&format!("\nid\t{}", short_id(&session.id)));
     }
-    entries.push(("Version".to_string(), format!("v{version}")));
-    entries.push(("Model".to_string(), model.to_string()));
-    entries.push(("Mode".to_string(), mode.to_string()));
+    session_value.push_str(&format!("\nversion\tv{version}"));
+    entries_push(&mut entries, "Session", session_value);
+    let mut runtime = format!("model\t{model}\nmode\t{mode}");
     if let Some(git) = git_status(project.root()) {
         let dirty = if git.changed == 0 {
             String::new()
         } else {
             format!(" · {} changed", git.changed)
         };
-        entries.push(("Git".to_string(), format!("{}{dirty}", git.branch)));
+        runtime.push_str(&format!("\ngit\t{}{dirty}", git.branch));
     }
-    entries.push(("Project".to_string(), display_path(project.root())));
+    runtime.push_str(&format!("\nproject\t{}", display_path(project.root())));
     if !mcp.is_empty() {
-        entries.push(("MCP".to_string(), mcp.to_string()));
+        runtime.push_str(&format!("\nmcp\t{mcp}"));
     }
-    let context_line = match (last_input_tokens, context_window) {
+    entries_push(&mut entries, "Runtime", runtime);
+    let mut context_line = match (last_input_tokens, context_window) {
         (Some(tokens), Some(window)) => {
             format!(
                 "{tokens} tokens ({:.1}% of {window})",
@@ -3045,7 +3142,20 @@ fn update_sidebar(
         (Some(tokens), None) => format!("{tokens} tokens"),
         (None, _) => "\u{2014}".to_string(),
     };
-    entries.push(("Context".to_string(), context_line));
+    if let (Some(tokens), Some(window)) = (last_input_tokens, context_window)
+        && window > 0
+    {
+        let pct = ((tokens as f64 / window as f64) * 100.0).min(100.0).round() as u8;
+        context_line.push_str(&format!("\nbar\t{pct}"));
+    }
+    if let (Some(tokens), Some(cached)) = (last_input_tokens, last_cached_tokens)
+        && cached > 0
+        && tokens > 0
+    {
+        let hit = (cached as f64 / tokens as f64 * 100.0).min(100.0);
+        context_line.push_str(&format!("\ncache\t{cached} ({hit:.0}%)"));
+    }
+    entries_push(&mut entries, "Context", context_line);
     // Status-bar badge: compact token count with context pressure for the amber threshold.
     match last_input_tokens {
         Some(tokens) => {
@@ -3063,10 +3173,59 @@ fn update_sidebar(
             let _ = chat_ui.set_token_badge(None);
         }
     }
+    if let Some(activity) = activity {
+        entries_push(&mut entries, "Activity", activity);
+    }
     if let Some(last_turn) = last_turn {
-        entries.push(("Last turn".to_string(), last_turn));
+        entries_push(&mut entries, "Last turn", last_turn);
     }
     let _ = chat_ui.set_sidebar(entries);
+}
+
+/// Push a sidebar group, merging into the previous entry when the same group is
+/// pushed twice (startup + refresh both contribute before the first turn).
+fn entries_push(entries: &mut Vec<(String, String)>, key: &str, value: String) {
+    if let Some(existing) = entries.iter_mut().find(|(k, _)| k == key) {
+        existing.1.push('\n');
+        existing.1.push_str(&value);
+    } else {
+        entries.push((key.to_string(), value));
+    }
+}
+
+/// Prefix-cache miss detection (Pi parity: `cache-stats.ts` `detectCacheMiss`).
+/// Compares this turn's cached tokens against the previous turn's: a drop larger
+/// than the noise floor means the prefix broke somewhere. Returns a short label
+/// for the `cache` line, or `None` when there is nothing worth reporting (first
+/// turn, or the delta is within noise). Callers pass what changed this turn so
+/// the label names the likely cause instead of just saying "miss".
+///
+/// Smallest observable contract: same-prefix turns stay silent, a fresh-prefix
+/// turn after a cached one reports `miss`, first turns never report.
+fn cache_miss_label(
+    prev_cached: Option<u64>,
+    cached: u64,
+    input: u64,
+    model_switched: bool,
+    head_rebuilt: bool,
+) -> Option<&'static str> {
+    /// Misses at or below this many tokens are noise (cold start, rounding),
+    /// not a broken prefix. Same role as Pi's `NOISE_FLOOR_TOKENS = 1024`.
+    const NOISE_FLOOR_TOKENS: u64 = 1024;
+    let prev = prev_cached?;
+    if prev <= NOISE_FLOOR_TOKENS || input == 0 {
+        return None;
+    }
+    if cached >= prev.saturating_sub(NOISE_FLOOR_TOKENS) {
+        return None;
+    }
+    Some(if model_switched {
+        "miss (model switch)"
+    } else if head_rebuilt {
+        "miss (prefix rebuilt)"
+    } else {
+        "miss"
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3081,6 +3240,7 @@ fn format_usage(
     ttft: Option<Duration>,
     elapsed: Duration,
     context_window: Option<u64>,
+    miss_label: Option<&str>,
 ) -> String {
     let mut line = format!("Tokens: {input} input + {output} output = {total} total");
     // On a cache-pinned profile the field is always shown: a zero there is the whole signal --
@@ -3088,6 +3248,9 @@ fn format_usage(
     // looking exactly like a provider that reports nothing.
     if let Some(percent) = cache::hit_percent(input, cached).filter(|_| cached > 0) {
         line.push_str(&format!(" | Cached: {cached} ({percent:.0}%)"));
+    } else if let Some(miss) = miss_label {
+        // A named cause beats a bare zero, so it wins when there is one.
+        line.push_str(&format!(" | Cache {miss}"));
     } else if cache_pinned {
         line.push_str(" | Cached: 0 (warm-up)");
     }
@@ -3863,6 +4026,25 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// the system prompt (which carries every entry on every request) from growing unbounded.
 const MAX_MEMORY_BYTES: i64 = 4 * 1024;
 
+/// Build the frozen request head: one message per stable block — the base system prompt (with
+/// project instructions) and the eager skill list. Only an explicit user action changes either,
+/// and the callers that perform one reset `head_messages`, so between those the head is the same
+/// bytes every turn.
+///
+/// Memory and the rolling summary are deliberately *not* here. Both change on their own — a
+/// `remember` call, a compaction — and anything in the head sits ahead of the whole conversation,
+/// so putting them here would mean one of those re-read every earlier turn at full price. They
+/// ride behind the history instead, as `cache::volatile_tail`.
+fn build_head_messages(base_system: String, skills_eager: Option<&str>) -> Vec<Message> {
+    let mut head = vec![Message::system(base_system)];
+    if let Some(skills) = skills_eager
+        && !skills.is_empty()
+    {
+        head.push(Message::system(skills.to_string()));
+    }
+    head
+}
+
 /// Render every remembered fact as a system-prompt block, or an empty string when there is
 /// nothing remembered yet (so callers can skip adding an empty section).
 fn render_memory_snapshot(entries: &[storage::MemoryEntry]) -> String {
@@ -3924,19 +4106,6 @@ fn is_mutating_tool(name: &str) -> bool {
         name,
         tools::PATCH_FILE_TOOL | "run_command" | "command_status" | "stop_command"
     )
-}
-
-fn plan_mode_definitions(
-    root: &std::path::Path,
-    has_embedding: bool,
-) -> Vec<crate::provider::ToolDefinition> {
-    let mut defs = tools::ToolRegistry::plan_mode(root.to_path_buf()).definitions();
-    // plan_mode() already includes update_plan; add ask_user/spawn_agent/memory via definitions()
-    // which plan_mode's definitions() already includes. Add search_code if available.
-    if has_embedding {
-        defs.push(tools::search_code_definition());
-    }
-    defs
 }
 
 #[derive(serde::Deserialize)]
@@ -5194,6 +5363,36 @@ mod tests {
     }
 
     #[test]
+    fn cache_miss_label_stays_silent_on_first_turn_and_hits() {
+        // No previous turn: never report.
+        assert_eq!(cache_miss_label(None, 0, 5000, false, false), None);
+        assert_eq!(cache_miss_label(None, 3000, 5000, false, false), None);
+        // Same-prefix hit: cached holds steady.
+        assert_eq!(cache_miss_label(Some(4000), 3950, 5000, false, false), None);
+        // Previous turn too small to trust: noise, not a miss.
+        assert_eq!(cache_miss_label(Some(500), 0, 5000, false, false), None);
+    }
+
+    #[test]
+    fn cache_miss_label_names_the_likely_cause() {
+        // Fresh prefix after a cached turn: plain miss.
+        assert_eq!(
+            cache_miss_label(Some(4000), 0, 5000, false, false),
+            Some("miss")
+        );
+        assert_eq!(
+            cache_miss_label(Some(4000), 0, 5000, true, false),
+            Some("miss (model switch)")
+        );
+        assert_eq!(
+            cache_miss_label(Some(4000), 0, 5000, false, true),
+            Some("miss (prefix rebuilt)")
+        );
+        // Partial drop within the noise floor: still a hit.
+        assert_eq!(cache_miss_label(Some(4000), 3500, 5000, false, false), None);
+    }
+
+    #[test]
     fn format_duration_switches_units_at_one_second() {
         // Kept here as well as in `terminal`: this is the boundary the two copies had to agree
         // on, and now only one implementation can define it.
@@ -5331,6 +5530,56 @@ mod tests {
 
         assert!(rendered.contains("Prefers bun over node."));
         assert!(rendered.contains("Prefers uv over pip."));
+    }
+
+    #[test]
+    fn head_messages_skip_empty_blocks() {
+        let head = build_head_messages("base".to_string(), None);
+        assert_eq!(head.len(), 1);
+        assert_eq!(head[0].content, "base");
+        assert_eq!(
+            build_head_messages("base".to_string(), Some("")).len(),
+            1,
+            "a project with no skills adds no empty block"
+        );
+    }
+
+    #[test]
+    fn head_messages_keep_blocks_separate() {
+        let head = build_head_messages("base".to_string(), Some("Skills:\n- review"));
+        assert_eq!(head.len(), 2);
+        assert_eq!(head[0].content, "base");
+        assert!(head[1].content.contains("review"));
+    }
+
+    /// The merged contract: a remembered fact reaches the model on the next turn without moving
+    /// one byte of the head, because it rides behind the history rather than in front of it.
+    #[test]
+    fn remembering_something_leaves_the_frozen_head_alone() {
+        let head = build_head_messages("base".to_string(), Some("Skills:\n- review"));
+        let before = crate::cache::head_text(&head);
+
+        let history = [Message::user("q"), Message::assistant("a")];
+        let turn = crate::cache::turn_messages(
+            &head,
+            &history,
+            crate::cache::volatile_tail("Remembered facts:\n- bun\n- uv", None),
+            Message::user("next"),
+        );
+
+        assert_eq!(
+            crate::cache::head_text(&head),
+            before,
+            "the head is not rebuilt when memory changes"
+        );
+        assert!(
+            turn[turn.len() - 2].content.contains("uv"),
+            "the new fact is in the tail, behind the history"
+        );
+        assert!(
+            !turn[0].content.contains("uv") && !turn[1].content.contains("uv"),
+            "and never in the head"
+        );
     }
 
     #[test]

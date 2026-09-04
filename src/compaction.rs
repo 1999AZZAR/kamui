@@ -74,6 +74,17 @@ pub fn render(messages: &[Message]) -> String {
         .join("\n\n")
 }
 
+/// Frozen Compaction templates (prefix-cache stability): the summary request must be
+/// byte-identical every time except for the prior summary + new messages. Editing
+/// these strings resets the side-request baseline the same way editing the system
+/// prompt resets the main prefix — so don't, without noting it in the changelog.
+pub const SUMMARY_INSTRUCTION: &str = "You maintain a running summary of a coding conversation so it can continue \
+     after older messages are dropped. Rewrite the summary to capture the user's \
+     goals, key decisions, files and code changed, commands run and their \
+     results, and any open threads. Be concise and factual, and output only the \
+     summary.";
+const NO_PRIOR_SUMMARY: &str = "(none yet)";
+
 /// Build the non-streaming request that folds new messages into the running summary.
 pub fn summary_request(
     model: &str,
@@ -81,16 +92,11 @@ pub fn summary_request(
     rendered: &str,
     session_id: Option<String>,
 ) -> ChatRequest {
-    let instruction = "You maintain a running summary of a coding conversation so it can continue \
-                       after older messages are dropped. Rewrite the summary to capture the user's \
-                       goals, key decisions, files and code changed, commands run and their \
-                       results, and any open threads. Be concise and factual, and output only the \
-                       summary.";
-    let prior = existing.unwrap_or("(none yet)");
+    let prior = existing.unwrap_or(NO_PRIOR_SUMMARY);
     ChatRequest {
         model: model.to_string(),
         messages: vec![
-            Message::system(instruction),
+            Message::system(SUMMARY_INSTRUCTION.to_string()),
             Message::user(format!(
                 "Prior summary:\n{prior}\n\nNew messages to fold in:\n{rendered}"
             )),
@@ -145,5 +151,19 @@ mod tests {
         let rendered = render(&messages);
         assert!(rendered.contains("User: fix the bug"));
         assert!(rendered.contains("called tools: read_file"));
+    }
+
+    #[test]
+    fn summary_request_shape_is_stable() {
+        // Only the prior summary + new messages may vary; instruction, tools,
+        // and message roles are frozen so the side request has a stable baseline.
+        let request = summary_request("m", Some("prior"), "new stuff", None);
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages[0].content, SUMMARY_INSTRUCTION);
+        assert!(request.messages[1].content.contains("prior"));
+        assert!(request.messages[1].content.contains("new stuff"));
+        assert!(request.tools.is_empty());
+        let fresh = summary_request("m", None, "new stuff", None);
+        assert!(fresh.messages[1].content.contains("(none yet)"));
     }
 }

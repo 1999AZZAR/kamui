@@ -48,24 +48,38 @@ pub fn volatile_tail(memory: &str, summary: Option<&str>) -> Option<String> {
     Some(tail)
 }
 
-/// Assembles one turn's request in cache order: the stable system prefix, the conversation so far,
-/// the volatile tail, then the new user turn. Keeping the order in one place is what makes the
+/// Assembles one turn's request in cache order: the frozen head, the conversation so far, the
+/// volatile tail, then the new user turn. Keeping the order in one place is what makes the
 /// contract testable -- and what stops a future caller from putting the tail back in front of the
 /// history, where it would invalidate every cached byte behind it.
+///
+/// The head is a slice rather than one string because the stable blocks are sent as separate
+/// system messages (base prompt, then the eager skill list). Splitting them changes no bytes on
+/// the wire, but it keeps each block's boundary visible to a provider that caches at one.
 pub fn turn_messages(
-    system: &str,
+    head: &[Message],
     history: &[Message],
     tail: Option<String>,
     user: Message,
 ) -> Vec<Message> {
-    let mut messages = Vec::with_capacity(history.len() + 3);
-    messages.push(Message::system(system));
+    let mut messages = Vec::with_capacity(head.len() + history.len() + 2);
+    messages.extend(head.iter().cloned());
     messages.extend(history.iter().cloned());
     if let Some(tail) = tail {
         messages.push(Message::system(tail));
     }
     messages.push(user);
     messages
+}
+
+/// The head's text as one string, for fingerprinting it. Message boundaries are part of what must
+/// stay stable, so they are marked rather than smoothed over: two heads that differ only in where
+/// one block ends are not the same prefix.
+pub fn head_text(head: &[Message]) -> String {
+    head.iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\u{1e}")
 }
 
 /// The exact bytes a cache-aware provider sees ahead of the conversation: the system message plus
@@ -268,7 +282,10 @@ mod tests {
     /// told, but not one byte of the prefix the provider caches.
     #[test]
     fn two_consecutive_turns_share_a_prefix_and_grow_only_at_the_tail() {
-        let system = "base prompt + tool guidance + project instructions";
+        let head = vec![
+            Message::system("base prompt + tool guidance + project instructions"),
+            Message::system("Skills:\n- review"),
+        ];
         let tools = vec![tool("read_file"), tool("grep")];
 
         let history = vec![
@@ -276,7 +293,7 @@ mod tests {
             Message::assistant("answer"),
         ];
         let first = turn_messages(
-            system,
+            &head,
             &history,
             volatile_tail("Known facts:\n- likes tabs", None),
             Message::user("second question"),
@@ -287,16 +304,16 @@ mod tests {
             .chain([Message::user("second question"), Message::assistant("sure")])
             .collect();
         let second = turn_messages(
-            system,
+            &head,
             &history,
             volatile_tail("Known facts:\n- likes tabs\n- ships on Fridays", None),
             Message::user("third question"),
         );
 
         assert_eq!(
-            prefix_bytes(system, &tools),
-            prefix_bytes(system, &tools),
-            "system message and tool definitions are the same bytes on both turns"
+            prefix_bytes(&head_text(&head), &tools),
+            prefix_bytes(&head_text(&head), &tools),
+            "head messages and tool definitions are the same bytes on both turns"
         );
         // Everything up to where the first turn's tail sat is byte-identical, so the provider
         // matches its cache through the end of the previous exchange.

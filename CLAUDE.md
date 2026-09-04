@@ -363,38 +363,51 @@ their turn through `cache::turn_messages`, which is the single definition of the
 Every request is assembled as:
 
 ```text
-[system]  stable prefix   base prompt + tool guidance + project instructions + eager skill list
+[system]  frozen head     base prompt + tool guidance + project instructions
+[system]  frozen head     eager skill list (omitted when there are no skills)
 [...]     history         the un-summarized conversation, unchanged
 [system]  volatile tail   memory snapshot + running compaction summary
 [user]    the new turn
 ```
 
-- **The prefix is stable for the session's life.** Its inputs are fixed at startup (`KAMUI.md`,
-  the profile's `tools` flag) or change only on an explicit user action - `/model`, `/skills
-  toggle`, entering Plan Mode. `cache::PrefixGuard` records the prefix bytes each turn and prints a
-  notice when they move, so a collapsed hit rate always has a stated cause. It never rewrites a
-  request: a user who toggles a skill gets the skill.
-- **Memory and the summary ride in the tail** (option (b) of freeze-at-start vs place-after-the-
-  stable-blob). They are still read fresh every turn, so a fact remembered in this turn is visible
-  in the next one - the shipped behaviour is unchanged - but they no longer sit in the system
-  message, where one `remember` call used to reset the cache for the rest of the session. The
-  divergence point is therefore the previous turn's tail: everything up to the end of the previous
-  exchange still matches.
-- **Tool definitions are the same JSON, in the same order, every turn.** `ToolRegistry` holds an
-  ordered `Vec`, so the order is already deterministic; `prefix_bytes` folds name, description, and
-  parameter schema into the guarded bytes so a future reordering cannot pass unnoticed. Plan Mode
-  swaps the tool set deliberately and is reported like any other prefix change.
+- **The head is built once per session and cloned per turn** (`chat::build_head_messages`). Its
+  inputs are fixed at startup (`KAMUI.md`, the profile's `tools` flag) or change only on an explicit
+  user action - `/model`, `/skills toggle` - and each of those resets `head_messages`. One block per
+  message rather than one concatenated string: the bytes on the wire are the same either way, but it
+  keeps each block's boundary visible to a provider that caches at one.
+- **`cache::PrefixGuard` records the head and tool bytes each turn** and prints a notice when they
+  move, so a collapsed hit rate always has a stated cause. It never rewrites a request: a user who
+  toggles a skill gets the skill.
+- **Memory and the summary ride in the tail**, behind the history, not in the head. They are read
+  fresh - a fact remembered this turn is visible on the next one, which is the shipped behaviour -
+  and putting them in front would mean one `remember` call moved byte zero and re-read the whole
+  conversation at full price. Behind the history, the divergence point is only ever the previous
+  turn's tail. `memory_dirty` makes the tail re-read the database only after a memory tool ran,
+  which saves a round trip per turn; it is an efficiency, not a cache protection, because the tail
+  is free to change.
+- **Tool definitions are computed once per session and reused** (`session_tools`), so the wire
+  `tools` array cannot change shape mid-session. Pending Plan Mode no longer shrinks the roster:
+  mutating calls are refused at execution time with an explanatory message (`is_mutating_held`)
+  instead. `prefix_bytes` folds each definition's name, description, and parameter schema, in order,
+  into the guarded bytes, so a future reordering cannot pass unnoticed.
+- **`prompt_cache_key`** carries the session id (clamped to 64 chars) as a top-level field on
+  OpenAI-compatible bodies, so a backend doing prefix caching routes the session consistently.
+  `skip_serializing_if` omits it when there is no session, so a generic backend sees no wire change.
 - **Compaction waits longer under the contract.** `compaction::threshold` compacts at ~50% of the
   context window normally but ~85% for a cache-pinned profile: dropping folded-away messages makes
   every later request a fresh prefix, so the token saving is charged back as a full re-read. It is
   still allowed - the context window is a hard limit and a cache miss beats a rejected request -
   and the notice says the prefix resets.
-- **Observability.** The per-turn usage line always shows the cache field on a pinned profile
-  (`Cached: 0 (warm-up)` rather than nothing), and `/stats` reports
-  `median X% over N turns | >=90%: A% | >=95%: B% | warm-up: C`. Turn one is excluded from the
-  ratios - it cannot hit a cache that does not exist - while a later warm-up turn stays in the
-  denominator, because a prefix that churned mid-session is exactly the failure worth seeing.
-  `storage::cache_samples` feeds it from `kind = 'chat'` rows only.
+- **Observability, two halves.** Before the request, `PrefixGuard` catches drift by comparing bytes
+  - deterministic, and it names the turn that broke. After the response, `chat::cache_miss_label`
+  compares this round's cached tokens against the previous one (1024-token noise floor) and names
+  the likely cause (`miss`, `miss (model switch)`, `miss (prefix rebuilt)`); it is silent on hits
+  and first turns. The usage line shows whichever applies, falling back to `Cached: 0 (warm-up)` on
+  a pinned profile so a zero is never mistaken for a provider that reports nothing. `/stats` then
+  reports the session: `median X% over N turns | >=90%: A% | >=95%: B% | warm-up: C`. Turn one is
+  excluded from the ratios - it cannot hit a cache that does not exist - while a later warm-up turn
+  stays in the denominator, because a prefix that churned mid-session is exactly the failure worth
+  seeing. `storage::cache_samples` feeds it from `kind = 'chat'` rows only.
 
 Known gap, not fixed in this pass: title generation and compaction send their own small requests
 under the *same* sticky `session_id`. If the upstream worker keeps one cached prefix per session,

@@ -135,6 +135,18 @@ struct Model {
     id: String,
 }
 
+/// Top-level routing key for OpenAI-compatible prefix caching (`prompt_cache_key`).
+/// Clamped to 64 chars like Pi (`clampOpenAIPromptCacheKey`): stable per Session,
+/// so same-prefix Turns route to the same cache replica. Backends that ignore
+/// unknown fields drop it harmlessly; `skip_serializing_if` omits it when unset.
+fn clamp_prompt_cache_key(key: &str) -> Option<String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(64).collect())
+}
+
 // Request wire types. These belong to the provider; the core stays agnostic and never
 // serializes its own message types into an OpenAI-shaped payload.
 
@@ -146,6 +158,8 @@ struct OpenAIRequest<'a> {
     tools: Vec<WireTool<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -158,6 +172,8 @@ struct OpenAIStreamRequest<'a> {
     stream_options: StreamOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -467,11 +483,16 @@ impl Provider for OpenAIProvider {
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         let session_id = self.resolve_session_id(&request)?;
+        let cache_key = request
+            .session_id
+            .as_deref()
+            .and_then(clamp_prompt_cache_key);
         let body = OpenAIRequest {
             model: &request.model,
             messages: wire_messages(&request.messages),
             tools: wire_tools(&request.tools),
             session_id,
+            prompt_cache_key: cache_key.as_deref(),
         };
         let response = self
             .client
@@ -500,6 +521,10 @@ impl Provider for OpenAIProvider {
         request: ChatRequest,
     ) -> Result<mpsc::UnboundedReceiver<Result<StreamEvent>>> {
         let session_id = self.resolve_session_id(&request)?;
+        let cache_key = request
+            .session_id
+            .as_deref()
+            .and_then(clamp_prompt_cache_key);
         let body = OpenAIStreamRequest {
             model: &request.model,
             messages: wire_messages(&request.messages),
@@ -509,6 +534,7 @@ impl Provider for OpenAIProvider {
                 include_usage: true,
             },
             session_id,
+            prompt_cache_key: cache_key.as_deref(),
         };
         let mut response = self
             .client
@@ -775,6 +801,7 @@ mod tests {
             messages: wire_messages(&request.messages),
             tools: wire_tools(&request.tools),
             session_id: None,
+            prompt_cache_key: None,
         };
         let value = serde_json::to_value(&body).unwrap();
 
@@ -854,6 +881,7 @@ mod tests {
             messages: wire_messages(&request.messages),
             tools: wire_tools(&request.tools),
             session_id: None,
+            prompt_cache_key: None,
         };
         let value = serde_json::to_value(&body).unwrap();
 
@@ -861,6 +889,49 @@ mod tests {
         assert_eq!(value["messages"][0]["role"], "system");
         assert_eq!(value["messages"][0]["content"], "be brief");
         assert_eq!(value["messages"][1]["content"], "hi");
+    }
+
+    #[test]
+    fn prompt_cache_key_clamps_to_64_chars() {
+        assert_eq!(clamp_prompt_cache_key("abc"), Some("abc".to_string()));
+        assert_eq!(clamp_prompt_cache_key("  "), None);
+        assert_eq!(clamp_prompt_cache_key(""), None);
+        let long = "x".repeat(100);
+        let clamped = clamp_prompt_cache_key(&long).unwrap();
+        assert_eq!(clamped.chars().count(), 64);
+        // Unicode-safe: chars, not bytes.
+        let emoji = "é".repeat(100);
+        assert_eq!(clamp_prompt_cache_key(&emoji).unwrap().chars().count(), 64);
+    }
+
+    #[test]
+    fn prompt_cache_key_omitted_when_no_session() {
+        let body = OpenAIRequest {
+            model: "m",
+            messages: Vec::new(),
+            tools: Vec::new(),
+            session_id: None,
+            prompt_cache_key: None,
+        };
+        let value = serde_json::to_value(&body).unwrap();
+        assert!(value.get("prompt_cache_key").is_none());
+        assert!(value.get("session_id").is_none());
+    }
+
+    #[test]
+    fn prompt_cache_key_follows_session_id() {
+        let session = "sess-123";
+        let key = clamp_prompt_cache_key(session);
+        let body = OpenAIRequest {
+            model: "m",
+            messages: Vec::new(),
+            tools: Vec::new(),
+            session_id: Some(session),
+            prompt_cache_key: key.as_deref(),
+        };
+        let value = serde_json::to_value(&body).unwrap();
+        assert_eq!(value["session_id"], "sess-123");
+        assert_eq!(value["prompt_cache_key"], "sess-123");
     }
 
     #[test]

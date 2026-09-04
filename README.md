@@ -49,12 +49,14 @@ arrive.
 upstream route for cache. Switch with `/model orvix-coding-flash`. Keep `/v1` profiles for A/B.
 
 On these profiles Kamui also keeps the request prefix byte-stable so that cache can hold: the system
-message and tool definitions stay identical for the whole session, while memory and the rolling
-summary travel in a tail message just before your newest turn (still refreshed every turn, just no
-longer able to reset the cache). If something does move the prefix — `/model`, toggling a skill,
-entering Plan Mode, compaction — Kamui says so instead of leaving you with a silently cold cache.
-The per-turn usage line always shows the cache field here, and `/stats` reports how the session is
-landing:
+prompt, your project instructions, the skill list and the tool definitions are built once and stay
+identical for the whole session, while memory and the rolling summary travel in a tail message just
+before your newest turn (still refreshed every turn, just no longer able to reset the cache). Plan
+Mode no longer changes the tool list either — it refuses mutating calls when they are attempted
+instead. If something does move the prefix — `/model`, toggling a skill, compaction — Kamui says so
+instead of leaving you with a silently cold cache, and a turn that misses says which of those is the
+likely cause. The per-turn usage line always shows the cache field here, and `/stats` reports how
+the session is landing:
 
 ```text
 Prompt cache:  median 96% over 12 turns | ≥90%: 92% | ≥95%: 75% | warm-up: 1
