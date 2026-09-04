@@ -178,7 +178,9 @@ where
                 session.title,
                 short_id(&session.id)
             ))?;
-            if !use_tui {
+            if use_tui {
+                replay_tui_history(&mut chat_ui, &messages)?;
+            } else {
                 print_history_preview(&messages);
             }
             (Some(session), messages)
@@ -2097,26 +2099,7 @@ fn handle_command(
             // rehydrate here — the caller would need &mut plan_mode.
             *session = Some(resumed);
             if let Some(ui) = tui.as_deref_mut() {
-                // Replay the last few user/assistant turns as transcript cards; raw text
-                // would print straight into the frame the TUI owns.
-                let skip = messages.len().saturating_sub(RESUME_REPLAY_MESSAGES);
-                if skip > 0 {
-                    // Say what is missing. The omitted messages are still sent to the model, so
-                    // a transcript that starts mid-conversation with no note reads as the whole
-                    // of it -- and the model then appears to know things it was never told.
-                    ui.notice(&format!(
-                        "{skip} earlier message(s) not replayed \u{2014} still in context"
-                    ))?;
-                }
-                for message in &messages[skip..] {
-                    match message.role {
-                        Role::User => ui.user(&message.content)?,
-                        Role::Assistant if !message.content.is_empty() => {
-                            ui.assistant_replay(&message.content)?
-                        }
-                        _ => {}
-                    }
-                }
+                replay_tui_history(ui, messages)?;
             } else {
                 print_history_preview(messages);
             }
@@ -2707,6 +2690,30 @@ fn revert_on_cancel(chat_ui: &mut ChatUi, snapshot: &HashMap<PathBuf, Option<Str
     }
 }
 
+/// Replay recent user/assistant turns into the fullscreen transcript. Startup `-r` used to only
+/// print a notice, so the home logo stayed up and the old chat looked gone even though the model
+/// still had it. Notes do not leave intro, so we also drop the logo once a session is attached.
+fn replay_tui_history(ui: &mut ChatUi, messages: &[Message]) -> Result<()> {
+    let skip = messages.len().saturating_sub(RESUME_REPLAY_MESSAGES);
+    if skip > 0 {
+        ui.notice(&format!(
+            "{skip} earlier message(s) not replayed \u{2014} still in context"
+        ))?;
+    }
+    for message in &messages[skip..] {
+        match message.role {
+            Role::User => ui.user(&message.content)?,
+            Role::Assistant if !message.content.is_empty() => {
+                ui.assistant_replay(&message.content)?
+            }
+            _ => {}
+        }
+    }
+    // A resume notice is a Note card, which would otherwise keep the logo home screen.
+    ui.leave_intro()?;
+    Ok(())
+}
+
 fn print_history_preview(messages: &[Message]) {
     if messages.is_empty() {
         println!("No previous messages.\n");
@@ -2909,6 +2916,14 @@ fn update_sidebar(
     entries.push(("Version".to_string(), format!("v{version}")));
     entries.push(("Model".to_string(), model.to_string()));
     entries.push(("Mode".to_string(), mode.to_string()));
+    if let Some(git) = git_status(project.root()) {
+        let dirty = if git.changed == 0 {
+            String::new()
+        } else {
+            format!(" · {} changed", git.changed)
+        };
+        entries.push(("Git".to_string(), format!("{}{dirty}", git.branch)));
+    }
     entries.push(("Project".to_string(), display_path(project.root())));
     if !mcp.is_empty() {
         entries.push(("MCP".to_string(), mcp.to_string()));
@@ -4308,6 +4323,17 @@ mod tests {
             total_tokens: 100,
             updated_at: 0,
         }
+    }
+
+    #[test]
+    fn tui_resume_replays_a_tail_of_stored_messages() {
+        assert_eq!(0usize.saturating_sub(RESUME_REPLAY_MESSAGES), 0);
+        assert_eq!(4usize.saturating_sub(RESUME_REPLAY_MESSAGES), 0);
+        assert_eq!(
+            14usize.saturating_sub(RESUME_REPLAY_MESSAGES),
+            4,
+            "older turns stay in model context but off the screen"
+        );
     }
 
     fn image(media: &str, decoded_bytes: usize) -> crate::provider::ImageAttachment {

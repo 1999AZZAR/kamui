@@ -114,7 +114,9 @@ pub fn render_ratatui(text: &str) -> Text<'static> {
         } else if in_fence {
             lines.push(Line::from(Span::styled(
                 line.to_string(),
-                Style::default().fg(Color::Cyan),
+                Style::default()
+                    .fg(Color::Rgb(0x9c, 0xd0, 0xde))
+                    .bg(Color::Rgb(0x1a, 0x1a, 0x1a)),
             )));
         } else if is_heading(trimmed) {
             lines.push(Line::from(Span::styled(
@@ -208,7 +210,12 @@ fn ratatui_inline(text: &str) -> Vec<Span<'static>> {
         .into_iter()
         .map(|segment| match segment {
             Segment::Plain(text) => Span::raw(text.to_string()),
-            Segment::Code(text) => Span::styled(text.to_string(), Style::default().fg(Color::Cyan)),
+            Segment::Code(text) => Span::styled(
+                text.to_string(),
+                Style::default()
+                    .fg(Color::Rgb(0x9c, 0xd0, 0xde))
+                    .bg(Color::Rgb(0x1a, 0x1a, 0x1a)),
+            ),
             Segment::Bold(text) => Span::styled(
                 text.to_string(),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -468,6 +475,10 @@ mod tests {
                 .any(|span| span.content == "check")
         );
         assert_eq!(text.lines[3].spans[0].content, "let x = 1;");
-        assert_eq!(text.lines[3].spans[0].style.fg, Some(Color::Cyan));
+        assert_eq!(
+            text.lines[3].spans[0].style.bg,
+            Some(Color::Rgb(0x1a, 0x1a, 0x1a)),
+            "fenced code sits on a panel"
+        );
     }
 }

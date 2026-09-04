@@ -2708,11 +2708,10 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     let main_area = screen_rows[0];
     let footer_area = screen_rows[1];
 
-    // Sidebar rail takes the right side once the terminal is wide enough and chat is underway.
-    let (left_area, sidebar_area) = match (&model.sidebar, model.intro) {
-        (Some(entries), false)
-            if !entries.is_empty() && !model.sidebar_hidden && main_area.width >= 68 =>
-        {
+    // Sidebar rail takes the right side once the terminal is wide enough — including the home
+    // screen, so a new chat is not a logo floating in a void.
+    let (left_area, sidebar_area) = match (&model.sidebar, model.sidebar_hidden) {
+        (Some(entries), false) if !entries.is_empty() && main_area.width >= 68 => {
             // Narrow terminals get a narrower rail rather than none at all.
             let rail = if main_area.width >= 84 { 30 } else { 24 };
             let cols = Layout::default()
@@ -2941,7 +2940,7 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
                 Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "type a message, or / for commands".to_string(),
+                "Ask Kamui, or / for commands".to_string(),
                 Style::default().add_modifier(Modifier::DIM),
             ),
         ])],
@@ -2985,10 +2984,12 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
             format!("{label}{dots}"),
             Style::default().fg(MUTED).add_modifier(Modifier::DIM),
         ));
-        wall_line.push(Span::styled(
-            "  \u{b7} Enter steers \u{b7} Esc interrupts".to_string(),
-            Style::default().fg(MUTED).add_modifier(Modifier::DIM),
-        ));
+        if area.width >= 56 {
+            wall_line.push(Span::styled(
+                "  \u{b7} Enter steers \u{b7} Esc interrupts".to_string(),
+                Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+            ));
+        }
         rows.push(Line::from(wall_line));
     }
     Paragraph::new(Text::from(rows))
@@ -3008,7 +3009,7 @@ pub(crate) fn menu_height(item_count: usize) -> u16 {
     if item_count == 0 {
         0
     } else {
-        (item_count.min(MENU_VISIBLE) as u16 + 2).min(10)
+        (item_count.min(MENU_VISIBLE) as u16 + 4).min(12)
     }
 }
 
@@ -3087,7 +3088,15 @@ fn popup_widget(model: &Model) -> Paragraph<'static> {
             ),
         ]));
     }
-    Paragraph::new(Text::from(lines)).style(Style::default().bg(POPUP_BG))
+    Paragraph::new(Text::from(lines))
+        .style(Style::default().bg(POPUP_BG))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(BORDER))
+                .title(" commands ")
+                .title_style(Style::default().fg(MUTED)),
+        )
 }
 
 fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
@@ -3149,8 +3158,8 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
 fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
     let width = area.width.max(20) as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let total_height = LOGO_LEFT.len() + 4; // gap above + logo + blank + info + hint
-    let top_pad = area.height.saturating_sub(total_height as u16 + 4) as usize / 3;
+    let total_height = LOGO_LEFT.len() + 6;
+    let top_pad = area.height.saturating_sub(total_height as u16 + 2) as usize / 6;
     for _ in 0..top_pad {
         lines.push(Line::from(""));
     }
@@ -3173,7 +3182,7 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
         Span::raw(" ".repeat(pad)),
         Span::styled(info, Style::default().fg(NOTICE_FG)),
     ]));
-    let hint = "type a message, or / for commands";
+    let hint = "Ask Kamui, or / for commands";
     let pad = width.saturating_sub(hint.len()) / 2;
     lines.push(Line::from(vec![
         Span::raw(" ".repeat(pad)),
@@ -3181,6 +3190,13 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
             hint.to_string(),
             Style::default().add_modifier(Modifier::DIM),
         ),
+    ]));
+    lines.push(Line::from(""));
+    let keys = "Ctrl+K  models    Ctrl+S  sessions    ?  keys";
+    let pad = width.saturating_sub(keys.len()) / 2;
+    lines.push(Line::from(vec![
+        Span::raw(" ".repeat(pad)),
+        Span::styled(keys.to_string(), Style::default().fg(MUTED)),
     ]));
     // Startup notices still belong on the home screen — the logo must never hide them.
     for card in &model.cards {
@@ -3207,33 +3223,47 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
             }
         }
     }
-    Paragraph::new(Text::from(lines))
+    Paragraph::new(Text::from(lines)).style(Style::default().bg(BG_CHAT))
 }
 
-/// One quiet status line — the editor above it carries the prompt itself. Queue depth and
-/// interrupt hints appear while the agent is working.
+/// Status line: a few discoverable keys, live run hints, token badge.
 fn footer_widget(model: &Model) -> Paragraph<'static> {
-    let mut text = model.footer.clone();
+    let mut left = if model.footer.is_empty() {
+        "? help".to_string()
+    } else {
+        model.footer.clone()
+    };
+    if !left.contains("Ctrl+K") {
+        left.push_str("  \u{b7}  Ctrl+K  \u{b7}  Ctrl+S");
+    }
     if model.thinking.is_some() {
-        text.push_str(" · Esc interrupts");
+        left.push_str("  \u{b7}  Esc interrupts");
     }
     if model.scroll_from_bottom > 0 {
-        text.push_str(&format!(
-            "  \u{b7} \u{2191} {} row(s) back \u{b7} Ctrl+End returns to live",
+        left.push_str(&format!(
+            "  \u{b7}  \u{2191} {} row(s) back  \u{b7}  Ctrl+End live",
             model.scroll_from_bottom
         ));
     }
     if model.queued_count > 0 {
         let plural = if model.queued_count == 1 { "" } else { "s" };
-        text.push_str(&format!(
-            " · {} message{} queued",
+        left.push_str(&format!(
+            "  \u{b7}  {} message{} queued",
             model.queued_count, plural
         ));
     }
-    // opencode status bar: a filled token badge that turns amber past 80% context.
-    let mut spans = vec![Span::styled(text, Style::default().fg(MUTED))];
+    let mut spans = vec![Span::styled(left, Style::default().fg(MUTED))];
+    if let Some(entries) = &model.sidebar
+        && let Some((_, model_name)) = entries.iter().find(|(key, _)| key == "Model")
+    {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            crate::tui::truncate_chars(model_name, 24),
+            Style::default().fg(BORDER),
+        ));
+    }
     if let Some((badge_text, pct)) = &model.token_badge {
-        spans.push(Span::raw("    "));
+        spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!(" {badge_text} "),
             Style::default()
@@ -3449,7 +3479,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
                 None => (GREEN, Style::default().fg(MUTED)),
             },
             CardKind::Error => (RED, Style::default().fg(TEXT)),
-            CardKind::Note => (BORDER, Style::default().fg(NOTICE_FG)),
+            CardKind::Note => (MUTED, Style::default().fg(NOTICE_FG)),
         }
     };
 
@@ -3464,6 +3494,13 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
     };
 
     if card.title == "Assistant" && !card.collapsed {
+        push_bordered(
+            &mut out,
+            vec![Span::styled(
+                "Kamui".to_string(),
+                Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+            )],
+        );
         let text = crate::markdown::render_ratatui(&card.body);
         for line in text.lines {
             let spans: Vec<Span<'static>> = line
@@ -3573,7 +3610,13 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
 
     match card.kind {
         CardKind::User => {
-            // A plain prompt carries no header; a labelled one (steering) says so above itself.
+            push_bordered(
+                &mut out,
+                vec![Span::styled(
+                    "You".to_string(),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )],
+            );
             if card.title != "User" && !card.title.is_empty() {
                 push_bordered(
                     &mut out,
@@ -4095,13 +4138,14 @@ mod tests {
             collapsed: false,
         };
         let rows = rendered(&steer, 60);
+        assert!(rows[0].contains("You"), "speaker first: {rows:?}");
         assert!(
-            rows[0].contains("steering"),
+            rows[1].contains("steering"),
             "the label heads the cell: {rows:?}"
         );
-        assert!(rows[1].contains("actually use"), "{rows:?}");
+        assert!(rows[2].contains("actually use"), "{rows:?}");
 
-        // An ordinary prompt gains no header from this.
+        // An ordinary prompt still names the speaker.
         let plain = Card {
             id: 2,
             kind: CardKind::User,
@@ -4110,11 +4154,10 @@ mod tests {
             status: None,
             collapsed: false,
         };
-        assert_eq!(
-            rendered(&plain, 60).len(),
-            1,
-            "no header for a plain prompt"
-        );
+        let plain_rows = rendered(&plain, 60);
+        assert_eq!(plain_rows.len(), 2, "You + body");
+        assert!(plain_rows[0].contains("You"));
+        assert!(plain_rows[1].contains("hello"));
     }
 
     #[test]
@@ -4525,9 +4568,15 @@ mod tests {
             collapsed: false,
         };
         let lines = card_lines(&card, 20);
-        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.len(), 2, "speaker label then body");
         assert_eq!(lines[0].spans[0].content, "\u{258c} ");
         assert_eq!(lines[0].spans[0].style.fg, Some(ACCENT));
+        let label: String = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(label.contains("You"), "{label:?}");
     }
 
     #[test]
@@ -4760,6 +4809,10 @@ mod tests {
             "the idle footer points at help: {footer:?}"
         );
         assert!(
+            footer.contains("Ctrl+K"),
+            "cold-start keys are teased: {footer:?}"
+        );
+        assert!(
             !footer.contains("! shell") && !footer.contains("Ctrl+O expand"),
             "the keymap dump is gone: {footer:?}"
         );
@@ -4791,6 +4844,10 @@ mod tests {
         let rows: Vec<String> = (0..20)
             .map(|y| (0..60).map(|x| buffer[(x, y)].symbol()).collect())
             .collect();
+        let speaker_y = rows
+            .iter()
+            .position(|row| row.contains("You"))
+            .expect("speaker is drawn");
         let text_y = rows
             .iter()
             .position(|row| row.contains("hello"))
@@ -4800,16 +4857,16 @@ mod tests {
             .position(|row| row.contains('\u{276f}'))
             .expect("editor is drawn");
         assert!(
-            text_y > 0,
+            speaker_y > 0,
             "a short transcript must not stick to the top: {rows:?}"
         );
         assert!(text_y < editor_y, "message sits above the editor");
         assert!(
-            editor_y - text_y <= 3,
-            "content sits just above the editor (text_y={text_y}, editor_y={editor_y}): {rows:?}"
+            editor_y - speaker_y <= 4,
+            "content sits just above the editor (speaker_y={speaker_y}, editor_y={editor_y}): {rows:?}"
         );
         assert!(
-            info.card_rows.iter().all(|(y, _)| *y >= text_y as u16),
+            info.card_rows.iter().all(|(y, _)| *y >= speaker_y as u16),
             "top pad rows are not click targets: {:?}",
             info.card_rows
         );
