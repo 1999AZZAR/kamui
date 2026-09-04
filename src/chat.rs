@@ -1,3 +1,4 @@
+use crate::cache;
 use crate::commands;
 use crate::compaction;
 use crate::config::{Config, Profile};
@@ -224,6 +225,9 @@ where
     let mut input_rx = if use_tui { None } else { Some(input_channel()) };
     let mut disabled_skills = crate::settings::load_disabled_skills(project.root());
 
+    // Prompt-cache prefix watch. Only cache-pinned profiles (Orvix Coding Plan, `send_session_id`)
+    // pay attention: everywhere else a changed prefix costs nothing worth a notice.
+    let mut prefix_guard = cache::PrefixGuard::new(active.send_session_id);
     // Rolling context compaction: `summary` folds in messages before `summarized_upto`; the rest of
     // `messages` is sent verbatim. Both reset whenever a command replaces the loaded history.
     let mut summary: Option<String> = None;
@@ -728,8 +732,10 @@ where
                         summary = Some(new_summary);
                         summarized_upto = new_upto;
                         chat_ui.notice(&format!(
-                            "Compacted {count} earlier messages into the summary."
+                            "Compacted {count} earlier messages into the summary.{}",
+                            cache_reset_note(active.send_session_id)
                         ))?;
+                        prefix_guard.reset();
                     }
                     Ok(None) => chat_ui.notice("Not enough history to compact yet.")?,
                     Err(error) => {
@@ -924,6 +930,9 @@ where
             if messages.len() != messages_before {
                 summary = None;
                 summarized_upto = 0;
+                // A different conversation gets a different prefix by design, so the first turn
+                // after it is a warm-up, not drift worth reporting.
+                prefix_guard.reset();
             }
             continue;
         }
@@ -988,7 +997,7 @@ where
         // Auto-compact older history once the recent portion grows past the threshold.
         summarized_upto = summarized_upto.min(messages.len());
         if compaction::total_bytes(&messages[summarized_upto..])
-            > compaction::threshold(active.context_window)
+            > compaction::threshold(active.context_window, active.send_session_id)
         {
             let outcome = tokio::select! {
                 result = run_compaction(
@@ -1010,8 +1019,10 @@ where
                     summary = Some(new_summary);
                     summarized_upto = new_upto;
                     chat_ui.notice(&format!(
-                        "Compacted {count} earlier messages into a running summary."
+                        "Compacted {count} earlier messages into a running summary.{}",
+                        cache_reset_note(active.send_session_id)
                     ))?;
+                    prefix_guard.reset();
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -1030,36 +1041,41 @@ where
             }
         }
 
-        // Working conversation for this turn: the agentic system prompt (plus project instructions
-        // and any running summary), the un-summarized recent history, and the expanded prompt.
-        // Intermediate tool messages live here only; they are not persisted. Memory is read fresh
-        // every turn (unlike Kumo's frozen-at-startup snapshot): Kamui is a single interactive
-        // process, not a server shared across many chats, so a fact remembered in this turn should
-        // be visible on the very next one without needing a restart.
+        // Working conversation for this turn: the agentic system prompt (plus project
+        // instructions), the un-summarized recent history, the volatile tail, and the expanded
+        // prompt. Intermediate tool messages live here only; they are not persisted. Memory is read
+        // fresh every turn (unlike Kumo's frozen-at-startup snapshot): Kamui is a single
+        // interactive process, not a server shared across many chats, so a fact remembered in this
+        // turn should be visible on the very next one without needing a restart.
         let skills_eager = skill_library.eager_block_filtered(&disabled_skills);
-        let mut system = prompt::build(
+        let system = prompt::build(
             active.tools,
             project.system_message().as_deref(),
             skills_eager.as_deref(),
         );
-        let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
-        if !memory_snapshot.is_empty() {
-            system.push_str("\n\n");
-            system.push_str(&memory_snapshot);
+        // Prompt-cache contract (see `src/cache.rs`): the system message and the tool definitions
+        // are the session's stable prefix, so anything that changes on its own has to ride behind
+        // them. Memory is still read fresh every turn -- a fact remembered this turn is visible on
+        // the next one -- and the running summary is still current, but both now travel in a tail
+        // message placed immediately before the new user turn instead of being folded into the
+        // system message, where a single `remember` call used to reset the cached prefix for the
+        // rest of the session.
+        if let Some(notice) = prefix_guard.check(&system, &tool_definitions) {
+            chat_ui.notice(&notice)?;
         }
-        if let Some(summary) = &summary {
-            system.push_str("\n\nSummary of the earlier conversation so far:\n\n");
-            system.push_str(summary);
-        }
-        let mut turn_messages = vec![Message::system(system)];
-        turn_messages.extend(messages[summarized_upto..].iter().cloned());
         // Say what was attached. The prompt text only ever shows what was typed (`@clipboard`,
         // `@shot.png`), so without this there is nothing to tell you whether an image was
         // actually picked up, how big it was, or that it needs a vision model to be read.
         if let Some(note) = describe_attachments(&expanded) {
             chat_ui.notice(&note)?;
         }
-        turn_messages.push(Message::user_with_images(expanded.text, expanded.images));
+        let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
+        let mut turn_messages = cache::turn_messages(
+            &system,
+            &messages[summarized_upto..],
+            cache::volatile_tail(&memory_snapshot, summary.as_deref()),
+            Message::user_with_images(expanded.text, expanded.images),
+        );
 
         // Agent loop: stream a turn, run any tools it requests, and repeat until a plain answer.
         // `tool_trail` collects this turn's intermediate tool-request and tool-result messages so
@@ -1250,6 +1266,7 @@ where
                 usage.completion_tokens,
                 usage.total_tokens,
                 usage.cached_tokens,
+                active.send_session_id,
                 &finish_reason,
                 ttft,
                 started.elapsed(),
@@ -1764,21 +1781,24 @@ where
     }
 
     let skills_eager = skill_library.eager_block_filtered(&disabled_skills);
-    let mut system = prompt::build(
+    let system = prompt::build(
         active.tools,
         project.system_message().as_deref(),
         skills_eager.as_deref(),
     );
-    let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
-    if !memory_snapshot.is_empty() {
-        system.push_str("\n\n");
-        system.push_str(&memory_snapshot);
-    }
-    let mut turn_messages = vec![Message::system(system)];
+    // Same prefix shape as an interactive turn (see `src/cache.rs`): stable system message first,
+    // volatile memory tail last, so a session driven through `-p` shares the cached prefix an
+    // interactive turn of the same session would build.
     if let Some(note) = describe_attachments(&expanded) {
         println!("{note}");
     }
-    turn_messages.push(Message::user_with_images(expanded.text, expanded.images));
+    let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
+    let mut turn_messages = cache::turn_messages(
+        &system,
+        &[],
+        cache::volatile_tail(&memory_snapshot, None),
+        Message::user_with_images(expanded.text, expanded.images),
+    );
 
     let user_message = Message::user(prompt);
     let mut tool_trail: Vec<Message> = Vec::new();
@@ -2380,6 +2400,19 @@ fn print_stats(
             stats.cached_tokens
         );
     }
+    // Prompt-cache behaviour, turn by turn. Lifetime token totals lag -- one cold session drags
+    // them for good -- so this counts turns, and it only appears for a provider that actually
+    // returns cached tokens.
+    let samples = database.cache_samples(&session.id)?;
+    if samples.iter().any(|(_, cached)| *cached > 0)
+        && let Some(cache) = cache::report(&samples)
+    {
+        let _ = writeln!(
+            out,
+            "Prompt cache:  median {:.0}% over {} turns | \u{2265}90%: {:.0}% | \u{2265}95%: {:.0}% | warm-up: {}",
+            cache.median, cache.measured, cache.pct_ge_90, cache.pct_ge_95, cache.warmup
+        );
+    }
     if let (Some(last_input), Some(window)) = (stats.last_input_tokens, context_window) {
         // Buffered like every other line. `print!` here sent the report's most useful line to
         // raw stdout, which both dropped it from `/stats` and wrote it over the frame.
@@ -2513,6 +2546,17 @@ fn usage_row(period: &storage::UsagePeriod, cost: Option<&str>) -> String {
 
 /// When `send_session_id` is set (Orvix Coding Plan), ensure a persisted Kamui session exists and
 /// return its id for the provider wire body.
+/// What compaction costs a cache-pinned session, appended to the notice so the next turn's
+/// collapsed hit rate has a stated cause. Empty for every other profile, where dropping older
+/// messages costs nothing but the messages.
+fn cache_reset_note(cache_pinned: bool) -> &'static str {
+    if cache_pinned {
+        " The cached prompt prefix resets, so the next turn warms up again."
+    } else {
+        ""
+    }
+}
+
 fn ensure_coding_session_id(
     session: &mut Option<Session>,
     database: &Database,
@@ -3031,19 +3075,21 @@ fn format_usage(
     output: u64,
     total: u64,
     cached: u64,
+    // Whether the active profile pins this session to a cached prefix (`send_session_id`).
+    cache_pinned: bool,
     finish_reason: &str,
     ttft: Option<Duration>,
     elapsed: Duration,
     context_window: Option<u64>,
 ) -> String {
     let mut line = format!("Tokens: {input} input + {output} output = {total} total");
-    if cached > 0 {
-        let percent = if input > 0 {
-            (cached as f64 / input as f64 * 100.0).min(100.0)
-        } else {
-            0.0
-        };
+    // On a cache-pinned profile the field is always shown: a zero there is the whole signal --
+    // either the session's first turn or a prefix that churned -- and hiding it left the failure
+    // looking exactly like a provider that reports nothing.
+    if let Some(percent) = cache::hit_percent(input, cached).filter(|_| cached > 0) {
         line.push_str(&format!(" | Cached: {cached} ({percent:.0}%)"));
+    } else if cache_pinned {
+        line.push_str(" | Cached: 0 (warm-up)");
     }
     if let Some(window) = context_window {
         let percent = input as f64 / window as f64 * 100.0;
@@ -3335,14 +3381,8 @@ async fn dispatch_spawn_agents(
                 (
                     call.id.clone(),
                     (
-                        dispatch_spawn_agent(
-                            provider,
-                            model,
-                            project,
-                            &call.arguments,
-                            session_id,
-                        )
-                        .await,
+                        dispatch_spawn_agent(provider, model, project, &call.arguments, session_id)
+                            .await,
                         started.elapsed(),
                     ),
                 )
@@ -5727,8 +5767,7 @@ mod tests {
             .collect::<Vec<_>>();
         let references = calls.iter().collect::<Vec<_>>();
 
-        let outputs =
-            dispatch_spawn_agents(&provider, "model", &project, &references, None).await;
+        let outputs = dispatch_spawn_agents(&provider, "model", &project, &references, None).await;
 
         assert_eq!(outputs.len(), 6);
         assert_eq!(outputs["c0"].0, "task 0");

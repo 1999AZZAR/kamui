@@ -297,6 +297,8 @@ Important modules:
 - `src/prompt.rs`: the agentic system prompt, combined with project instructions per request.
 - `src/compaction.rs`: rolling-summary context compaction (threshold, message selection, summary
   request); the chat loop drives it automatically and via `/compact`.
+- `src/cache.rs`: the Coding cache contract - request assembly order (`turn_messages`), the volatile
+  tail, `prefix_bytes`/`PrefixGuard` drift detection, and the per-session hit report.
 - `src/mcp.rs`: MCP client over stdio via the `rmcp` SDK; wraps each server tool as a Kamui `Tool`.
 - `src/chat.rs`: interactive loop, streaming display, session commands, title generation, the
   streaming tool agent loop, graceful shutdown, and `run_once` for non-interactive `-p` prompts.
@@ -349,6 +351,59 @@ Whole turns are persisted, including tool messages. A `user_version = 3` migrati
 `save_turn` writes the prompt, tool requests, tool results, and final answer atomically, so resumed
 sessions replay tool interactions. Recorded usage is still the final round's, not the whole turn's.
 The terminal runner, mutation tools, per-turn usage accounting, and a durable audit trail remain.
+
+## Coding Cache Contract
+
+Orvix Coding Plan profiles (`send_session_id = true`, `completions_path = "/coding/completions"`)
+pin a session to one upstream worker that caches the request prefix. A cached prefix only pays off
+while the bytes *before* the newest turn are identical, so Kamui's request assembly is a contract,
+not an implementation detail. It lives in `src/cache.rs`; the chat loop and `run_once` both build
+their turn through `cache::turn_messages`, which is the single definition of the order.
+
+Every request is assembled as:
+
+```text
+[system]  stable prefix   base prompt + tool guidance + project instructions + eager skill list
+[...]     history         the un-summarized conversation, unchanged
+[system]  volatile tail   memory snapshot + running compaction summary
+[user]    the new turn
+```
+
+- **The prefix is stable for the session's life.** Its inputs are fixed at startup (`KAMUI.md`,
+  the profile's `tools` flag) or change only on an explicit user action - `/model`, `/skills
+  toggle`, entering Plan Mode. `cache::PrefixGuard` records the prefix bytes each turn and prints a
+  notice when they move, so a collapsed hit rate always has a stated cause. It never rewrites a
+  request: a user who toggles a skill gets the skill.
+- **Memory and the summary ride in the tail** (option (b) of freeze-at-start vs place-after-the-
+  stable-blob). They are still read fresh every turn, so a fact remembered in this turn is visible
+  in the next one - the shipped behaviour is unchanged - but they no longer sit in the system
+  message, where one `remember` call used to reset the cache for the rest of the session. The
+  divergence point is therefore the previous turn's tail: everything up to the end of the previous
+  exchange still matches.
+- **Tool definitions are the same JSON, in the same order, every turn.** `ToolRegistry` holds an
+  ordered `Vec`, so the order is already deterministic; `prefix_bytes` folds name, description, and
+  parameter schema into the guarded bytes so a future reordering cannot pass unnoticed. Plan Mode
+  swaps the tool set deliberately and is reported like any other prefix change.
+- **Compaction waits longer under the contract.** `compaction::threshold` compacts at ~50% of the
+  context window normally but ~85% for a cache-pinned profile: dropping folded-away messages makes
+  every later request a fresh prefix, so the token saving is charged back as a full re-read. It is
+  still allowed - the context window is a hard limit and a cache miss beats a rejected request -
+  and the notice says the prefix resets.
+- **Observability.** The per-turn usage line always shows the cache field on a pinned profile
+  (`Cached: 0 (warm-up)` rather than nothing), and `/stats` reports
+  `median X% over N turns | >=90%: A% | >=95%: B% | warm-up: C`. Turn one is excluded from the
+  ratios - it cannot hit a cache that does not exist - while a later warm-up turn stays in the
+  denominator, because a prefix that churned mid-session is exactly the failure worth seeing.
+  `storage::cache_samples` feeds it from `kind = 'chat'` rows only.
+
+Known gap, not fixed in this pass: title generation and compaction send their own small requests
+under the *same* sticky `session_id`. If the upstream worker keeps one cached prefix per session,
+those requests can evict the conversation's - and title generation fires right after turn one, just
+before the turn the KPI measures. Kamui cannot tell from here what the harness does with a
+non-conversation prefix on a live session. Symptom to look for: turn two reporting `Cached: 0`
+while later turns are fine. Fixing it needs a documented handshake (a derived sub-session id, or
+the harness scoping its cache by prefix hash), so it is a joint decision, not a unilateral Kamui
+change.
 
 ## Storage Decisions
 

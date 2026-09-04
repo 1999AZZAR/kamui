@@ -238,6 +238,16 @@ provider-neutral.
 Thinking spinner and interrupt-and-continue (Phase 6 items) also shipped early: a braille spinner
 animates until the first token, and `Ctrl+C` mid-turn returns to the prompt instead of exiting.
 
+Orvix Coding Plan support extends Phase 5: `completions_path` plus a sticky `session_id`
+(`send_session_id`) route a session to one upstream worker, and the **Coding cache contract**
+(`src/cache.rs`, documented in `CLAUDE.md`) keeps the request prefix byte-stable so that worker's
+prompt cache actually holds. Memory and the rolling summary moved out of the system message into a
+volatile tail behind the history; `PrefixGuard` reports any prefix that moves; compaction waits
+until ~85% of the context window on a pinned profile; and `/stats` reports the per-session hit
+median, the share of turns at or above 90%/95%, and how many turns were warm-ups. Still open: title
+generation and compaction share the sticky session id, which may evict the conversation's cached
+prefix upstream — that needs a handshake with the harness rather than a Kamui-only change.
+
 ## Phase 6: Terminal Experience
 
 - [x] Project status card and `/status` refresh

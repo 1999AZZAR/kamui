@@ -11,10 +11,17 @@ const DEFAULT_THRESHOLD_BYTES: usize = 48 * 1024;
 
 /// Byte size at which the recent (un-summarized) history should be compacted. When a context window
 /// is known, compact at roughly half of it (assuming ~4 bytes per token); otherwise use a default.
-pub fn threshold(context_window: Option<u64>) -> usize {
+///
+/// `cache_pinned` profiles (Orvix Coding Plan, see `crate::cache`) wait far longer. Compaction drops
+/// the messages it folded away, so every request after it is a fresh prefix: on a cached session the
+/// token saving is charged back as a full re-read of the conversation. It is still allowed -- the
+/// context window is a hard limit and a cache miss beats a rejected request -- but only once the
+/// history is genuinely close to that limit rather than at the halfway mark.
+pub fn threshold(context_window: Option<u64>, cache_pinned: bool) -> usize {
+    let share = if cache_pinned { 85 } else { 50 };
     match context_window {
-        Some(window) => (window as usize).saturating_mul(4) / 2,
-        None => DEFAULT_THRESHOLD_BYTES,
+        Some(window) => (window as usize).saturating_mul(4) / 100 * share,
+        None => DEFAULT_THRESHOLD_BYTES * share / 50,
     }
 }
 
@@ -99,8 +106,12 @@ mod tests {
 
     #[test]
     fn threshold_scales_with_context_window() {
-        assert_eq!(threshold(Some(1000)), 2000); // 1000 tokens * 4 bytes / 2
-        assert_eq!(threshold(None), DEFAULT_THRESHOLD_BYTES);
+        assert_eq!(threshold(Some(1000), false), 2000); // 1000 tokens * 4 bytes / 2
+        assert_eq!(threshold(None, false), DEFAULT_THRESHOLD_BYTES);
+        // A cache-pinned session holds out until the window is nearly full: compacting there
+        // throws away the cached prefix, so the token saving is not free.
+        assert_eq!(threshold(Some(1000), true), 3400);
+        assert!(threshold(None, true) > threshold(None, false));
     }
 
     #[test]
