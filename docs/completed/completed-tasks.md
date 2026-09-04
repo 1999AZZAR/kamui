@@ -1,5 +1,10 @@
 # Completed Tasks
 
+## 2026-09-04 — PR #18 staging→main (TUI UX package)
+- **What:** Committed session work to `staging` (force-push over diverged remote per user pick) + opened PR #18 with full changelog.
+- **Key files:** `src/chat.rs`, `src/ui.rs`, `src/markdown.rs`, docs
+- **Verify:** `cargo test` 398 passed pre-commit; PR https://github.com/algonacci/kamui/pull/18
+
 ## 2026-09-04 — Markdown table support (both renderers)
 - **What:** `split_table_row` + table branch in `render_line` (ANSI) and `render_ratatui`: `| a | b |` → cells joined by dim `│` with inline style per cell; separator row (`|---|---|`) → dim `─` rule. No column alignment (per-line wrapping can't guarantee it) — pipes gone, content keeps code/bold.
 - **Key files:** `src/markdown.rs` split_table_row + 2 branches + 2 tests
@@ -14,6 +19,28 @@
 - **What:** `update_sidebar` groups entries into Session/Runtime/Context/Activity/Last turn (tab-separated metric rows); Context gains `bar\tpct` usage bar; turn call site adds `Activity` (tools count + lat + time). Renderer: section headers as muted rules, semantic value ink (model blue, plan amber/build green, dirty git amber, cache cyan, bar green→amber→red), `▓░` bar from `bar\tNN`.
 - **Key files:** `src/chat.rs` update_sidebar + entries_push + 6 call sites, `src/ui.rs` sidebar_paragraph/is_sidebar_section/sidebar_value_style/push_sidebar_value + CYAN, `docs/ui-architecture.md`
 - **Verify:** `cargo fmt` pass, `clippy -D warnings` pass, `cargo test` 395 passed (incl. new sidebar groups test)
+
+## 2026-09-04 — Cache-miss detection + frozen summary template (P1.4/P1.5)
+- **What:** P1.4: `cache_miss_label` (noise floor 1024, Pi parity) — diam di first turn/hit, label sebab bila miss (`miss` / `miss (model switch)` / `miss (prefix rebuilt)`); tampil di usage line + sidebar cache row; state `prev_cached`/`prev_model`/`head_rebuilt_this_turn`. P1.5: instruction summary jadi konstanta frozen `SUMMARY_INSTRUCTION` + `NO_PRIOR_SUMMARY` (do-not-edit note); usage compaction memang sudah segregasi (`kind` filter) → tanpa perubahan storage.
+- **Key files:** `src/chat.rs`, `src/compaction.rs`; commit `7bc063b`
+- **Verify:** `cargo fmt` pass, `clippy -D warnings` pass, `cargo test` 406 passed (3 test baru: silent-first/hit, cause labels, summary shape stable)
+
+## 2026-09-04 — Fixed tool array + frozen head per Session (P0.2/P0.3)
+- **What:** P0.2: `tool_definitions` dihitung sekali per Session (`session_tools`), Plan Mode pending tidak susutkan roster — mutating call di-hold saat eksekusi (`is_mutating_held` sudah ada); hapus `ToolRegistry::plan_mode` + `plan_mode_definitions` yang mati. P0.3: `build_head_messages` pecah message[0] jadi pesan per blok stabil (base/memory/skills); summary Compaction pesan terpisah; memory re-read DB hanya pasca memory-tool (`memory_dirty` + `cached_memory_snapshot`); `run_once` selaras.
+- **Key files:** `src/chat.rs`, `src/tools.rs` (-24); commit `38ae60e`
+- **Verify:** `cargo fmt` pass, `clippy -D warnings` pass, `cargo test` 403 passed (2 test baru: skip empty blocks, blocks separate + memory-only diff)
+- **Review note:** caught stale-memory bug (rebuild pasca skill-toggle baca `String::new`) → fixed via cached snapshot
+
+## 2026-09-04 — Stable prompt_cache_key per Session (P0.1)
+- **What:** `OpenAIRequest`/`OpenAIStreamRequest` kirim top-level `prompt_cache_key` = session id clamp 64 char unicode-safe (`clamp_prompt_cache_key`, Pi parity). `skip_serializing_if` omit saat tanpa session → backend generik zero wire change.
+- **Key files:** `src/provider/openai.rs` (+71, 1 file); commit `d48752c`
+- **Verify:** `cargo fmt` pass, `clippy -D warnings` pass, `cargo test` 401 passed (3 test baru: clamp 64/unicode-safe, omit tanpa session, follows session_id)
+- **Caveat:** `prompt_cache_key` param Responses API — efek di `/chat/completions` tergantung backend honor atau tidak; stabilitas body (P0.2/P0.3) tetap langkah berikutnya
+
+## 2026-09-04 — Cache-hit gap analysis doc + riset clone
+- **What:** Clone `pi-cache-hit-research.md` ke `docs/research/` (copy, bukan pindah) + tulis `docs/research/kamui-cache-hit-gap-analysis.md`: mengapa Pi unggul (5 layer terverifikasi + koreksi), kamui lacks per layer, ranking 3 prefix-breaker, roadmap P0/P1/P2.
+- **Key files:** `docs/research/pi-cache-hit-research.md` (clone), `docs/research/kamui-cache-hit-gap-analysis.md` (new)
+- **Verify:** semua klaim kamui file:line-grounded (`src/chat.rs:982-1070`, `src/provider/openai.rs:133-148`, `src/compaction.rs:71-88`); grep zero-hit `cache_control|prompt_cache_key|retention` confirmed
 
 ## 2026-09-04 — Cache-hit comparison pi-mono vs kamui (3-scout audit)
 - **What:** Verified pi-cache-hit-research.md against live pi-mono source + audited kamui request path vs Pi 5 layers.
