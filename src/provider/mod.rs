@@ -141,6 +141,8 @@ pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
+    /// Sticky session for providers that require it (Orvix Coding Plan).
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -199,6 +201,9 @@ impl<'de> Deserialize<'de> for Usage {
                 _ => None,
             })
             .or_else(|| map.get("cache_read_input_tokens").map(parse_u64))
+            // Orvix / some OpenAI-compat hosts put the cache hit count at the top level.
+            .or_else(|| map.get("cached_prompt_tokens").map(parse_u64))
+            .or_else(|| map.get("cached_tokens").map(parse_u64))
             .unwrap_or(0);
         Ok(Self {
             prompt_tokens,

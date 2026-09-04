@@ -12,14 +12,70 @@ pub struct OpenAIProvider {
     client: Client,
     api_key: String,
     base_url: String,
+    /// When set, chat POSTs here instead of `{base_url}/chat/completions`.
+    ///
+    /// Absolute HTTP(S) URLs are used as-is. Paths starting with `/` replace the
+    /// path of `base_url` (so `base_url = https://api.orvix.id/v1` +
+    /// `completions_path = /coding/completions` → Orvix Coding Plan). Relative
+    /// paths append under `base_url`.
+    completions_path: Option<String>,
+    /// When true, every chat request must carry `ChatRequest::session_id` and it
+    /// is sent as a top-level `session_id` field (Orvix Coding Plan).
+    send_session_id: bool,
 }
 
 impl OpenAIProvider {
     pub fn new(api_key: String, base_url: String) -> Self {
+        Self::with_options(api_key, base_url, None, false)
+    }
+
+    pub fn with_options(
+        api_key: String,
+        base_url: String,
+        completions_path: Option<String>,
+        send_session_id: bool,
+    ) -> Self {
         Self {
             client: Client::new(),
             api_key,
             base_url: base_url.trim_end_matches('/').to_string(),
+            completions_path,
+            send_session_id,
+        }
+    }
+
+    pub fn from_profile(profile: &crate::config::Profile) -> Self {
+        Self::with_options(
+            profile.api_key.clone(),
+            profile.base_url.clone(),
+            profile.completions_path.clone(),
+            profile.send_session_id,
+        )
+    }
+
+    fn chat_url(&self) -> String {
+        match &self.completions_path {
+            Some(path) if path.starts_with("http://") || path.starts_with("https://") => {
+                path.trim_end_matches('/').to_string()
+            }
+            Some(path) if path.starts_with('/') => match origin_of(&self.base_url) {
+                Some(origin) => format!("{origin}{path}"),
+                None => format!("{}{path}", self.base_url),
+            },
+            Some(path) => format!("{}/{}", self.base_url, path.trim_start_matches('/')),
+            None => format!("{}/chat/completions", self.base_url),
+        }
+    }
+
+    fn resolve_session_id<'a>(&self, request: &'a ChatRequest) -> Result<Option<&'a str>> {
+        if !self.send_session_id {
+            return Ok(None);
+        }
+        match request.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) => Ok(Some(id)),
+            None => bail!(
+                "this provider requires session_id (Orvix Coding Plan); no active Kamui session id was provided"
+            ),
         }
     }
 
@@ -55,6 +111,15 @@ impl OpenAIProvider {
     }
 }
 
+/// Scheme + host (+ port) of an HTTP(S) base URL, with no path.
+fn origin_of(base: &str) -> Option<String> {
+    let trimmed = base.trim_end_matches('/');
+    let scheme_sep = trimmed.find("://")?;
+    let after_scheme = &trimmed[scheme_sep + 3..];
+    let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+    Some(format!("{}{}", &trimmed[..scheme_sep + 3], &after_scheme[..host_end]))
+}
+
 #[derive(Deserialize)]
 struct ModelsResponse {
     data: Vec<Model>,
@@ -74,6 +139,8 @@ struct OpenAIRequest<'a> {
     messages: Vec<WireMessage<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<WireTool<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -84,6 +151,8 @@ struct OpenAIStreamRequest<'a> {
     tools: Vec<WireTool<'a>>,
     stream: bool,
     stream_options: StreamOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -392,14 +461,16 @@ impl Provider for OpenAIProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let session_id = self.resolve_session_id(&request)?;
         let body = OpenAIRequest {
             model: &request.model,
             messages: wire_messages(&request.messages),
             tools: wire_tools(&request.tools),
+            session_id,
         };
         let response = self
             .client
-            .post(format!("{}/chat/completions", self.base_url))
+            .post(self.chat_url())
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
@@ -423,6 +494,7 @@ impl Provider for OpenAIProvider {
         &self,
         request: ChatRequest,
     ) -> Result<mpsc::UnboundedReceiver<Result<StreamEvent>>> {
+        let session_id = self.resolve_session_id(&request)?;
         let body = OpenAIStreamRequest {
             model: &request.model,
             messages: wire_messages(&request.messages),
@@ -431,10 +503,11 @@ impl Provider for OpenAIProvider {
             stream_options: StreamOptions {
                 include_usage: true,
             },
+            session_id,
         };
         let mut response = self
             .client
-            .post(format!("{}/chat/completions", self.base_url))
+            .post(self.chat_url())
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
@@ -690,11 +763,13 @@ mod tests {
                     "properties": { "path": { "type": "string" } }
                 }),
             }],
+            session_id: None,
         };
         let body = OpenAIRequest {
             model: &request.model,
             messages: wire_messages(&request.messages),
             tools: wire_tools(&request.tools),
+            session_id: None,
         };
         let value = serde_json::to_value(&body).unwrap();
 
@@ -767,11 +842,13 @@ mod tests {
             model: "m".to_string(),
             messages: vec![Message::system("be brief"), Message::user("hi")],
             tools: Vec::new(),
+        session_id: None,
         };
         let body = OpenAIRequest {
             model: &request.model,
             messages: wire_messages(&request.messages),
             tools: wire_tools(&request.tools),
+            session_id: None,
         };
         let value = serde_json::to_value(&body).unwrap();
 
@@ -779,6 +856,24 @@ mod tests {
         assert_eq!(value["messages"][0]["role"], "system");
         assert_eq!(value["messages"][0]["content"], "be brief");
         assert_eq!(value["messages"][1]["content"], "hi");
+    }
+
+    #[test]
+    fn chat_url_rewrites_absolute_path_against_origin() {
+        let provider = OpenAIProvider::with_options(
+            "k".into(),
+            "https://api.orvix.id/v1".into(),
+            Some("/coding/completions".into()),
+            true,
+        );
+        assert_eq!(
+            provider.chat_url(),
+            "https://api.orvix.id/coding/completions"
+        );
+        assert_eq!(
+            origin_of("https://api.orvix.id/v1"),
+            Some("https://api.orvix.id".into())
+        );
     }
 
     #[test]

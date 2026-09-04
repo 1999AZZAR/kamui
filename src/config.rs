@@ -39,6 +39,11 @@ api_key = \"\"
 # models). Kamui then chats without offering tools. Defaults to true.
 # tools = true
 
+# Orvix Coding Plan (internal): POST /coding/completions with sticky session_id.
+# Keep base_url on /v1 so /models still works; override only the chat path.
+# completions_path = \"/coding/completions\"
+# send_session_id = true
+
 # Alternatively, define named profiles and switch between them at runtime with
 # `/model <name>`. When profiles are present the flat settings above are ignored.
 # Share one API key across many models by defining a [providers.*] block and
@@ -128,6 +133,10 @@ pub struct Profile {
     /// (base_url/api_key) as this profile. `None` means semantic search is unavailable for this
     /// profile — not every model/endpoint offers an embeddings API.
     pub embedding_model: Option<String>,
+    /// Override the chat completions URL/path (see `OpenAIProvider::chat_url`).
+    pub completions_path: Option<String>,
+    /// Send Kamui's session id as top-level `session_id` (required by Orvix Coding Plan).
+    pub send_session_id: bool,
 }
 
 /// An MCP server Kamui launches and talks to over stdio.
@@ -244,6 +253,11 @@ struct ProviderSection {
     api_key: Option<String>,
     tools: Option<bool>,
     embedding_model: Option<String>,
+    /// See [`Profile::completions_path`].
+    completions_path: Option<String>,
+    /// See [`Profile::send_session_id`].
+    #[serde(default)]
+    send_session_id: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -256,6 +270,9 @@ struct ProfileSection {
     context_window: Option<u64>,
     tools: Option<bool>,
     embedding_model: Option<String>,
+    completions_path: Option<String>,
+    #[serde(default)]
+    send_session_id: Option<bool>,
 }
 
 impl Config {
@@ -487,6 +504,15 @@ fn resolve_flat(global: ConfigFile, project: Option<ConfigFile>) -> Result<Confi
         .and_then(|provider| provider.embedding_model.clone())
         .or_else(|| global_provider.and_then(|provider| provider.embedding_model.clone()));
 
+    let completions_path = project_provider
+        .and_then(|provider| provider.completions_path.clone())
+        .or_else(|| global_provider.and_then(|provider| provider.completions_path.clone()));
+
+    let send_session_id = project_provider
+        .and_then(|provider| provider.send_session_id)
+        .or_else(|| global_provider.and_then(|provider| provider.send_session_id))
+        .unwrap_or(false);
+
     let profile = Profile {
         name: DEFAULT_PROFILE_NAME.to_string(),
         model,
@@ -495,6 +521,8 @@ fn resolve_flat(global: ConfigFile, project: Option<ConfigFile>) -> Result<Confi
         context_window,
         tools,
         embedding_model,
+        completions_path,
+        send_session_id,
     };
     Ok(Config {
         default_profile: profile.name.clone(),
@@ -545,6 +573,14 @@ fn resolve_profiles(global: ConfigFile, project: Option<ConfigFile>) -> Result<C
             .embedding_model
             .clone()
             .or_else(|| shared.and_then(|provider| provider.embedding_model.clone()));
+        let completions_path = section
+            .completions_path
+            .clone()
+            .or_else(|| shared.and_then(|provider| provider.completions_path.clone()));
+        let send_session_id = section
+            .send_session_id
+            .or_else(|| shared.and_then(|provider| provider.send_session_id))
+            .unwrap_or(false);
         profiles.push(Profile {
             name: name.clone(),
             model,
@@ -553,6 +589,8 @@ fn resolve_profiles(global: ConfigFile, project: Option<ConfigFile>) -> Result<C
             context_window: section.context_window,
             tools,
             embedding_model,
+            completions_path,
+            send_session_id,
         });
     }
     // Stable ordering for listing, since the source is a hash map.
@@ -684,6 +722,30 @@ mod tests {
         let path = std::env::temp_dir().join(format!("kamui-config-{}.toml", Uuid::new_v4()));
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn orvix_coding_provider_inherits_completions_path_and_session_flag() {
+        let global = file(
+            r#"
+default_profile = "flash"
+[providers.orvix-coding]
+base_url = "https://api.orvix.id/v1"
+api_key = "sk-test"
+completions_path = "/coding/completions"
+send_session_id = true
+[profiles.flash]
+provider = "orvix-coding"
+model = "orvix/deepseek-v4-flash"
+"#,
+        );
+        let profile = resolve(global, None).unwrap().default().clone();
+        assert_eq!(profile.base_url, "https://api.orvix.id/v1");
+        assert_eq!(
+            profile.completions_path.as_deref(),
+            Some("/coding/completions")
+        );
+        assert!(profile.send_session_id);
     }
 
     #[test]

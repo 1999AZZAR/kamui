@@ -68,7 +68,12 @@ pub fn render(messages: &[Message]) -> String {
 }
 
 /// Build the non-streaming request that folds new messages into the running summary.
-pub fn summary_request(model: &str, existing: Option<&str>, rendered: &str) -> ChatRequest {
+pub fn summary_request(
+    model: &str,
+    existing: Option<&str>,
+    rendered: &str,
+    session_id: Option<String>,
+) -> ChatRequest {
     let instruction = "You maintain a running summary of a coding conversation so it can continue \
                        after older messages are dropped. Rewrite the summary to capture the user's \
                        goals, key decisions, files and code changed, commands run and their \
@@ -84,6 +89,7 @@ pub fn summary_request(model: &str, existing: Option<&str>, rendered: &str) -> C
             )),
         ],
         tools: Vec::new(),
+        session_id,
     }
 }
 

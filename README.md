@@ -43,6 +43,11 @@ Any service implementing the OpenAI Chat Completions API can be used by changing
 model, and API key. Chat responses use the API's SSE streaming mode and are rendered as deltas
 arrive.
 
+**Orvix Coding Plan (internal):** point a shared provider at `https://api.orvix.id/v1`, set
+`completions_path = "/coding/completions"` and `send_session_id = true`, and use a key with
+`coding:invoke`. Kamui sends its session UUID as top-level `session_id` so Orvix can stick the
+upstream route for cache. Switch with `/model orvix-coding-flash`. Keep `/v1` profiles for A/B.
+
 ### OpenAI-compatible providers
 
 Kamui talks to any OpenAI-compatible endpoint, so you can point it at hosted aggregators or a local

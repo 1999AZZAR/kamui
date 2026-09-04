@@ -250,6 +250,15 @@ where
         for line in tools::drain_finished_jobs(&job_registry, &mut announced_jobs) {
             chat_ui.notice(&line)?;
         }
+        // Sticky Orvix Coding sessions need an id before the first provider call (including
+        // /compact). Creating early is harmless for other providers: we only do it when asked.
+        let coding_session_id = ensure_coding_session_id(
+            &mut session,
+            database,
+            provider.name(),
+            &active.model,
+            active.send_session_id,
+        )?;
         let input = if use_tui {
             let hub = hub.as_mut().expect("tui implies hub");
             let cmds: Vec<crate::commands::CustomCommand> = command_library.list().to_vec();
@@ -432,6 +441,8 @@ where
                         context_window: None,
                         tools: true,
                         embedding_model: None,
+                        completions_path: None,
+                        send_session_id: false,
                     };
                     active = profile.clone();
                     provider = build_provider(&active);
@@ -699,7 +710,12 @@ where
             if command == "/compact" {
                 let outcome = tokio::select! {
                     result = run_compaction(
-                        provider.as_ref(), &active.model, &messages, summary.as_deref(), summarized_upto,
+                        provider.as_ref(),
+                        &active.model,
+                        &messages,
+                        summary.as_deref(),
+                        summarized_upto,
+                        coding_session_id.clone(),
                     ) => result,
                     signal = tokio::signal::ctrl_c() => {
                         signal.context("failed to listen for Ctrl+C")?;
@@ -976,7 +992,12 @@ where
         {
             let outcome = tokio::select! {
                 result = run_compaction(
-                    provider.as_ref(), &active.model, &messages, summary.as_deref(), summarized_upto,
+                    provider.as_ref(),
+                    &active.model,
+                    &messages,
+                    summary.as_deref(),
+                    summarized_upto,
+                    coding_session_id.clone(),
                 ) => result,
                 signal = tokio::signal::ctrl_c() => {
                     signal.context("failed to listen for Ctrl+C")?;
@@ -1094,6 +1115,7 @@ where
                 model: model.clone(),
                 messages: turn_messages.clone(),
                 tools: tool_definitions.clone(),
+                session_id: coding_session_id.clone(),
             });
             if !chat_ui.is_fullscreen() {
                 println!();
@@ -1298,7 +1320,11 @@ where
                 ))?;
                 tokio::select! {
                     output = dispatch_spawn_agents(
-                        provider.as_ref(), &active.model, project, &spawn_calls,
+                        provider.as_ref(),
+                        &active.model,
+                        project,
+                        &spawn_calls,
+                        coding_session_id.clone(),
                     ) => output,
                     signal = tokio::signal::ctrl_c() => {
                         signal.context("failed to listen for Ctrl+C")?;
@@ -1629,6 +1655,7 @@ where
                     Message::assistant(final_answer),
                 ],
                 tools: Vec::new(),
+                session_id: coding_session_id.clone(),
             });
             let title_response = tokio::select! {
                 response = title_request => response,
@@ -1700,6 +1727,12 @@ where
         .cloned()
         .unwrap_or_else(|| config.default().clone());
     let provider = build_provider(&active);
+    let mut session = if active.send_session_id {
+        Some(database.create_session(provider.name(), &active.model)?)
+    } else {
+        None
+    };
+    let coding_session_id = session.as_ref().map(|s| s.id.clone());
 
     // `kamui -p /review` or `/skill:my-skill` expands the same way interactive chat does.
     let command_library = commands::CommandLibrary::load(project.root());
@@ -1764,6 +1797,7 @@ where
                 model: active.model.clone(),
                 messages: turn_messages.clone(),
                 tools: tool_definitions.clone(),
+                session_id: coding_session_id.clone(),
             })
             .await
             .context("request failed")?;
@@ -1784,8 +1818,14 @@ where
             .iter()
             .filter(|call| call.name == tools::SPAWN_AGENT_TOOL)
             .collect();
-        let spawned_outputs =
-            dispatch_spawn_agents(provider.as_ref(), &active.model, project, &spawn_calls).await;
+        let spawned_outputs = dispatch_spawn_agents(
+            provider.as_ref(),
+            &active.model,
+            project,
+            &spawn_calls,
+            coding_session_id.clone(),
+        )
+        .await;
         for call in &response.tool_calls {
             let tool_started = Instant::now();
             if call.name == tools::UPDATE_PLAN_TOOL
@@ -1873,7 +1913,10 @@ where
     turn_record.append(&mut tool_trail);
     turn_record.push(assistant_message);
 
-    let mut session = database.create_session(provider.name(), &active.model)?;
+    let mut session = match session {
+        Some(existing) => existing,
+        None => database.create_session(provider.name(), &active.model)?,
+    };
     database.save_turn(
         &session.id,
         &turn_record,
@@ -1907,6 +1950,7 @@ where
                 Message::assistant(final_answer),
             ],
             tools: Vec::new(),
+            session_id: coding_session_id.clone(),
         })
         .await;
     match title_response {
@@ -2467,6 +2511,24 @@ fn usage_row(period: &storage::UsagePeriod, cost: Option<&str>) -> String {
     line
 }
 
+/// When `send_session_id` is set (Orvix Coding Plan), ensure a persisted Kamui session exists and
+/// return its id for the provider wire body.
+fn ensure_coding_session_id(
+    session: &mut Option<Session>,
+    database: &Database,
+    provider_name: &str,
+    model: &str,
+    send_session_id: bool,
+) -> Result<Option<String>> {
+    if !send_session_id {
+        return Ok(None);
+    }
+    if session.is_none() {
+        *session = Some(database.create_session(provider_name, model)?);
+    }
+    Ok(session.as_ref().map(|s| s.id.clone()))
+}
+
 /// Fold the older, un-summarized messages into a fresh running summary via a non-streaming request.
 /// Returns the new summary, the new summarized-up-to index, and how many messages were folded in, or
 /// `None` when there is nothing new worth summarizing.
@@ -2476,12 +2538,13 @@ async fn run_compaction(
     messages: &[Message],
     summary: Option<&str>,
     summarized_upto: usize,
+    session_id: Option<String>,
 ) -> Result<Option<(String, usize, usize)>> {
     let Some(cutoff) = compaction::cutoff(messages.len(), summarized_upto) else {
         return Ok(None);
     };
     let rendered = compaction::render(&messages[summarized_upto..cutoff]);
-    let request = compaction::summary_request(model, summary, &rendered);
+    let request = compaction::summary_request(model, summary, &rendered, session_id);
     let response = provider.chat(request).await?;
     Ok(Some((
         response.content.trim().to_string(),
@@ -3246,8 +3309,9 @@ async fn dispatch_spawn_agent(
     model: &str,
     project: &ProjectContext,
     arguments: &str,
+    session_id: Option<String>,
 ) -> String {
-    match run_spawned_agent(provider, model, project, arguments).await {
+    match run_spawned_agent(provider, model, project, arguments, session_id).await {
         Ok(output) => output,
         Err(error) => format!("Error: {error:#}"),
     }
@@ -3260,18 +3324,29 @@ async fn dispatch_spawn_agents(
     model: &str,
     project: &ProjectContext,
     calls: &[&ToolCall],
+    session_id: Option<String>,
 ) -> HashMap<String, (String, Duration)> {
     let mut outputs = HashMap::with_capacity(calls.len());
     for batch in calls.chunks(MAX_CONCURRENT_SUB_AGENTS) {
-        let futures = batch.iter().map(|call| async move {
-            let started = Instant::now();
-            (
-                call.id.clone(),
+        let futures = batch.iter().map(|call| {
+            let session_id = session_id.clone();
+            async move {
+                let started = Instant::now();
                 (
-                    dispatch_spawn_agent(provider, model, project, &call.arguments).await,
-                    started.elapsed(),
-                ),
-            )
+                    call.id.clone(),
+                    (
+                        dispatch_spawn_agent(
+                            provider,
+                            model,
+                            project,
+                            &call.arguments,
+                            session_id,
+                        )
+                        .await,
+                        started.elapsed(),
+                    ),
+                )
+            }
         });
         outputs.extend(join_all(futures).await);
     }
@@ -3288,6 +3363,7 @@ async fn run_spawned_agent(
     model: &str,
     project: &ProjectContext,
     arguments: &str,
+    session_id: Option<String>,
 ) -> Result<String> {
     let arguments: SpawnAgentArguments = serde_json::from_str(arguments)
         .context("spawn_agent requires a 'prompt' string argument")?;
@@ -3314,6 +3390,7 @@ async fn run_spawned_agent(
                 model: model.to_string(),
                 messages: messages.clone(),
                 tools: tool_definitions.clone(),
+                session_id: session_id.clone(),
             })
             .await
             .context("sub-agent request failed")?;
@@ -4612,6 +4689,8 @@ mod tests {
             context_window: None,
             tools,
             embedding_model: None,
+            completions_path: None,
+            send_session_id: false,
         }
     }
 
@@ -5569,6 +5648,8 @@ mod tests {
             context_window: None,
             tools: true,
             embedding_model: embedding_model.map(str::to_string),
+            completions_path: None,
+            send_session_id: false,
         }
     }
 
@@ -5646,7 +5727,8 @@ mod tests {
             .collect::<Vec<_>>();
         let references = calls.iter().collect::<Vec<_>>();
 
-        let outputs = dispatch_spawn_agents(&provider, "model", &project, &references).await;
+        let outputs =
+            dispatch_spawn_agents(&provider, "model", &project, &references, None).await;
 
         assert_eq!(outputs.len(), 6);
         assert_eq!(outputs["c0"].0, "task 0");
@@ -5777,7 +5859,7 @@ mod tests {
         let project = ProjectContext::from_root(root.clone()).unwrap();
 
         let output =
-            dispatch_spawn_agent(&UnreachableProvider, "gpt-5", &project, "not json").await;
+            dispatch_spawn_agent(&UnreachableProvider, "gpt-5", &project, "not json", None).await;
 
         assert!(output.starts_with("Error:"), "{output}");
         fs::remove_dir_all(root).unwrap();
@@ -5793,6 +5875,7 @@ mod tests {
             "gpt-5",
             &project,
             r#"{"prompt":"   "}"#,
+            None,
         )
         .await;
 

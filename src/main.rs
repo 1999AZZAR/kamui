@@ -79,10 +79,7 @@ async fn main() -> Result<()> {
         command_limits,
     );
     let build_provider = |profile: &config::Profile| {
-        Box::new(OpenAIProvider::new(
-            profile.api_key.clone(),
-            profile.base_url.clone(),
-        )) as Box<dyn Provider>
+        Box::new(OpenAIProvider::from_profile(profile)) as Box<dyn Provider>
     };
 
     match command {
@@ -352,12 +349,15 @@ async fn run_doctor() -> Result<()> {
             "Default profile '{}' uses model '{}'",
             profile.name, profile.model
         ));
-        let provider = OpenAIProvider::new(profile.api_key.clone(), profile.base_url.clone());
+        let provider = OpenAIProvider::from_profile(profile);
         match provider
             .chat(provider::ChatRequest {
                 model: profile.model.clone(),
                 messages: vec![provider::Message::user("ping")],
                 tools: Vec::new(),
+                session_id: profile
+                    .send_session_id
+                    .then(|| uuid::Uuid::new_v4().to_string()),
             })
             .await
         {
