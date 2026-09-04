@@ -1,3 +1,4 @@
+use crate::cache;
 use crate::commands;
 use crate::compaction;
 use crate::config::{Config, Profile};
@@ -226,6 +227,9 @@ where
     let mut input_rx = if use_tui { None } else { Some(input_channel()) };
     let mut disabled_skills = crate::settings::load_disabled_skills(project.root());
 
+    // Prompt-cache prefix watch. Only cache-pinned profiles (Orvix Coding Plan, `send_session_id`)
+    // pay attention: everywhere else a changed prefix costs nothing worth a notice.
+    let mut prefix_guard = cache::PrefixGuard::new(active.send_session_id);
     // Rolling context compaction: `summary` folds in messages before `summarized_upto`; the rest of
     // `messages` is sent verbatim. Both reset whenever a command replaces the loaded history.
     let mut summary: Option<String> = None;
@@ -764,8 +768,10 @@ where
                         summary = Some(new_summary);
                         summarized_upto = new_upto;
                         chat_ui.notice(&format!(
-                            "Compacted {count} earlier messages into the summary."
+                            "Compacted {count} earlier messages into the summary.{}",
+                            cache_reset_note(active.send_session_id)
                         ))?;
+                        prefix_guard.reset();
                     }
                     Ok(None) => chat_ui.notice("Not enough history to compact yet.")?,
                     Err(error) => {
@@ -964,6 +970,9 @@ where
             if messages.len() != messages_before {
                 summary = None;
                 summarized_upto = 0;
+                // A different conversation gets a different prefix by design, so the first turn
+                // after it is a warm-up, not drift worth reporting.
+                prefix_guard.reset();
             }
             // The fixed tool array + frozen head are session-scoped: a new/resumed session
             // may carry a different plan state or profile, so recompute on the next turn.
@@ -1034,7 +1043,7 @@ where
         // Auto-compact older history once the recent portion grows past the threshold.
         summarized_upto = summarized_upto.min(messages.len());
         if compaction::total_bytes(&messages[summarized_upto..])
-            > compaction::threshold(active.context_window)
+            > compaction::threshold(active.context_window, active.send_session_id)
         {
             let outcome = tokio::select! {
                 result = run_compaction(
@@ -1056,8 +1065,10 @@ where
                     summary = Some(new_summary);
                     summarized_upto = new_upto;
                     chat_ui.notice(&format!(
-                        "Compacted {count} earlier messages into a running summary."
+                        "Compacted {count} earlier messages into a running summary.{}",
+                        cache_reset_note(active.send_session_id)
                     ))?;
+                    prefix_guard.reset();
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -1076,42 +1087,52 @@ where
             }
         }
 
-        // Working conversation for this turn: the frozen head (base system, memory, skills
-        // as separate messages) + the rolling summary + un-summarized history + prompt.
-        // Intermediate tool messages live here only; they are not persisted. The head is
-        // computed once per Session and reused: a memory/skill change resets `head_messages`
-        // (skill toggle) or flips `memory_dirty` (memory tools), so the next turn rebuilds
-        // just the head while history turns keep byte-identical prefixes.
+        // Working conversation for this turn (prompt-cache contract, see `src/cache.rs`):
+        //
+        //     [head]     base system + project instructions, then the eager skill list
+        //     [history]  the un-summarized conversation, unchanged
+        //     [tail]     memory snapshot + rolling summary
+        //     [user]     the new turn
+        //
+        // The head is computed once per Session and cloned per Turn: its inputs are fixed at
+        // startup or change only on an explicit user action (`/model`, a skill toggle), which
+        // resets `head_messages`.
+        //
+        // Memory and the summary sit *behind* the history rather than in the head. Both are read
+        // fresh -- a fact remembered this turn is visible on the next one -- so putting them in
+        // front would mean one `remember` call moved byte zero and re-read the whole conversation
+        // at full price. Behind it, the divergence point is only ever the previous turn's tail.
+        // Intermediate tool messages live here only; they are not persisted.
         if head_messages.is_none() {
             let skills_eager = skill_library.eager_block_filtered(&disabled_skills);
             let base = prompt::build(active.tools, project.system_message().as_deref(), None);
-            // Refresh from the DB only when memory actually changed; otherwise reuse the
-            // snapshot baked into the previous head so the bytes stay identical.
-            // ponytail: re-read is a DB round-trip per memory-changing turn only, not per turn.
-            if memory_dirty {
-                cached_memory_snapshot = render_memory_snapshot(&database.list_memory()?);
-                memory_dirty = false;
-            }
-            head_messages = Some(build_head_messages(
-                base,
-                &cached_memory_snapshot,
-                skills_eager.as_deref(),
-            ));
+            head_messages = Some(build_head_messages(base, skills_eager.as_deref()));
         }
-        let mut turn_messages = head_messages.as_ref().expect("built above").clone();
-        if let Some(summary) = &summary {
-            turn_messages.push(Message::system(format!(
-                "Summary of the earlier conversation so far:\n\n{summary}"
-            )));
+        let head = head_messages.as_ref().expect("built above");
+        // The tail re-reads the database only after a memory tool ran; between those turns the
+        // previous snapshot is reused, which saves a round trip per turn rather than protecting
+        // the prefix -- the tail is free to change without costing a cache hit.
+        if memory_dirty {
+            cached_memory_snapshot = render_memory_snapshot(&database.list_memory()?);
+            memory_dirty = false;
         }
-        turn_messages.extend(messages[summarized_upto..].iter().cloned());
+        // Guard the frozen part. Nothing above should ever move without an explicit user action;
+        // when it does, say so, because otherwise a collapsed hit rate has no visible cause.
+        if let Some(notice) = prefix_guard.check(&cache::head_text(head), &tool_definitions) {
+            chat_ui.notice(&notice)?;
+        }
         // Say what was attached. The prompt text only ever shows what was typed (`@clipboard`,
         // `@shot.png`), so without this there is nothing to tell you whether an image was
         // actually picked up, how big it was, or that it needs a vision model to be read.
         if let Some(note) = describe_attachments(&expanded) {
             chat_ui.notice(&note)?;
         }
-        turn_messages.push(Message::user_with_images(expanded.text, expanded.images));
+        let mut turn_messages = cache::turn_messages(
+            head,
+            &messages[summarized_upto..],
+            cache::volatile_tail(&cached_memory_snapshot, summary.as_deref()),
+            Message::user_with_images(expanded.text, expanded.images),
+        );
 
         // Agent loop: stream a turn, run any tools it requests, and repeat until a plain answer.
         // `tool_trail` collects this turn's intermediate tool-request and tool-result messages so
@@ -1309,6 +1330,7 @@ where
                 usage.completion_tokens,
                 usage.total_tokens,
                 usage.cached_tokens,
+                active.send_session_id,
                 &finish_reason,
                 ttft,
                 started.elapsed(),
@@ -1561,11 +1583,11 @@ where
                             .to_string(),
                     }
                 } else if is_memory_tool(&call.name) {
-                    // Memory changed: rebuild the frozen head next turn so the new fact is
+                    // Memory changed: re-read it for the next turn's tail, so the new fact is
                     // visible immediately (same guarantee as the old read-fresh-every-turn).
+                    // The head is untouched — memory does not live there, which is exactly why a
+                    // `remember` call no longer costs the session its cached prefix.
                     memory_dirty = true;
-                    head_messages = None;
-                    head_rebuilt_this_turn = true;
                     dispatch_memory_tool(database, &call.name, &call.arguments)
                 } else if tools.requires_confirmation_for(&call.name, &call.arguments)
                     && !auto_approve
@@ -1856,13 +1878,21 @@ where
     }
 
     let skills_eager = skill_library.eager_block_filtered(&disabled_skills);
+    // Same shape as an interactive turn (see `src/cache.rs`): frozen head first, volatile memory
+    // tail last, so a session driven through `-p` builds the prefix an interactive turn of the
+    // same session would.
     let base = prompt::build(active.tools, project.system_message().as_deref(), None);
-    let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
-    let mut turn_messages = build_head_messages(base, &memory_snapshot, skills_eager.as_deref());
+    let head = build_head_messages(base, skills_eager.as_deref());
     if let Some(note) = describe_attachments(&expanded) {
         println!("{note}");
     }
-    turn_messages.push(Message::user_with_images(expanded.text, expanded.images));
+    let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
+    let mut turn_messages = cache::turn_messages(
+        &head,
+        &[],
+        cache::volatile_tail(&memory_snapshot, None),
+        Message::user_with_images(expanded.text, expanded.images),
+    );
 
     let user_message = Message::user(prompt);
     let mut tool_trail: Vec<Message> = Vec::new();
@@ -2464,6 +2494,19 @@ fn print_stats(
             stats.cached_tokens
         );
     }
+    // Prompt-cache behaviour, turn by turn. Lifetime token totals lag -- one cold session drags
+    // them for good -- so this counts turns, and it only appears for a provider that actually
+    // returns cached tokens.
+    let samples = database.cache_samples(&session.id)?;
+    if samples.iter().any(|(_, cached)| *cached > 0)
+        && let Some(cache) = cache::report(&samples)
+    {
+        let _ = writeln!(
+            out,
+            "Prompt cache:  median {:.0}% over {} turns | \u{2265}90%: {:.0}% | \u{2265}95%: {:.0}% | warm-up: {}",
+            cache.median, cache.measured, cache.pct_ge_90, cache.pct_ge_95, cache.warmup
+        );
+    }
     if let (Some(last_input), Some(window)) = (stats.last_input_tokens, context_window) {
         // Buffered like every other line. `print!` here sent the report's most useful line to
         // raw stdout, which both dropped it from `/stats` and wrote it over the frame.
@@ -2597,6 +2640,17 @@ fn usage_row(period: &storage::UsagePeriod, cost: Option<&str>) -> String {
 
 /// When `send_session_id` is set (Orvix Coding Plan), ensure a persisted Kamui session exists and
 /// return its id for the provider wire body.
+/// What compaction costs a cache-pinned session, appended to the notice so the next turn's
+/// collapsed hit rate has a stated cause. Empty for every other profile, where dropping older
+/// messages costs nothing but the messages.
+fn cache_reset_note(cache_pinned: bool) -> &'static str {
+    if cache_pinned {
+        " The cached prompt prefix resets, so the next turn warms up again."
+    } else {
+        ""
+    }
+}
+
 fn ensure_coding_session_id(
     session: &mut Option<Session>,
     database: &Database,
@@ -3180,6 +3234,8 @@ fn format_usage(
     output: u64,
     total: u64,
     cached: u64,
+    // Whether the active profile pins this session to a cached prefix (`send_session_id`).
+    cache_pinned: bool,
     finish_reason: &str,
     ttft: Option<Duration>,
     elapsed: Duration,
@@ -3187,15 +3243,16 @@ fn format_usage(
     miss_label: Option<&str>,
 ) -> String {
     let mut line = format!("Tokens: {input} input + {output} output = {total} total");
-    if cached > 0 {
-        let percent = if input > 0 {
-            (cached as f64 / input as f64 * 100.0).min(100.0)
-        } else {
-            0.0
-        };
+    // On a cache-pinned profile the field is always shown: a zero there is the whole signal --
+    // either the session's first turn or a prefix that churned -- and hiding it left the failure
+    // looking exactly like a provider that reports nothing.
+    if let Some(percent) = cache::hit_percent(input, cached).filter(|_| cached > 0) {
         line.push_str(&format!(" | Cached: {cached} ({percent:.0}%)"));
     } else if let Some(miss) = miss_label {
+        // A named cause beats a bare zero, so it wins when there is one.
         line.push_str(&format!(" | Cache {miss}"));
+    } else if cache_pinned {
+        line.push_str(" | Cached: 0 (warm-up)");
     }
     if let Some(window) = context_window {
         let percent = input as f64 / window as f64 * 100.0;
@@ -3969,22 +4026,17 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// the system prompt (which carries every entry on every request) from growing unbounded.
 const MAX_MEMORY_BYTES: i64 = 4 * 1024;
 
-/// Build the frozen request head: one message per stable block (base system, memory,
-/// skills), so a change in one block never re-serializes the others. The rolling
-/// Compaction summary stays out — it grows by design and is appended per Turn by the
-/// caller as the last head message. Empty blocks are skipped, but a block that
-/// *becomes* empty keeps its slot only via full-head rebuild (see callers resetting
-/// `head_messages` on skill toggle / session change); per-Turn shape is stable
-/// otherwise: same blocks present → same prefix bytes.
-fn build_head_messages(
-    base_system: String,
-    memory_snapshot: &str,
-    skills_eager: Option<&str>,
-) -> Vec<Message> {
+/// Build the frozen request head: one message per stable block — the base system prompt (with
+/// project instructions) and the eager skill list. Only an explicit user action changes either,
+/// and the callers that perform one reset `head_messages`, so between those the head is the same
+/// bytes every turn.
+///
+/// Memory and the rolling summary are deliberately *not* here. Both change on their own — a
+/// `remember` call, a compaction — and anything in the head sits ahead of the whole conversation,
+/// so putting them here would mean one of those re-read every earlier turn at full price. They
+/// ride behind the history instead, as `cache::volatile_tail`.
+fn build_head_messages(base_system: String, skills_eager: Option<&str>) -> Vec<Message> {
     let mut head = vec![Message::system(base_system)];
-    if !memory_snapshot.is_empty() {
-        head.push(Message::system(memory_snapshot.to_string()));
-    }
     if let Some(skills) = skills_eager
         && !skills.is_empty()
     {
@@ -5482,31 +5534,52 @@ mod tests {
 
     #[test]
     fn head_messages_skip_empty_blocks() {
-        let head = build_head_messages("base".to_string(), "", None);
+        let head = build_head_messages("base".to_string(), None);
         assert_eq!(head.len(), 1);
         assert_eq!(head[0].content, "base");
+        assert_eq!(
+            build_head_messages("base".to_string(), Some("")).len(),
+            1,
+            "a project with no skills adds no empty block"
+        );
     }
 
     #[test]
     fn head_messages_keep_blocks_separate() {
-        let head = build_head_messages(
-            "base".to_string(),
-            "Remembered facts:\n- bun",
-            Some("Skills:\n- review"),
-        );
-        assert_eq!(head.len(), 3);
+        let head = build_head_messages("base".to_string(), Some("Skills:\n- review"));
+        assert_eq!(head.len(), 2);
         assert_eq!(head[0].content, "base");
-        assert!(head[1].content.contains("bun"));
-        assert!(head[2].content.contains("review"));
-        // A memory change re-renders only message[1]: message[0] bytes are untouched.
-        let head2 = build_head_messages(
-            "base".to_string(),
-            "Remembered facts:\n- bun\n- uv",
-            Some("Skills:\n- review"),
+        assert!(head[1].content.contains("review"));
+    }
+
+    /// The merged contract: a remembered fact reaches the model on the next turn without moving
+    /// one byte of the head, because it rides behind the history rather than in front of it.
+    #[test]
+    fn remembering_something_leaves_the_frozen_head_alone() {
+        let head = build_head_messages("base".to_string(), Some("Skills:\n- review"));
+        let before = crate::cache::head_text(&head);
+
+        let history = [Message::user("q"), Message::assistant("a")];
+        let turn = crate::cache::turn_messages(
+            &head,
+            &history,
+            crate::cache::volatile_tail("Remembered facts:\n- bun\n- uv", None),
+            Message::user("next"),
         );
-        assert_eq!(head2[0].content, head[0].content);
-        assert_eq!(head2[2].content, head[2].content);
-        assert_ne!(head2[1].content, head[1].content);
+
+        assert_eq!(
+            crate::cache::head_text(&head),
+            before,
+            "the head is not rebuilt when memory changes"
+        );
+        assert!(
+            turn[turn.len() - 2].content.contains("uv"),
+            "the new fact is in the tail, behind the history"
+        );
+        assert!(
+            !turn[0].content.contains("uv") && !turn[1].content.contains("uv"),
+            "and never in the head"
+        );
     }
 
     #[test]

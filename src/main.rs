@@ -1,4 +1,5 @@
 mod benchmark;
+mod cache;
 mod chat;
 mod commands;
 mod compaction;
@@ -651,7 +652,7 @@ mod tests {
         assert!(matches!(
             command,
             Command::Benchmark { suite, profile: Some(profile), runs: 3 }
-                if *suite == *"suite.json" && profile == "fast"
+                if suite == std::path::Path::new("suite.json") && profile == "fast"
         ));
     }
 

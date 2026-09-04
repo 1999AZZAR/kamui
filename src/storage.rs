@@ -827,6 +827,21 @@ impl Database {
         Ok(stats)
     }
 
+    /// Every chat request of one session as `(prompt_tokens, cached_tokens)`, oldest first, for the
+    /// prompt-cache report (`crate::cache::report`). Title generation and compaction are left out on
+    /// purpose: they are separate requests with their own prefixes, so counting them would misreport
+    /// how the conversation itself is landing against the cache.
+    pub fn cache_samples(&self, session_id: &str) -> Result<Vec<(i64, i64)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT input_tokens, cached_tokens FROM usage_records
+             WHERE session_id = ?1 AND kind = 'chat' ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn rename_session(&self, session_id: &str, title: &str) -> Result<()> {
         let changed = self.connection.execute(
             "UPDATE sessions SET title = ?2, updated_at = unixepoch() WHERE id = ?1",
@@ -1639,6 +1654,47 @@ mod tests {
         let messages = database.load_messages("s1").unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].role_name(), "tool");
+    }
+
+    #[test]
+    fn cache_samples_are_chat_turns_in_order() {
+        let database = database();
+        let session = database.create_session("test", "model").unwrap();
+        for (prompt, cached) in [(100u64, 0u64), (300, 285)] {
+            database
+                .save_turn(
+                    &session.id,
+                    &[Message::user("hi"), Message::assistant("hello")],
+                    &Usage {
+                        prompt_tokens: prompt,
+                        completion_tokens: 5,
+                        total_tokens: prompt + 5,
+                        cached_tokens: cached,
+                    },
+                    "model",
+                    "stop",
+                )
+                .unwrap();
+        }
+        // Title generation is its own request with its own prefix; counting it would misreport how
+        // the conversation lands against the cache.
+        database
+            .save_generated_title(
+                &session.id,
+                "a title",
+                &Usage {
+                    prompt_tokens: 40,
+                    completion_tokens: 3,
+                    total_tokens: 43,
+                    cached_tokens: 0,
+                },
+                "model",
+                "stop",
+            )
+            .unwrap();
+
+        let samples = database.cache_samples(&session.id).unwrap();
+        assert_eq!(samples, vec![(100, 0), (300, 285)]);
     }
 
     #[test]

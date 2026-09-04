@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 
 pub mod openai;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     System,
     User,

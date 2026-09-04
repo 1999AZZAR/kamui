@@ -252,6 +252,9 @@ struct Model {
     dialog: Option<DialogState>,
     /// `?` overlay with keybindings.
     help_visible: bool,
+    /// First keybinding row shown in the `?` overlay; a short terminal scrolls the sheet
+    /// rather than silently cutting the bindings that did not fit.
+    help_scroll: usize,
     /// Right-side status-bar badge ("5.9k tok 41%", amber past 80%).
     token_badge: Option<(String, u8)>,
     /// Open approval modal (opencode permission panel).
@@ -367,6 +370,7 @@ impl Default for Model {
             queued_count: 0,
             dialog: None,
             help_visible: false,
+            help_scroll: 0,
             token_badge: None,
             permission: None,
             ask: None,
@@ -1091,6 +1095,7 @@ impl ChatUi {
             Some(screen_arc) => {
                 let mut s = lock_screen(screen_arc);
                 s.model.help_visible = !s.model.help_visible;
+                s.model.help_scroll = 0;
                 s.draw()
             }
             None => Ok(()),
@@ -1638,12 +1643,30 @@ fn scroll_screen(screen: &ScreenHandle, rows: i64) {
 }
 
 /// Centered modal with border, opencode PlaceOverlay style.
+/// Rows the picker shows at once; arrows scroll within this window.
+const DIALOG_VISIBLE: usize = 8;
+
 fn render_dialog(frame: &mut Frame<'_>, dialog: &DialogState, area: Rect) {
     let filtered = dialog.filtered();
     let selected = dialog.selected.min(filtered.len().saturating_sub(1));
     let width = 56.min(area.width.saturating_sub(4));
-    let list_rows = filtered.len() as u16 + 2;
-    let height = (list_rows + 3).min(area.height.saturating_sub(2)).max(5);
+    // Height follows what the list can actually show, not how many entries exist: sizing it to
+    // `filtered.len()` grew the box to the full screen while only a window of rows was ever
+    // drawn, leaving a session picker that was mostly empty space.
+    let wanted = filtered.len().clamp(1, DIALOG_VISIBLE);
+    let height = ((wanted + 4) as u16)
+        .min(area.height.saturating_sub(2))
+        .max(5);
+    let capacity = (height as usize).saturating_sub(4).max(1);
+    // Keep the selection centred in the window instead of pinned to its last row.
+    let start = if filtered.len() <= capacity {
+        0
+    } else {
+        selected
+            .saturating_sub(capacity / 2)
+            .min(filtered.len() - capacity)
+    };
+    let end = filtered.len().min(start + capacity);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let box_area = Rect {
@@ -1661,7 +1684,14 @@ fn render_dialog(frame: &mut Frame<'_>, dialog: &DialogState, area: Rect) {
                 Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
             ),
             Span::styled(dialog.query.clone(), Style::default().fg(TEXT)),
-            Span::styled("  (Esc closes)".to_string(), Style::default().fg(BORDER)),
+            Span::styled(
+                if filtered.is_empty() {
+                    "  Esc closes".to_string()
+                } else {
+                    format!("  {}/{} \u{b7} Esc closes", selected + 1, filtered.len())
+                },
+                Style::default().fg(BORDER),
+            ),
         ]),
         Line::from(""),
     ];
@@ -1671,33 +1701,31 @@ fn render_dialog(frame: &mut Frame<'_>, dialog: &DialogState, area: Rect) {
             Style::default().fg(MUTED),
         ));
     }
-    for (idx, (value, label)) in filtered.iter().enumerate() {
-        if idx >= selected.saturating_sub(7) && idx < selected.saturating_sub(7) + 8 {
-            let is_on = idx == selected;
-            let prefix = if is_on { "\u{276f} " } else { "  " };
-            let mut row = vec![
-                Span::styled(
-                    prefix.to_string(),
-                    Style::default().fg(if is_on { BLUE } else { BORDER }),
-                ),
-                Span::styled(
-                    label.clone(),
-                    Style::default()
-                        .fg(if is_on { TEXT } else { MUTED })
-                        .add_modifier(if is_on {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ),
-            ];
-            // Show the raw value only when the label doesn't already contain it.
-            if !label.contains(value.as_str()) {
-                row.push(Span::raw("  "));
-                row.push(Span::styled(value.clone(), Style::default().fg(BORDER)));
-            }
-            lines.push(Line::from(row));
+    for (idx, (value, label)) in filtered.iter().enumerate().take(end).skip(start) {
+        let is_on = idx == selected;
+        let prefix = if is_on { "\u{276f} " } else { "  " };
+        let mut row = vec![
+            Span::styled(
+                prefix.to_string(),
+                Style::default().fg(if is_on { BLUE } else { BORDER }),
+            ),
+            Span::styled(
+                label.clone(),
+                Style::default()
+                    .fg(if is_on { TEXT } else { MUTED })
+                    .add_modifier(if is_on {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+        ];
+        // Show the raw value only when the label doesn't already contain it.
+        if !label.contains(value.as_str()) {
+            row.push(Span::raw("  "));
+            row.push(Span::styled(value.clone(), Style::default().fg(BORDER)));
         }
+        lines.push(Line::from(row));
     }
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -1912,7 +1940,7 @@ fn render_ask(frame: &mut Frame<'_>, ask: &AskState, area: Rect) {
 }
 
 /// `?` overlay: the keybinding sheet.
-fn render_help(frame: &mut Frame<'_>, area: Rect) {
+fn render_help(frame: &mut Frame<'_>, area: Rect, scroll: usize) {
     let width = 64.min(area.width.saturating_sub(4));
     let rows: [(&str, &str); 22] = [
         (
@@ -1944,9 +1972,14 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         ("Esc", "interrupt the agent"),
         ("Ctrl+C x 2", "quit"),
     ];
-    let height = ((rows.len() as u16) + 3)
-        .min(area.height.saturating_sub(2))
-        .max(8);
+    // Chrome the sheet always pays for: two borders, the title, and the closing hint.
+    const HELP_CHROME: usize = 4;
+    let ceiling = (area.height.saturating_sub(2).max(8) as usize).saturating_sub(HELP_CHROME);
+    let capacity = ceiling.clamp(1, rows.len());
+    // A terminal too short for the whole sheet scrolls it; it used to clip the tail with
+    // nothing on screen saying bindings were missing.
+    let scroll = scroll.min(rows.len() - capacity);
+    let height = (capacity + HELP_CHROME) as u16;
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let box_area = Rect {
@@ -1960,15 +1993,37 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         "Keybindings",
         Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
     ))];
-    for (key, desc) in rows {
+    // One column width for every key, so the descriptions line up instead of stepping around
+    // the longest binding.
+    let key_width = rows
+        .iter()
+        .map(|(key, _)| UnicodeWidthStr::width(*key))
+        .max()
+        .unwrap_or(0);
+    for (key, desc) in rows.iter().skip(scroll).take(capacity) {
+        let pad = " ".repeat(key_width - UnicodeWidthStr::width(*key));
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {key:<12} "),
+                format!("  {key}{pad}  "),
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(desc.to_string(), Style::default().fg(MUTED)),
+            Span::styled((*desc).to_string(), Style::default().fg(MUTED)),
         ]));
     }
+    let hidden = rows.len() - capacity;
+    lines.push(Line::from(Span::styled(
+        if hidden == 0 {
+            "  Esc closes".to_string()
+        } else {
+            format!(
+                "  \u{2191}/\u{2193} scroll \u{b7} {}-{} of {} \u{b7} Esc closes",
+                scroll + 1,
+                scroll + capacity,
+                rows.len()
+            )
+        },
+        Style::default().fg(BORDER),
+    )));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .style(Style::default().bg(POPUP_BG))
@@ -2234,7 +2289,17 @@ fn input_thread(
             let mut s = lock_screen(&screen.0);
             if s.model.help_visible {
                 match key.code {
-                    KeyCode::Char('?') | KeyCode::Esc => s.model.help_visible = false,
+                    KeyCode::Char('?') | KeyCode::Esc => {
+                        s.model.help_visible = false;
+                        s.model.help_scroll = 0;
+                    }
+                    KeyCode::Down | KeyCode::PageDown => {
+                        s.model.help_scroll = s.model.help_scroll.saturating_add(1);
+                    }
+                    KeyCode::Up | KeyCode::PageUp => {
+                        s.model.help_scroll = s.model.help_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Home => s.model.help_scroll = 0,
                     _ => {}
                 }
                 drop(s);
@@ -2365,6 +2430,7 @@ fn input_thread(
         if key.code == KeyCode::Char('?') && buf.is_empty() {
             let mut sc = lock_screen(&screen.0);
             sc.model.help_visible = !sc.model.help_visible;
+            sc.model.help_scroll = 0;
             drop(sc);
             let _ = screen.draw_now();
             continue;
@@ -2817,7 +2883,7 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     if let Some(search) = &model.search {
         frame.render_widget(search_widget(search), popup_area);
     } else if popup_height > 0 {
-        frame.render_widget(popup_widget(model), popup_area);
+        frame.render_widget(popup_widget(model, popup_area), popup_area);
     }
     frame.render_widget(editor_widget(model, editor_area), editor_area);
 
@@ -2838,8 +2904,21 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         ));
     }
 
-    frame.render_widget(footer_widget(model), footer_area);
+    frame.render_widget(footer_widget(model, footer_area), footer_area);
 
+    // Modal elevation: dim whatever is behind an overlay so the dialog reads as the front
+    // surface rather than one more box on the same plane. Only the DIM modifier is patched in,
+    // so every cell underneath keeps its own colours.
+    if model.permission.is_some()
+        || model.ask.is_some()
+        || model.help_visible
+        || model.dialog.is_some()
+    {
+        let whole = frame.area();
+        frame
+            .buffer_mut()
+            .set_style(whole, Style::default().add_modifier(Modifier::DIM));
+    }
     if let Some(perm) = &model.permission {
         render_permission(frame, perm, frame.area());
     }
@@ -2847,7 +2926,7 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         render_ask(frame, ask, frame.area());
     }
     if model.help_visible {
-        render_help(frame, frame.area());
+        render_help(frame, frame.area(), model.help_scroll);
     }
     if let Some(dialog) = &model.dialog {
         render_dialog(frame, dialog, frame.area());
@@ -3059,7 +3138,7 @@ fn search_widget(search: &SearchState) -> Paragraph<'static> {
     .style(Style::default().bg(POPUP_BG))
 }
 
-fn popup_widget(model: &Model) -> Paragraph<'static> {
+fn popup_widget(model: &Model, area: Rect) -> Paragraph<'static> {
     let total = model.ac_items.len();
     let selected = model.ac_selected.min(total.saturating_sub(1));
     // Sliding window keeps the highlighted row in view no matter how many candidates match.
@@ -3077,8 +3156,11 @@ fn popup_widget(model: &Model) -> Paragraph<'static> {
     } else {
         String::new()
     };
+    let rule = (area.width as usize)
+        .saturating_sub(counter.chars().count() + 2)
+        .max(1);
     let mut lines: Vec<Line<'static>> = vec![Line::from(vec![
-        Span::styled("\u{2500}".repeat(40), Style::default().fg(BORDER)),
+        Span::styled("\u{2500}".repeat(rule), Style::default().fg(BORDER)),
         Span::styled(counter, Style::default().fg(BORDER)),
     ])];
     for idx in start..end {
@@ -3290,8 +3372,11 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
     ]));
     // Startup notices still belong on the home screen — the logo must never hide them.
     for card in &model.cards {
-        for row in card.title.lines().chain(card.body.lines()) {
+        let mut rows = card.title.lines().chain(card.body.lines()).peekable();
+        if rows.peek().is_some() {
             lines.push(Line::from(""));
+        }
+        for row in rows {
             lines.push(Line::styled(row.to_string(), Style::default().fg(MUTED)));
         }
     }
@@ -3317,7 +3402,7 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
 }
 
 /// Status line: a few discoverable keys, live run hints, token badge.
-fn footer_widget(model: &Model) -> Paragraph<'static> {
+fn footer_widget(model: &Model, area: Rect) -> Paragraph<'static> {
     let mut left = if model.footer.is_empty() {
         "? help".to_string()
     } else {
@@ -3342,19 +3427,23 @@ fn footer_widget(model: &Model) -> Paragraph<'static> {
             model.queued_count, plural
         ));
     }
-    let mut spans = vec![Span::styled(left, Style::default().fg(MUTED))];
+    // Model and token badge are pinned to the right edge: they are the two facts worth a glance
+    // at any moment, and letting the hint text push them off the row (a plain Paragraph clips at
+    // the right) hid them exactly when the hints grew -- scrolled back, queued, mid-turn.
+    let mut right: Vec<Span<'static>> = Vec::new();
     if let Some(entries) = &model.sidebar
         && let Some((_, model_name)) = entries.iter().find(|(key, _)| key == "Model")
     {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
+        right.push(Span::styled(
             crate::tui::truncate_chars(model_name, 24),
             Style::default().fg(BORDER),
         ));
     }
     if let Some((badge_text, pct)) = &model.token_badge {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
+        if !right.is_empty() {
+            right.push(Span::raw("  "));
+        }
+        right.push(Span::styled(
             format!(" {badge_text} "),
             Style::default()
                 .bg(if *pct >= 80 { WARN } else { TEXT })
@@ -3362,7 +3451,21 @@ fn footer_widget(model: &Model) -> Paragraph<'static> {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    Paragraph::new(Line::from(spans))
+    let total = area.width as usize;
+    let right_width: usize = right
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    // The hints yield to the right cluster rather than the other way round.
+    let left_budget = total.saturating_sub(right_width + 2);
+    let left = crate::tui::truncate_chars(&left, left_budget);
+    let gap = total.saturating_sub(UnicodeWidthStr::width(left.as_str()) + right_width);
+    let mut spans = vec![Span::styled(left, Style::default().fg(MUTED))];
+    if !right.is_empty() {
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(right);
+    }
+    Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_PANEL))
 }
 
 /// The transcript as it is actually drawn: every source line wrapped to `width`, each wrapped
@@ -3380,7 +3483,7 @@ fn wrapped_transcript(model: &Model, width: u16) -> Vec<(Line<'static>, Option<u
     }
     let mut rows = Vec::new();
     for (line, owner) in transcript_rows(model, width) {
-        for row in wrap_spans(&line.spans, width.max(1) as usize) {
+        for row in wrap_card_line(&line, width.max(1) as usize) {
             rows.push((Line::from(row), owner));
         }
     }
@@ -3392,6 +3495,31 @@ fn wrapped_transcript(model: &Model, width: u16) -> Vec<(Line<'static>, Option<u
         });
     }
     rows
+}
+
+/// Wraps one transcript line, keeping a card's rail on every row it produces. `card_lines`
+/// emits `\u{258c} ` as the first span of every row it owns; wrapping the line as a flat span
+/// list dropped that prefix from the continuation rows, so a long assistant paragraph looked
+/// like its rail stopped one line in and the text jumped back to column zero.
+fn wrap_card_line(line: &Line<'_>, width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    let Some(rail) = line
+        .spans
+        .first()
+        .filter(|span| span.content == THICK_BORDER)
+    else {
+        return wrap_spans(&line.spans, width);
+    };
+    let rail_style = rail.style;
+    let indent = UnicodeWidthStr::width(THICK_BORDER);
+    wrap_spans(&line.spans[1..], width.saturating_sub(indent).max(1))
+        .into_iter()
+        .map(|row| {
+            let mut out = vec![Span::styled(THICK_BORDER.to_string(), rail_style)];
+            out.extend(row);
+            out
+        })
+        .collect()
 }
 
 /// Repaints a whole drawn row onto `background`. Colouring only the matched substring would
@@ -3464,7 +3592,9 @@ fn transcript_rows(model: &Model, width: u16) -> Vec<(Line<'static>, Option<u64>
     if !model.cards.is_empty() {
         lines.pop();
     }
-    if model.warnings_visible {
+    // The separator belongs to the warning block, not to the flag: with warnings visible but
+    // none pending -- the default -- this pushed a stray blank row under every transcript.
+    if model.warnings_visible && !model.warnings.is_empty() {
         if !lines.is_empty() {
             lines.push((Line::from(""), None));
         }
@@ -3691,7 +3821,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
                 &mut out,
                 vec![Span::styled(
                     format!("\u{2026} {hidden} more line(s) \u{b7} ctrl+o or click"),
-                    Style::default().fg(GREEN),
+                    Style::default().fg(MUTED),
                 )],
             );
         }
@@ -3847,7 +3977,12 @@ fn wrap_spans(spans: &[Span<'_>], width: usize) -> Vec<Vec<Span<'static>>> {
                             take_end = i + ch.len_utf8();
                         }
                         if take_end == 0 {
-                            take_end = rest.ceil_char_boundary(1.min(rest.len()));
+                            // A char wider than the remaining columns: take it whole anyway so the
+                            // loop always advances. (str::ceil_char_boundary is still unstable.)
+                            if let Some(ch) = rest.chars().next() {
+                                take_end = ch.len_utf8();
+                                take_w = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+                            }
                         }
                         let piece = &rest[..take_end];
                         push_row_text(&mut rows, piece.to_string(), *style);
@@ -3932,6 +4067,72 @@ mod tests {
             status: None,
             collapsed: false,
         }
+    }
+
+    #[test]
+    fn wrapped_assistant_text_keeps_its_rail_on_every_row() {
+        let model = Model {
+            intro: false,
+            cards: vec![Card {
+                id: 1,
+                kind: CardKind::Output,
+                title: "Assistant".into(),
+                body: "satu paragraf panjang tanpa newline yang harus dibungkus beberapa kali"
+                    .into(),
+                status: None,
+                collapsed: false,
+            }],
+            ..Default::default()
+        };
+        let rows = wrapped_transcript(&model, 30);
+        assert!(rows.len() > 2, "the paragraph wraps: {}", rows.len());
+        for (line, _) in &rows {
+            let text = row_text(line);
+            assert!(
+                text.starts_with(THICK_BORDER),
+                "every wrapped row keeps the rail: {text:?}"
+            );
+            assert!(
+                UnicodeWidthStr::width(text.as_str()) <= 30,
+                "no row overruns the transcript: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_token_badge_survives_a_crowded_footer() {
+        let model = Model {
+            intro: false,
+            footer: "? help".into(),
+            queued_count: 3,
+            scroll_from_bottom: 42,
+            sidebar: Some(vec![("Model".into(), "some-very-long-model-name".into())]),
+            token_badge: Some(("9.9k tok 41%".into(), 41)),
+            ..Default::default()
+        };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 1,
+        };
+        let backend = ratatui::backend::TestBackend::new(60, 1);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                frame.render_widget(footer_widget(&model, area), area);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let row: String = (0..60).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(
+            row.contains("9.9k tok 41%"),
+            "the badge is pinned right, not clipped by the hints: {row:?}"
+        );
+        assert!(
+            row.trim_end().ends_with("9.9k tok 41%"),
+            "the badge sits at the right edge: {row:?}"
+        );
     }
 
     #[test]
