@@ -16,7 +16,8 @@ You can call tools to work in the repository:
 - read_image: decode a project image and attach it as native visual input (requires a vision-capable model).
 - grep: search file contents by regular expression across the project.
 - glob: find files by a glob pattern, e.g. \"src/**/*.rs\".
-- run_command: run a shell command (the user must approve it before it runs).
+- run_command: run a shell command (the user must approve it before it runs), primarily for
+  builds, tests, and other commands that must execute a program.
 - patch_file: create or edit one file by exact-text replacement (the user must approve it).
 - update_plan: declare or replace the checklist for a multi-step task, shown live to the user.
 - spawn_agent: delegate a self-contained, read-only exploration task to an isolated sub-agent.
@@ -27,11 +28,14 @@ update_plan, ask_user, search_code, and spawn_agent are available until the user
 the plan. Propose the full checklist with update_plan (all pending) and wait for approval \
 before using run_command or patch_file.
 
-Use tools to gather real information instead of guessing. Read a file before you answer questions \
-about it or edit it. To change code, read the target first, then call patch_file with an old_text \
-that occurs exactly once; prefer the smallest correct change and keep the surrounding style. Use \
-run_command for builds and tests. Prefer grep/glob over run_command with shell grep/find/ls for \
-locating code or files — they are faster, need no approval, and already respect .gitignore. For \
+Use tools to gather real information instead of guessing. For repository inspection, prefer the \
+read-only tools: use glob to locate files, grep to search their contents, and read_file to read \
+the relevant files. These are faster, need no approval, and already respect .gitignore. Do not use \
+run_command for file reading or repository searching; specifically avoid shell cat, sed, grep, find, \
+and ls when read_file, grep, or glob can do the job. Read a file before you answer questions about \
+it or edit it. To change code, read the target first, then call patch_file with an old_text that \
+occurs exactly once; prefer the smallest correct change and keep the surrounding style. Use \
+run_command for builds, tests, and other necessary execution. For \
 tasks with three or more distinct steps, call update_plan with the full checklist before starting \
 and update it as you go, marking at most one step in_progress at a time; skip it for simple, \
 single-step requests. For a well-scoped, self-contained exploration question — \"find every place \
@@ -101,5 +105,19 @@ mod tests {
         );
         assert!(prompt.contains("Available skills"));
         assert!(prompt.find("tabs").unwrap() < prompt.find("Available skills").unwrap());
+    }
+
+    #[test]
+    fn repository_inspection_prefers_read_only_tools_over_shell_readers() {
+        let prompt = build(true, None, None);
+
+        assert!(prompt.contains("prefer the read-only tools"));
+        assert!(
+            prompt.contains("glob to locate files, grep to search their contents, and read_file")
+        );
+        assert!(prompt.contains("avoid shell cat, sed, grep, find, and ls"));
+        assert!(
+            prompt.contains("Use run_command for builds, tests, and other necessary execution")
+        );
     }
 }

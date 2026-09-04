@@ -473,33 +473,39 @@ polish: users hit these before they ever need a design system or batch-approval 
 
 ### Session and commands
 
-- [ ] `/resume` with no id opens the session picker (same path as Ctrl+S / `/sessions`)
-- [ ] Accept unambiguous prefixes such as `/sess` → `/sessions` (and keep “did you mean” for
-      ambiguous typos)
-- [ ] Model picker lists every configured profile, not only the active/default entry
+- [x] `/resume` with no id opens the session picker (same path as Ctrl+S / `/sessions`)
+- [x] Accept unambiguous prefixes such as `/sess` → `/sessions` (and keep “did you mean” for
+       ambiguous typos)
+- [x] Model picker lists every configured profile, not only the active/default entry
 
 ### Plan Mode and live input
 
-- [ ] One clear approve path: after the user approves (permission modal or an explicit `approve`),
-      do not leave them in “plan not approved — still in Plan Mode” and ask again
-- [ ] Short control replies typed while a turn is running (`approve`, mode status, stop intents)
-      must not silently land in the Enter-queue as ordinary chat; consume them or surface that they
-      queued
-- [ ] Sidebar / notices must agree on mode (`plan` vs `build`) the moment approval lands
+- [x] One clear approve path: after the user approves (permission modal or an explicit `approve`),
+       do not leave them in “plan not approved — still in Plan Mode” and ask again
+- [x] Short control replies typed while a turn is running (`approve`, mode status, stop intents)
+       must not silently land in the Enter-queue as ordinary chat; consume them or surface that they
+       queued
+- [x] Sidebar / notices must agree on mode (`plan` vs `build`) the moment approval lands
 
 ### Editor and agent habits
 
-- [ ] `@`-file / directory completion popup in the fullscreen editor (Phase 7 deferred item;
-      still the highest-value TUI completion gap)
-- [ ] Prefer built-in `read_file` / `grep` / `glob` over `run_command`+`sed` for reading project
-      files (prompt/tool guidance), so dogfooding turns stay short
+- [x] `@`-file / directory completion popup in the fullscreen editor (Phase 7 deferred item;
+       still the highest-value TUI completion gap)
+- [x] Prefer built-in `read_file` / `grep` / `glob` over `run_command`+`sed` for reading project
+       files (prompt/tool guidance), so dogfooding turns stay short
 
 ### Image / multimodal (shipped basis)
 
 - [x] Explicit `read_image` tool alongside `@image` / `@clipboard` context input
 - [x] Defer vision `user` attachments until after every contiguous `tool` result in the batch
-      (fixes upstream 400 `No tool call found for function call output with call_id …` on
-      OpenAI-compatible / Orvix Coding)
+       (fixes upstream 400 `No tool call found for function call output with call_id …` on
+       OpenAI-compatible / Orvix Coding)
+
+### Interactive navigation
+
+- [x] Clickable autocomplete rows, picker rows, approval options, and `ask_user` choices
+- [x] Contextual mouse-wheel navigation for overlays, dialogs, autocomplete, and transcript
+- [x] Modal click-through prevention and bounded transcript click targets
 
 ## OpenCode-inspired TUI direction
 

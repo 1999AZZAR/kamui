@@ -14,7 +14,7 @@ use crate::storage::{Database, Session};
 use crate::terminal::{Style, Ui};
 use crate::tools;
 use crate::tools::ToolRegistry;
-use crate::ui::{ChatUi, HubEvent, InputHub};
+use crate::ui::{self, ChatUi, HubEvent, InputHub};
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
 use dialoguer::console::Term;
@@ -86,19 +86,11 @@ where
     let mut hub = chat_ui.screen_handle().map(InputHub::spawn);
     let interrupt = hub.as_ref().map(|h| h.interrupt.clone());
     if let Some(hub) = hub.as_ref() {
-        hub.set_models(
-            config
-                .profiles
-                .iter()
-                .map(|profile| {
-                    (
-                        profile.name.clone(),
-                        format!("{} · {}", profile.name, profile.model),
-                    )
-                })
-                .collect(),
-        );
+        refresh_model_source(&config, hub);
         refresh_session_source(database, hub);
+        if let Ok(candidates) = project.at_path_candidates() {
+            hub.set_path_candidates(candidates);
+        }
     }
     let ui = Ui::stdio();
     let mcp_sidebar = mcp_sidebar_value(&mcp_statuses);
@@ -220,6 +212,32 @@ where
                 plan_json: Some(json),
             })
         });
+    if let Some(state) = plan_mode.as_ref() {
+        mode = if state.status == PlanStatus::Pending {
+            Mode::Plan
+        } else {
+            Mode::Build
+        };
+        auto_approve = false;
+        update_sidebar(
+            &mut chat_ui,
+            session.as_ref(),
+            &model_label(&active),
+            mode.label(),
+            env!("CARGO_PKG_VERSION"),
+            project,
+            &mcp_sidebar,
+            None,
+            None,
+            context_window,
+            active.send_session_id,
+            session
+                .as_ref()
+                .and_then(|s| session_cache_line(database, &s.id)),
+            None,
+            None,
+        );
+    }
     if let Some(state) = plan_mode.as_ref()
         && state.status == PlanStatus::Pending
         && let Some(json) = state.plan_json.as_deref()
@@ -413,6 +431,14 @@ where
         }
         if expanded.is_none() && input.starts_with('/') {
             let (command, argument) = input.split_once(' ').unwrap_or((input, ""));
+            let command = match resolve_builtin_command(command) {
+                Ok(command) => command,
+                Err(message) => {
+                    chat_ui.notice(&format!("{message:#}"))?;
+                    continue;
+                }
+            };
+            let canonical_input = format!("{command} {}", argument.trim());
             // Open a cell headed by the command so its output is attributed to it rather than
             // merging into the flat run of status lines that used to sit below every card.
             chat_ui.command_echo(input)?;
@@ -516,6 +542,16 @@ where
                 // A concrete name: fall through to handle_command's direct switch.
             }
             if command == "/sessions" && use_tui {
+                let opened = hub
+                    .as_ref()
+                    .map(|h| h.open_sessions_dialog())
+                    .unwrap_or(false);
+                if !opened {
+                    chat_ui.notice("No saved sessions yet.")?;
+                }
+                continue;
+            }
+            if command == "/resume" && argument.trim().is_empty() && use_tui {
                 let opened = hub
                     .as_ref()
                     .map(|h| h.open_sessions_dialog())
@@ -855,6 +891,26 @@ where
             }
             if command == "/plan" {
                 plan_requested = true;
+                mode = Mode::Plan;
+                auto_approve = false;
+                update_sidebar(
+                    &mut chat_ui,
+                    session.as_ref(),
+                    &model_label(&active),
+                    mode.label(),
+                    env!("CARGO_PKG_VERSION"),
+                    project,
+                    &mcp_sidebar,
+                    None,
+                    None,
+                    context_window,
+                    active.send_session_id,
+                    session
+                        .as_ref()
+                        .and_then(|s| session_cache_line(database, &s.id)),
+                    None,
+                    None,
+                );
                 chat_ui.notice("Plan Mode requested — next turn will require a plan.")?;
                 continue;
             }
@@ -912,7 +968,7 @@ where
             }
             let tui_sink = if use_tui { Some(&mut chat_ui) } else { None };
             if let Err(error) = handle_command(
-                input,
+                &canonical_input,
                 provider.as_ref(),
                 context_window,
                 database,
@@ -979,6 +1035,33 @@ where
                     {
                         chat_ui.notice(&format!("Plan Mode — pending plan\n{rendered}"))?;
                     }
+                    mode = if plan_mode
+                        .as_ref()
+                        .is_some_and(|state| state.status == PlanStatus::Pending)
+                    {
+                        Mode::Plan
+                    } else {
+                        Mode::Build
+                    };
+                    auto_approve = false;
+                    update_sidebar(
+                        &mut chat_ui,
+                        session.as_ref(),
+                        &model_label(&active),
+                        mode.label(),
+                        env!("CARGO_PKG_VERSION"),
+                        project,
+                        &mcp_sidebar,
+                        None,
+                        None,
+                        context_window,
+                        active.send_session_id,
+                        session
+                            .as_ref()
+                            .and_then(|s| session_cache_line(database, &s.id)),
+                        None,
+                        None,
+                    );
                 } else {
                     plan_mode = None;
                     plan_requested = false;
@@ -1028,6 +1111,8 @@ where
         let should_enter_plan =
             plan_requested || (plan_mode.is_none() && looks_like_multi_step(input));
         if should_enter_plan && active.tools {
+            mode = Mode::Plan;
+            auto_approve = false;
             plan_mode = Some(PlanModeState {
                 status: PlanStatus::Pending,
                 plan_json: None,
@@ -1037,6 +1122,24 @@ where
                 let _ = database.set_plan(&session.id, "{}", "pending");
             }
             chat_ui.notice("Plan Mode — only read-only tools + update_plan until approved")?;
+            update_sidebar(
+                &mut chat_ui,
+                session.as_ref(),
+                &model_label(&active),
+                mode.label(),
+                env!("CARGO_PKG_VERSION"),
+                project,
+                &mcp_sidebar,
+                None,
+                None,
+                context_window,
+                active.send_session_id,
+                session
+                    .as_ref()
+                    .and_then(|s| session_cache_line(database, &s.id)),
+                None,
+                None,
+            );
         } else if plan_requested {
             plan_requested = false;
         }
@@ -1183,6 +1286,42 @@ where
                     queued.push(line);
                 }
                 for line in queued {
+                    if plan_mode
+                        .as_ref()
+                        .is_some_and(|state| state.status == PlanStatus::Pending)
+                        && is_plan_approval(&line)
+                    {
+                        if let Some(state) = plan_mode.as_mut() {
+                            state.status = PlanStatus::Approved;
+                            if let Some(session) = session.as_ref()
+                                && let Some(json) = state.plan_json.as_deref()
+                            {
+                                let _ = database.set_plan(&session.id, json, "approved");
+                            }
+                        }
+                        mode = Mode::Build;
+                        auto_approve = false;
+                        chat_ui.notice("plan approved — gate open for this session")?;
+                        update_sidebar(
+                            &mut chat_ui,
+                            session.as_ref(),
+                            &model_label(&active),
+                            mode.label(),
+                            env!("CARGO_PKG_VERSION"),
+                            project,
+                            &mcp_sidebar,
+                            None,
+                            None,
+                            context_window,
+                            active.send_session_id,
+                            session
+                                .as_ref()
+                                .and_then(|s| session_cache_line(database, &s.id)),
+                            None,
+                            None,
+                        );
+                        continue;
+                    }
                     if line.trim_start().starts_with('/') {
                         hub.push_prompt(line);
                         continue;
@@ -1485,12 +1624,32 @@ where
                             status: PlanStatus::Pending,
                             plan_json: None,
                         });
+                        mode = Mode::Plan;
+                        auto_approve = false;
                         if let Some(session) = session.as_ref() {
                             let _ = database.set_plan(&session.id, "{}", "pending");
                         }
                         chat_ui.notice(
                             "Plan Mode — only read-only tools + update_plan until approved",
                         )?;
+                        update_sidebar(
+                            &mut chat_ui,
+                            session.as_ref(),
+                            &model_label(&active),
+                            mode.label(),
+                            env!("CARGO_PKG_VERSION"),
+                            project,
+                            &mcp_sidebar,
+                            None,
+                            None,
+                            context_window,
+                            active.send_session_id,
+                            session
+                                .as_ref()
+                                .and_then(|s| session_cache_line(database, &s.id)),
+                            None,
+                            None,
+                        );
                         break;
                     }
                 }
@@ -1532,7 +1691,7 @@ where
                         )
                         .unwrap_or_default();
                         let answer = tokio::select! {
-                            answer = read_approval_line(&mut input_rx, use_tui, hub.as_mut(), plan_title, plan_body) => answer,
+                             answer = read_plan_approval_line(&mut input_rx, use_tui, hub.as_mut(), plan_title, plan_body) => answer,
                         () = wait_interrupt(&interrupt) => None,
                             signal = tokio::signal::ctrl_c() => {
                                 signal.context("failed to listen for Ctrl+C")?;
@@ -1541,10 +1700,7 @@ where
                                 continue 'chat;
                             }
                         };
-                        let approved = matches!(
-                            answer.as_deref().map(str::trim),
-                            Some("y" | "Y" | "yes" | "Yes")
-                        );
+                        let approved = answer.as_deref().is_some_and(is_plan_approval);
                         if approved {
                             if let Some(state) = plan_mode.as_mut() {
                                 state.status = PlanStatus::Approved;
@@ -1555,6 +1711,26 @@ where
                                 }
                             }
                             chat_ui.notice("plan approved — gate open for this session")?;
+                            mode = Mode::Build;
+                            auto_approve = false;
+                            update_sidebar(
+                                &mut chat_ui,
+                                session.as_ref(),
+                                &model_label(&active),
+                                mode.label(),
+                                env!("CARGO_PKG_VERSION"),
+                                project,
+                                &mcp_sidebar,
+                                None,
+                                None,
+                                context_window,
+                                active.send_session_id,
+                                session
+                                    .as_ref()
+                                    .and_then(|s| session_cache_line(database, &s.id)),
+                                None,
+                                None,
+                            );
                         } else {
                             chat_ui.notice(
                                 "plan not approved — still in Plan Mode; propose a revised plan",
@@ -1721,9 +1897,7 @@ where
                             ),
                             vec![image],
                         ),
-                        Err(error) => {
-                            Message::user(format!("Image attachment failed: {error:#}"))
-                        }
+                        Err(error) => Message::user(format!("Image attachment failed: {error:#}")),
                     });
                 }
             }
@@ -2516,6 +2690,36 @@ fn nearest_command(typed: &str) -> Option<&'static str> {
         .filter(|(distance, _)| *distance <= 2)
         .min_by_key(|(distance, name)| (*distance, name.len()))
         .map(|(_, name)| name)
+}
+
+fn resolve_builtin_command(command: &str) -> Result<String> {
+    if !command.starts_with('/') {
+        return Ok(command.to_string());
+    }
+    let needle = command[1..].to_ascii_lowercase();
+    if let Some((name, _)) = crate::tui::BUILTINS
+        .iter()
+        .find(|(name, _)| *name == needle)
+    {
+        return Ok(format!("/{name}"));
+    }
+    let matches: Vec<&str> = crate::tui::BUILTINS
+        .iter()
+        .filter(|(name, _)| name.starts_with(&needle))
+        .map(|(name, _)| *name)
+        .collect();
+    match matches.as_slice() {
+        [name] => Ok(format!("/{name}")),
+        [] => Ok(command.to_string()),
+        _ => anyhow::bail!(
+            "Ambiguous command \"{command}\". Choose one of: {}",
+            matches
+                .iter()
+                .map(|name| format!("/{name}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 /// Levenshtein distance over chars, two rows at a time. Only ever run against the short
@@ -3574,6 +3778,31 @@ async fn read_approval_line(
     } else {
         input_rx.as_mut().unwrap().recv().await
     }
+}
+
+async fn read_plan_approval_line(
+    input_rx: &mut Option<mpsc::UnboundedReceiver<String>>,
+    use_tui: bool,
+    hub: Option<&mut InputHub>,
+    title: &str,
+    body: String,
+) -> Option<String> {
+    if use_tui {
+        let hub = hub.expect("tui implies hub");
+        hub.open_permission_modal_with_options(title, body, ui::PLAN_OPTIONS.to_vec());
+        let answer = hub.request_line().await;
+        hub.close_permission_modal();
+        answer
+    } else {
+        input_rx.as_mut().unwrap().recv().await
+    }
+}
+
+fn is_plan_approval(answer: &str) -> bool {
+    matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes" | "approve" | "approved"
+    )
 }
 
 async fn ask_user(

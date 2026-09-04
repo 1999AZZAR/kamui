@@ -284,14 +284,14 @@ pub const PERM_OPTIONS: [(&str, &str); 3] = [
     ("a", "Always allow this session"),
     ("n", "Reject"),
 ];
+pub const PLAN_OPTIONS: [(&str, &str); 2] = [("approve", "Approve and build"), ("n", "Reject")];
 
-fn perm_hotkey(ch: char) -> Option<&'static str> {
-    match ch.to_ascii_lowercase() {
-        'y' => Some("y"),
-        'a' => Some("a"),
-        'n' => Some("n"),
-        _ => None,
-    }
+fn permission_hotkey(options: &[(&'static str, &'static str)], ch: char) -> Option<&'static str> {
+    let ch = ch.to_ascii_lowercase();
+    options
+        .iter()
+        .find(|(key, _)| key.starts_with(ch) || (ch == 'y' && *key == "approve"))
+        .map(|(key, _)| *key)
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +303,7 @@ pub struct PermissionState {
     /// cut at ten rows with nothing saying so -- you were being asked to authorise a change you
     /// could not finish reading.
     pub scroll: usize,
+    pub options: Vec<(&'static str, &'static str)>,
 }
 
 /// Clarifying question from the model (`ask_user`), rendered as a modal like permission.
@@ -389,6 +390,9 @@ struct FullScreen {
     /// Terminal row -> card id from the most recent draw, so a mouse click can find the card
     /// under the pointer.
     last_card_rows: Vec<(u16, u64)>,
+    /// Bounded interactive regions from the most recent draw. Later entries sit above earlier
+    /// ones, matching the order widgets are painted.
+    last_hits: Vec<HitRegion>,
     /// Transcript width and height from the last draw. Search re-wraps the transcript exactly
     /// as the renderer did, so the row it scrolls to is the row the user will see.
     last_transcript_width: u16,
@@ -448,6 +452,7 @@ impl FullScreen {
             model,
             last_viewport_rows: 0,
             last_card_rows: Vec::new(),
+            last_hits: Vec::new(),
             last_transcript_width: 0,
             next_card_id: 0,
             restored: false,
@@ -467,6 +472,7 @@ impl FullScreen {
         })?;
         self.last_viewport_rows = info.viewport_rows;
         self.last_card_rows = info.card_rows;
+        self.last_hits = info.hits;
         self.last_transcript_width = info.transcript_width;
         Ok(())
     }
@@ -800,6 +806,33 @@ impl FullScreen {
             self.model.cards.drain(..keep_from);
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HitTarget {
+    Card(u64),
+    Autocomplete(usize),
+    Dialog(usize),
+    Permission(usize),
+    Ask(usize),
+    Overlay,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HitRegion {
+    area: Rect,
+    target: HitTarget,
+}
+
+fn point_in(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
+}
+
+fn hit_at(hits: &[HitRegion], column: u16, row: u16) -> Option<HitTarget> {
+    hits.iter()
+        .rev()
+        .find(|hit| point_in(hit.area, column, row))
+        .map(|hit| hit.target.clone())
 }
 
 impl FullScreen {
@@ -1262,6 +1295,7 @@ pub struct InputHub {
     screen: ScreenHandle,
     models_src: Arc<std::sync::RwLock<Vec<(String, String)>>>,
     sessions_src: Arc<std::sync::RwLock<Vec<(String, String)>>>,
+    path_candidates: Arc<std::sync::RwLock<Vec<String>>>,
 }
 
 impl InputHub {
@@ -1277,6 +1311,7 @@ impl InputHub {
         let candidates = Arc::new(std::sync::RwLock::new(Vec::new()));
         let models_src = Arc::new(std::sync::RwLock::new(Vec::new()));
         let sessions_src = Arc::new(std::sync::RwLock::new(Vec::new()));
+        let path_candidates = Arc::new(std::sync::RwLock::new(Vec::new()));
         std::thread::spawn({
             let interrupt = interrupt.clone();
             let busy = busy.clone();
@@ -1285,6 +1320,7 @@ impl InputHub {
             let candidates = candidates.clone();
             let models_src = models_src.clone();
             let sessions_src = sessions_src.clone();
+            let path_candidates = path_candidates.clone();
             move || {
                 input_thread(
                     screen,
@@ -1296,6 +1332,7 @@ impl InputHub {
                     candidates,
                     models_src,
                     sessions_src,
+                    path_candidates,
                 )
             }
         });
@@ -1309,6 +1346,7 @@ impl InputHub {
             screen: hub_screen,
             models_src,
             sessions_src,
+            path_candidates,
         }
     }
 
@@ -1316,6 +1354,13 @@ impl InputHub {
     pub fn set_candidates(&self, candidates: Vec<crate::tui::Candidate>) {
         *self
             .candidates
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = candidates;
+    }
+
+    pub fn set_path_candidates(&self, candidates: Vec<String>) {
+        *self
+            .path_candidates
             .write()
             .unwrap_or_else(PoisonError::into_inner) = candidates;
     }
@@ -1453,6 +1498,15 @@ impl InputHub {
 
     /// Opens/closes the approval modal from the keyboard-thread side.
     pub fn open_permission_modal(&self, title: &str, body: String) {
+        self.open_permission_modal_with_options(title, body, PERM_OPTIONS.to_vec());
+    }
+
+    pub fn open_permission_modal_with_options(
+        &self,
+        title: &str,
+        body: String,
+        options: Vec<(&'static str, &'static str)>,
+    ) {
         {
             let mut s = lock_screen(&self.screen.0);
             s.model.permission = Some(PermissionState {
@@ -1460,6 +1514,7 @@ impl InputHub {
                 body,
                 selected: 0,
                 scroll: 0,
+                options,
             });
         }
         let _ = self.screen.draw_now();
@@ -1797,7 +1852,7 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
         ));
     }
     lines.push(Line::from(""));
-    for (idx, (hotkey, label)) in PERM_OPTIONS.iter().enumerate() {
+    for (idx, (hotkey, label)) in perm.options.iter().enumerate() {
         let is_on = idx == perm.selected;
         let prefix = if is_on { "\u{276f} " } else { "  " };
         lines.push(Line::from(vec![
@@ -2048,6 +2103,7 @@ fn input_thread(
     candidates: Arc<std::sync::RwLock<Vec<crate::tui::Candidate>>>,
     models_src: Arc<std::sync::RwLock<Vec<(String, String)>>>,
     sessions_src: Arc<std::sync::RwLock<Vec<(String, String)>>>,
+    path_candidates: Arc<std::sync::RwLock<Vec<String>>>,
 ) {
     let mut buf = String::new();
     // Caret as a byte offset into `buf`. Editing used to be append-and-backspace only: a typo
@@ -2080,6 +2136,25 @@ fn input_thread(
             .map(|c| (c.name.clone(), c.description.clone()))
             .collect()
     };
+    let path_items_for = |needle: &str| -> Vec<(String, String)> {
+        path_candidates
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|path| path.to_ascii_lowercase().starts_with(needle))
+            .map(|path| {
+                let description = if path.ends_with('/') {
+                    "directory"
+                } else {
+                    "file"
+                };
+                (
+                    path.trim_start_matches('@').to_string(),
+                    description.to_string(),
+                )
+            })
+            .collect()
+    };
 
     sync(&screen, "", 0, 0, Vec::new());
     // Feed loop: the wheel scrolls right here; only key presses fall through to the editor.
@@ -2103,7 +2178,10 @@ fn input_thread(
                         }
                         let is_slash =
                             buf.trim_start().starts_with('/') && !buf.trim_start().contains(' ');
-                        let items = if is_slash {
+                        let at = crate::context::active_at_reference(&buf, caret);
+                        let items = if let Some(reference) = at {
+                            path_items_for(&reference.query)
+                        } else if is_slash {
                             items_for(&needle_of(&buf))
                         } else {
                             Vec::new()
@@ -2112,15 +2190,143 @@ fn input_thread(
                     }
                 }
                 Ok(Event::Mouse(mouse)) => match mouse.kind {
-                    MouseEventKind::ScrollUp => scroll_screen(&screen, 3),
-                    MouseEventKind::ScrollDown => scroll_screen(&screen, -3),
-                    // Click-to-expand: the row map from the last draw resolves the pointer to
-                    // a card id, so folds open without leaving the mouse.
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                            -1
+                        } else {
+                            1
+                        };
+                        let mut s = lock_screen(&screen.0);
+                        if let Some(perm) = s.model.permission.as_mut() {
+                            if delta < 0 {
+                                perm.scroll = perm.scroll.saturating_sub(3);
+                            } else {
+                                perm.scroll += 3;
+                            }
+                        } else if s.model.ask.is_some() {
+                            // The ask panel has no scrollable body; consume the wheel so it cannot
+                            // move the transcript behind the modal.
+                        } else if s.model.help_visible {
+                            if delta < 0 {
+                                s.model.help_scroll = s.model.help_scroll.saturating_sub(1);
+                            } else {
+                                s.model.help_scroll += 1;
+                            }
+                        } else if let Some(dialog) = s.model.dialog.as_mut() {
+                            let total = dialog.filtered().len();
+                            if total > 0 {
+                                dialog.selected = if delta < 0 {
+                                    dialog.selected.saturating_sub(1)
+                                } else {
+                                    (dialog.selected + 1).min(total - 1)
+                                };
+                            }
+                        } else if !s.model.ac_items.is_empty() {
+                            let total = s.model.ac_items.len();
+                            selected = if delta < 0 {
+                                selected.saturating_sub(1)
+                            } else {
+                                (selected + 1).min(total - 1)
+                            };
+                            s.model.ac_selected = selected;
+                        } else {
+                            drop(s);
+                            scroll_screen(&screen, if delta < 0 { 3 } else { -3 });
+                            continue 'keys;
+                        }
+                        let _ = s.draw();
+                    }
                     MouseEventKind::Down(MouseButton::Left) => {
-                        let _ = lock_screen(&screen.0).toggle_card_at_row(mouse.row);
+                        let target = {
+                            let s = lock_screen(&screen.0);
+                            hit_at(&s.last_hits, mouse.column, mouse.row)
+                        };
+                        match target {
+                            Some(HitTarget::Card(_)) => {
+                                let _ = lock_screen(&screen.0).toggle_card_at_row(mouse.row);
+                            }
+                            Some(HitTarget::Autocomplete(index)) => {
+                                let choice =
+                                    lock_screen(&screen.0).model.ac_items.get(index).cloned();
+                                if let Some((value, _)) = choice {
+                                    if let Some(reference) =
+                                        crate::context::active_at_reference(&buf, caret)
+                                    {
+                                        let replacement = format!("@{value}");
+                                        buf.replace_range(
+                                            reference.replacement.clone(),
+                                            &replacement,
+                                        );
+                                        caret = reference.replacement.start + replacement.len();
+                                    } else {
+                                        buf = format!("/{value} ");
+                                        caret = buf.len();
+                                    }
+                                    selected = 0;
+                                    sync(&screen, &buf, caret, selected, Vec::new());
+                                }
+                            }
+                            Some(HitTarget::Dialog(index)) => {
+                                let line = {
+                                    let mut s = lock_screen(&screen.0);
+                                    let picked = s.model.dialog.as_ref().and_then(|dialog| {
+                                        dialog
+                                            .filtered()
+                                            .get(index)
+                                            .map(|(value, _)| format!("{}{}", dialog.prefix, value))
+                                    });
+                                    if picked.is_some() {
+                                        s.model.dialog = None;
+                                    }
+                                    picked
+                                };
+                                if let Some(line) = line {
+                                    submit_line(
+                                        &screen, &tx, &requester, &busy, &interrupt, &queue, line,
+                                    );
+                                }
+                            }
+                            Some(HitTarget::Permission(index)) => {
+                                let answer = lock_screen(&screen.0)
+                                    .model
+                                    .permission
+                                    .as_ref()
+                                    .and_then(|p| p.options.get(index))
+                                    .map(|(key, _)| (*key).to_string())
+                                    .unwrap_or_else(|| "n".to_string());
+                                lock_screen(&screen.0).model.permission = None;
+                                if let Some(answer_tx) = requester
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .take()
+                                {
+                                    let _ = answer_tx.send(answer);
+                                }
+                            }
+                            Some(HitTarget::Ask(index)) => {
+                                lock_screen(&screen.0).model.ask = None;
+                                if let Some(answer_tx) = requester
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .take()
+                                {
+                                    let _ = answer_tx.send((index + 1).to_string());
+                                }
+                            }
+                            Some(HitTarget::Overlay) | None => {}
+                        }
                     }
                     MouseEventKind::Down(MouseButton::Right) => {
-                        let _ = lock_screen(&screen.0).copy_card_at_row(mouse.row);
+                        let is_card = {
+                            let s = lock_screen(&screen.0);
+                            matches!(
+                                hit_at(&s.last_hits, mouse.column, mouse.row),
+                                Some(HitTarget::Card(_))
+                            )
+                        };
+                        if is_card {
+                            let _ = lock_screen(&screen.0).copy_card_at_row(mouse.row);
+                        }
                     }
                     _ => {}
                 },
@@ -2147,10 +2353,10 @@ fn input_thread(
                         perm.selected = perm
                             .selected
                             .checked_sub(1)
-                            .unwrap_or(PERM_OPTIONS.len() - 1);
+                            .unwrap_or(perm.options.len().saturating_sub(1));
                     }
                     KeyCode::Down => {
-                        perm.selected = (perm.selected + 1) % PERM_OPTIONS.len();
+                        perm.selected = (perm.selected + 1) % perm.options.len().max(1);
                     }
                     // Up/Down belong to the options, so the body pages instead.
                     KeyCode::PageUp => {
@@ -2160,7 +2366,7 @@ fn input_thread(
                         perm.scroll += 5;
                     }
                     KeyCode::Enter => {
-                        let answer = PERM_OPTIONS[perm.selected.min(PERM_OPTIONS.len() - 1)]
+                        let answer = perm.options[perm.selected.min(perm.options.len() - 1)]
                             .0
                             .to_string();
                         s.model.permission = None;
@@ -2175,7 +2381,7 @@ fn input_thread(
                         continue;
                     }
                     KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if let Some(answer) = perm_hotkey(c) {
+                        if let Some(answer) = permission_hotkey(&perm.options, c) {
                             s.model.permission = None;
                             drop(s);
                             if let Some(tx) = requester
@@ -2329,7 +2535,7 @@ fn input_thread(
                             let line = format!("{}{}", dialog.prefix, value);
                             s.model.dialog = None;
                             drop(s);
-                            submit_line(&screen, &tx, &requester, &busy, &queue, line);
+                            submit_line(&screen, &tx, &requester, &busy, &interrupt, &queue, line);
                             continue;
                         }
                     }
@@ -2437,6 +2643,7 @@ fn input_thread(
         }
 
         let is_slash = buf.trim_start().starts_with('/') && !buf.trim_start().contains(' ');
+        let active_at = crate::context::active_at_reference(&buf, caret);
         let needle = buf
             .trim_start()
             .trim_start_matches('/')
@@ -2448,7 +2655,12 @@ fn input_thread(
         }
         match key.code {
             KeyCode::Up => {
-                if is_slash {
+                if let Some(reference) = active_at.as_ref() {
+                    let total = path_items_for(&reference.query).len();
+                    if total > 0 {
+                        selected = selected.checked_sub(1).unwrap_or(total - 1);
+                    }
+                } else if is_slash {
                     let total = filtered_len(&candidates, &needle);
                     if total > 0 {
                         selected = selected.checked_sub(1).unwrap_or(total - 1);
@@ -2466,7 +2678,12 @@ fn input_thread(
                 }
             }
             KeyCode::Down => {
-                if is_slash {
+                if let Some(reference) = active_at.as_ref() {
+                    let total = path_items_for(&reference.query).len();
+                    if total > 0 {
+                        selected = (selected + 1) % total;
+                    }
+                } else if is_slash {
                     let total = filtered_len(&candidates, &needle);
                     if total > 0 {
                         selected = (selected + 1) % total;
@@ -2485,7 +2702,14 @@ fn input_thread(
                 }
             }
             KeyCode::Tab => {
-                if is_slash {
+                if let Some(reference) = active_at.as_ref()
+                    && let Some(choice) = path_items_for(&reference.query).get(selected)
+                {
+                    let replacement = format!("@{}", choice.0);
+                    buf.replace_range(reference.replacement.clone(), &replacement);
+                    caret = reference.replacement.start + replacement.len();
+                    selected = 0;
+                } else if is_slash {
                     let all = items_for(&needle);
                     if let Some(choice) = all.get(selected) {
                         buf = format!("/{} ", choice.0);
@@ -2500,6 +2724,7 @@ fn input_thread(
                         &tx,
                         &requester,
                         &busy,
+                        &interrupt,
                         &queue,
                         "/mode next".to_string(),
                     );
@@ -2511,6 +2736,7 @@ fn input_thread(
                     &tx,
                     &requester,
                     &busy,
+                    &interrupt,
                     &queue,
                     "/mode prev".to_string(),
                 );
@@ -2590,6 +2816,16 @@ fn input_thread(
                     sync(&screen, &buf, caret, selected, Vec::new());
                     continue 'keys;
                 }
+                if let Some(reference) = active_at.as_ref()
+                    && let Some(choice) = path_items_for(&reference.query).get(selected)
+                {
+                    let replacement = format!("@{}", choice.0);
+                    buf.replace_range(reference.replacement.clone(), &replacement);
+                    caret = reference.replacement.start + replacement.len();
+                    selected = 0;
+                    sync(&screen, &buf, caret, selected, Vec::new());
+                    continue 'keys;
+                }
                 // Slash menu open with a match: Enter accepts the highlighted
                 // candidate and submits it, so `/mo` + Enter runs `/model`
                 // without a Tab stop first. Exact buffer wins: typing the full
@@ -2614,7 +2850,7 @@ fn input_thread(
                     }
                     history_idx = history.len();
                 }
-                submit_line(&screen, &tx, &requester, &busy, &queue, line);
+                submit_line(&screen, &tx, &requester, &busy, &interrupt, &queue, line);
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 scroll_screen(&screen, -(page_rows(&screen) / 2));
@@ -2687,11 +2923,14 @@ fn input_thread(
         // closes it (filtering with an empty needle would otherwise match every candidate
         // and leave the helper stuck open).
         let is_slash_now = buf.trim_start().starts_with('/') && !buf.trim_start().contains(' ');
-        let (items, selected) = if is_slash_now {
-            (items_for(&needle_of(&buf)), selected)
-        } else {
-            (Vec::new(), 0)
-        };
+        let (items, selected) =
+            if let Some(reference) = crate::context::active_at_reference(&buf, caret) {
+                (path_items_for(&reference.query), selected)
+            } else if is_slash_now {
+                (items_for(&needle_of(&buf)), selected)
+            } else {
+                (Vec::new(), 0)
+            };
         sync(&screen, &buf, caret, selected, items);
     }
 }
@@ -2703,11 +2942,27 @@ fn submit_line(
     tx: &tokio::sync::mpsc::UnboundedSender<HubEvent>,
     requester: &Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     busy: &Arc<std::sync::atomic::AtomicBool>,
+    interrupt: &Arc<tokio::sync::Notify>,
     queue: &Arc<Mutex<VecDeque<String>>>,
     line: String,
 ) {
     if line.is_empty() {
         return;
+    }
+    let control = line.trim().to_ascii_lowercase();
+    if busy.load(std::sync::atomic::Ordering::SeqCst) {
+        if control == "stop" || control == "cancel" {
+            // Busy controls are consumed here rather than becoming queued prompts.
+            // The keyboard loop owns the interrupt notifier through `tx`'s companion path.
+            interrupt.notify_one();
+            return;
+        }
+        if control == "mode" || control == "mode?" || control == "status mode" {
+            let mut s = lock_screen(&screen.0);
+            let _ = s.add_notice("mode is controlled by the active chat turn".to_string());
+            let _ = s.draw();
+            return;
+        }
     }
     let answer_tx = requester
         .lock()
@@ -2763,6 +3018,35 @@ struct RenderInfo {
     viewport_rows: usize,
     card_rows: Vec<(u16, u64)>,
     transcript_width: u16,
+    hits: Vec<HitRegion>,
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+fn dialog_geometry(dialog: &DialogState, area: Rect) -> (Rect, usize, usize) {
+    let filtered = dialog.filtered();
+    let selected = dialog.selected.min(filtered.len().saturating_sub(1));
+    let width = 56.min(area.width.saturating_sub(4));
+    let wanted = filtered.len().clamp(1, DIALOG_VISIBLE);
+    let height = ((wanted + 4) as u16)
+        .min(area.height.saturating_sub(2))
+        .max(5);
+    let capacity = (height as usize).saturating_sub(4).max(1);
+    let start = if filtered.len() <= capacity {
+        0
+    } else {
+        selected
+            .saturating_sub(capacity / 2)
+            .min(filtered.len() - capacity)
+    };
+    (centered_rect(area, width, height), start, capacity)
 }
 
 fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
@@ -2821,6 +3105,7 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     let editor_area = left_rows[2];
 
     let mut card_rows: Vec<(u16, u64)> = Vec::new();
+    let mut hit_regions = Vec::new();
     let home = model.intro
         && model
             .cards
@@ -2860,7 +3145,12 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         }
         for (offset, (line, owner)) in shown.into_iter().enumerate() {
             if let Some(id) = owner {
-                card_rows.push((transcript_area.y + (pad + offset) as u16, id));
+                let row = transcript_area.y + (pad + offset) as u16;
+                card_rows.push((row, id));
+                hit_regions.push(HitRegion {
+                    area: Rect::new(transcript_area.x, row, transcript_area.width, 1),
+                    target: HitTarget::Card(id),
+                });
             }
             let absolute = start + offset;
             let line = if Some(absolute) == current_hit {
@@ -2884,6 +3174,26 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         frame.render_widget(search_widget(search), popup_area);
     } else if popup_height > 0 {
         frame.render_widget(popup_widget(model, popup_area), popup_area);
+        let total = model.ac_items.len();
+        let selected = model.ac_selected.min(total.saturating_sub(1));
+        let start = if total <= MENU_VISIBLE {
+            0
+        } else {
+            selected
+                .saturating_sub(MENU_VISIBLE / 2)
+                .min(total - MENU_VISIBLE)
+        };
+        for (row, index) in (start..total.min(start + MENU_VISIBLE)).enumerate() {
+            hit_regions.push(HitRegion {
+                area: Rect::new(
+                    popup_area.x + 1,
+                    popup_area.y + 2 + row as u16,
+                    popup_area.width.saturating_sub(2),
+                    1,
+                ),
+                target: HitTarget::Autocomplete(index),
+            });
+        }
     }
     frame.render_widget(editor_widget(model, editor_area), editor_area);
 
@@ -2914,6 +3224,10 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         || model.help_visible
         || model.dialog.is_some()
     {
+        hit_regions.push(HitRegion {
+            area: frame.area(),
+            target: HitTarget::Overlay,
+        });
         let whole = frame.area();
         frame
             .buffer_mut()
@@ -2921,15 +3235,69 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     }
     if let Some(perm) = &model.permission {
         render_permission(frame, perm, frame.area());
+        let width = 64.min(frame.area().width.saturating_sub(4));
+        let all_rows = wrap_display(&perm.body, width.saturating_sub(6) as usize);
+        let chrome = perm.options.len() + 5;
+        let capacity = (frame.area().height.saturating_sub(2).max(7) as usize)
+            .saturating_sub(chrome)
+            .max(1);
+        let body_rows = all_rows.len().saturating_sub(perm.scroll).min(capacity);
+        let height = ((body_rows + chrome) as u16)
+            .min(frame.area().height.saturating_sub(2))
+            .max(7);
+        let area = centered_rect(frame.area(), width, height);
+        let option_y = area.y + 1 + body_rows as u16 + u16::from(all_rows.len() > body_rows) + 1;
+        for index in 0..perm.options.len() {
+            hit_regions.push(HitRegion {
+                area: Rect::new(
+                    area.x + 1,
+                    option_y + index as u16,
+                    area.width.saturating_sub(2),
+                    1,
+                ),
+                target: HitTarget::Permission(index),
+            });
+        }
     }
     if let Some(ask) = &model.ask {
         render_ask(frame, ask, frame.area());
+        let width = 64.min(frame.area().width.saturating_sub(4));
+        let question_rows = wrap_display(&ask.question, width.saturating_sub(6) as usize).len();
+        let height = ((question_rows + ask.options.len() + 5) as u16)
+            .min(frame.area().height.saturating_sub(2))
+            .max(7);
+        let area = centered_rect(frame.area(), width, height);
+        let option_y = area.y + 1 + question_rows as u16 + 1;
+        for index in 0..ask.options.len() {
+            hit_regions.push(HitRegion {
+                area: Rect::new(
+                    area.x + 1,
+                    option_y + index as u16,
+                    area.width.saturating_sub(2),
+                    1,
+                ),
+                target: HitTarget::Ask(index),
+            });
+        }
     }
     if model.help_visible {
         render_help(frame, frame.area(), model.help_scroll);
     }
     if let Some(dialog) = &model.dialog {
         render_dialog(frame, dialog, frame.area());
+        let (area, start, capacity) = dialog_geometry(dialog, frame.area());
+        let end = dialog.filtered().len().min(start + capacity);
+        for (row, index) in (start..end).enumerate() {
+            hit_regions.push(HitRegion {
+                area: Rect::new(
+                    area.x + 1,
+                    area.y + 3 + row as u16,
+                    area.width.saturating_sub(2),
+                    1,
+                ),
+                target: HitTarget::Dialog(index),
+            });
+        }
     }
 
     RenderInfo {
@@ -2940,6 +3308,7 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         },
         card_rows,
         transcript_width: transcript_area.width,
+        hits: hit_regions,
     }
 }
 
@@ -4791,6 +5160,85 @@ mod tests {
     }
 
     #[test]
+    fn autocomplete_rows_are_bounded_click_targets() {
+        let model = Model {
+            intro: false,
+            input: "/m".into(),
+            input_caret: 2,
+            ac_items: vec![
+                ("model".into(), "switch model".into()),
+                ("memory".into(), "list memory".into()),
+            ],
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(60, 14);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut info = RenderInfo::default();
+        terminal
+            .draw(|frame| info = render(frame, &model))
+            .expect("draw");
+        let second = info
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::Autocomplete(1))
+            .expect("second completion");
+        assert_eq!(
+            hit_at(&info.hits, second.area.x, second.area.y),
+            Some(HitTarget::Autocomplete(1))
+        );
+        assert_ne!(
+            hit_at(&info.hits, second.area.right(), second.area.y),
+            Some(HitTarget::Autocomplete(1)),
+            "right edge is outside the bounded row"
+        );
+    }
+
+    #[test]
+    fn dialog_overlay_prevents_transcript_click_through() {
+        let model = Model {
+            intro: false,
+            cards: vec![Card {
+                id: 42,
+                kind: CardKind::Tool,
+                title: "tool".into(),
+                body: "one\ntwo".into(),
+                status: None,
+                collapsed: true,
+            }],
+            dialog: Some(DialogState::new(
+                "Pick",
+                "/model ",
+                vec![("fast".into(), "Fast".into())],
+            )),
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut info = RenderInfo::default();
+        terminal
+            .draw(|frame| info = render(frame, &model))
+            .expect("draw");
+        let card = info
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::Card(42))
+            .expect("card row");
+        assert_eq!(
+            hit_at(&info.hits, card.area.x, card.area.y),
+            Some(HitTarget::Overlay)
+        );
+        let dialog = info
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::Dialog(0))
+            .expect("dialog row");
+        assert_eq!(
+            hit_at(&info.hits, dialog.area.x, dialog.area.y),
+            Some(HitTarget::Dialog(0))
+        );
+    }
+
+    #[test]
     fn caret_lands_on_the_row_that_holds_the_typed_text() {
         // Reproduces the slash-menu report: with `/st` typed the caret sat one row below the
         // text and one column short of its end, because the block draws no top border and the
@@ -4920,6 +5368,7 @@ mod tests {
             body,
             selected: 0,
             scroll: 0,
+            options: PERM_OPTIONS.to_vec(),
         };
         let backend = ratatui::backend::TestBackend::new(80, 30);
         let mut terminal = Terminal::new(backend).expect("test terminal");

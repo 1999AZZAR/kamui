@@ -372,8 +372,9 @@ impl Tool for ReadFileTool {
         ToolDefinition {
             name: self.name().to_string(),
             description:
-                "Read a UTF-8 text file from the project. The path must be relative to the \
-                          project root, for example src/main.rs."
+                "Read a UTF-8 text file from the project. Prefer this for reading file contents \
+                          instead of using run_command with shell readers such as cat or sed. The \
+                          path must be relative to the project root, for example src/main.rs."
                     .to_string(),
             parameters: json!({
                 "type": "object",
@@ -645,10 +646,10 @@ impl Tool for GrepTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description:
-                "Search file contents in the project for a regular expression. Respects \
-                          .gitignore. Prefer this over run_command with grep/find for locating code."
-                    .to_string(),
+            description: "Search file contents in the project for a regular expression. Respects \
+                          .gitignore. Prefer this over run_command with shell grep/find for \
+                          locating code."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -761,7 +762,8 @@ impl Tool for GlobTool {
         ToolDefinition {
             name: self.name().to_string(),
             description: "Find project files by a glob pattern, e.g. \"src/**/*.rs\". Respects \
-                          .gitignore. Prefer this over run_command with find for locating files."
+                          .gitignore. Prefer this over run_command with shell find/ls for locating \
+                          files."
                 .to_string(),
             parameters: json!({
                 "type": "object",

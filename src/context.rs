@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use std::collections::HashSet;
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -29,6 +30,18 @@ pub struct Expanded {
 pub struct ProjectContext {
     root: PathBuf,
     instructions: Option<(String, String)>,
+}
+
+/// The `@` reference being edited at a byte-indexed caret position.
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ActiveAtReference {
+    /// Reference text without the leading `@` or surrounding quote.
+    pub query: String,
+    /// Byte range to replace with one value from `ProjectContext::at_path_candidates`.
+    pub replacement: Range<usize>,
+    /// The quote already used by the reference, if any.
+    pub quote: Option<char>,
 }
 
 impl ProjectContext {
@@ -74,6 +87,56 @@ impl ProjectContext {
                 "Follow the project instructions from {name} for this conversation:\n\n{content}"
             )
         })
+    }
+
+    /// Return insertion-ready `@` references for visible, non-ignored project files and
+    /// directories. Paths use `/` on every platform; directories end in `/` and paths containing
+    /// whitespace are double quoted. Named non-filesystem references are included as well.
+    #[allow(dead_code)]
+    pub fn at_path_candidates(&self) -> Result<Vec<String>> {
+        let mut candidates = vec![
+            "@clipboard".to_string(),
+            "@diff".to_string(),
+            "@staged".to_string(),
+        ];
+        let walker = ignore::WalkBuilder::new(&self.root)
+            .hidden(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .require_git(false)
+            .build();
+
+        for entry in walker {
+            let entry = entry.with_context(|| {
+                format!(
+                    "could not enumerate project paths in {}",
+                    self.root.display()
+                )
+            })?;
+            let Some(file_type) = entry.file_type() else {
+                continue;
+            };
+            if entry.depth() == 0 || file_type.is_symlink() {
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(&self.root)
+                .expect("walked project entry is below its root");
+            let mut reference = relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            if file_type.is_dir() {
+                reference.push('/');
+            }
+            candidates.push(format_at_reference(&reference));
+        }
+
+        candidates.sort();
+        Ok(candidates)
     }
 
     pub fn expand_file_references(&self, input: &str) -> Result<Expanded> {
@@ -179,6 +242,62 @@ impl ProjectContext {
             diff
         })
     }
+}
+
+fn format_at_reference(reference: &str) -> String {
+    if reference.chars().any(char::is_whitespace) {
+        format!("@\"{reference}\"")
+    } else {
+        format!("@{reference}")
+    }
+}
+
+/// Find the incomplete `@` reference containing the caret. The caret and returned replacement
+/// range are UTF-8 byte offsets, matching Rust editor buffers and the expansion parser below.
+#[allow(dead_code)]
+pub fn active_at_reference(input: &str, caret: usize) -> Option<ActiveAtReference> {
+    if caret > input.len() || !input.is_char_boundary(caret) {
+        return None;
+    }
+
+    for (at, character) in input[..caret].char_indices().rev() {
+        if character != '@' || !is_reference_boundary(input, at) {
+            continue;
+        }
+        let start = at + 1;
+        let next = input[start..].chars().next();
+        if let Some(quote @ ('"' | '\'')) = next {
+            let content_start = start + quote.len_utf8();
+            if caret < content_start {
+                continue;
+            }
+            let before_caret = &input[content_start..caret];
+            if before_caret.contains(quote) {
+                return None;
+            }
+            let replacement_end = input[caret..]
+                .chars()
+                .next()
+                .filter(|character| *character == quote)
+                .map_or(caret, |character| caret + character.len_utf8());
+            return Some(ActiveAtReference {
+                query: before_caret.to_string(),
+                replacement: at..replacement_end,
+                quote: Some(quote),
+            });
+        }
+
+        let query = &input[start..caret];
+        if query.chars().any(char::is_whitespace) {
+            return None;
+        }
+        return Some(ActiveAtReference {
+            query: query.to_string(),
+            replacement: at..caret,
+            quote: None,
+        });
+    }
+    None
 }
 
 fn file_references(input: &str) -> Vec<String> {
@@ -945,6 +1064,67 @@ mod tests {
     fn file_references_ignore_mid_word_at_signs() {
         let refs = file_references("email a@b.test then read @src/main.rs");
         assert_eq!(refs, vec!["src/main.rs".to_string()]);
+    }
+
+    #[test]
+    fn path_candidates_are_ignore_aware_portable_and_insertion_ready() {
+        let root = project();
+        fs::create_dir_all(root.join("src/nested")).unwrap();
+        fs::create_dir(root.join("My Notes")).unwrap();
+        fs::create_dir(root.join(".hidden")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("src/ignored.rs"), "ignored").unwrap();
+        fs::write(root.join("My Notes/todo.txt"), "todo").unwrap();
+        fs::write(root.join(".hidden/secret.txt"), "secret").unwrap();
+        fs::write(root.join(".gitignore"), "src/ignored.rs\n").unwrap();
+        let context = ProjectContext::from_root(root.clone()).unwrap();
+
+        let candidates = context.at_path_candidates().unwrap();
+
+        assert!(candidates.contains(&"@diff".to_string()));
+        assert!(candidates.contains(&"@staged".to_string()));
+        assert!(candidates.contains(&"@clipboard".to_string()));
+        assert!(candidates.contains(&"@src/".to_string()));
+        assert!(candidates.contains(&"@src/nested/".to_string()));
+        assert!(candidates.contains(&"@src/main.rs".to_string()));
+        assert!(candidates.contains(&r#"@"My Notes/""#.to_string()));
+        assert!(candidates.contains(&r#"@"My Notes/todo.txt""#.to_string()));
+        assert!(!candidates.iter().any(|value| value.contains("ignored")));
+        assert!(!candidates.iter().any(|value| value.contains("hidden")));
+        assert!(!candidates.iter().any(|value| value.contains("gitignore")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_reference_matches_boundaries_and_tracks_replacement() {
+        assert_eq!(
+            active_at_reference("review @src/ma", 14),
+            Some(ActiveAtReference {
+                query: "src/ma".to_string(),
+                replacement: 7..14,
+                quote: None,
+            })
+        );
+        assert_eq!(active_at_reference("email a@src", 11), None);
+        assert_eq!(active_at_reference("done @src now", 13), None);
+    }
+
+    #[test]
+    fn active_quoted_reference_allows_spaces_and_consumes_closing_quote() {
+        let input = r#"see @"My Notes/ma" later"#;
+        assert_eq!(
+            active_at_reference(input, 17),
+            Some(ActiveAtReference {
+                query: "My Notes/ma".to_string(),
+                replacement: 4..18,
+                quote: Some('"'),
+            })
+        );
+        assert_eq!(active_at_reference(input, 18), None);
+        assert_eq!(
+            active_at_reference("see @'My Notes", 14).unwrap().quote,
+            Some('\'')
+        );
     }
 
     #[test]
