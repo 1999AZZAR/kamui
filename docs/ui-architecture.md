@@ -26,9 +26,7 @@ line-oriented renderer and never touches the alternate screen.
   rail with normal text (not a full-width red smear). Tool output folds by default to a
   two-line peek; long errors fold to a short headline. One blank swimlane between cards.
   Short transcripts pad at the top so the stack sits just above the editor.
-- **Sidebar** — Session title, Id, Model, Project (left-truncated so the leaf stays visible),
-  Context pressure, and Last turn metrics, one per line. Hidden under 84 columns and during
-  the intro screen.
+- **Sidebar** — grouped sections (Session identity, Runtime model/mode/git/project, Context with a `▓░` usage bar + cache line, Activity tools/lat/time, Last turn metrics). Section headers render as small muted rules; only load-bearing values get semantic ink (model blue, build green / plan amber, dirty git amber, cache cyan, context bar green→amber→red by pressure). Hidden under 68 columns and during the intro screen.
 - **Editor** — left-accent bordered box holding the live buffer with a real terminal cursor.
   While a turn runs, a bouncing wall row is the sole in-flight indicator (no transcript
   spinner; empty-buffer placeholder is omitted). Enter submits, `\` + Enter continues on a

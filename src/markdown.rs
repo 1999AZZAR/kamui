@@ -75,23 +75,65 @@ impl Renderer {
         }
         let trimmed = line.trim_start();
 
-        // A fence toggles code mode; the marker itself is dimmed so the block's edges stay visible
-        // without competing with the code inside it.
+        // A fence toggles code mode; the marker collapses to a dim `··· lang` edge so the
+        // block reads as a block without raw backticks in the transcript.
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             self.in_fence = !self.in_fence;
-            return format!("{DIM}{line}{RESET}");
+            let lang = trimmed
+                .trim_start_matches(['`', '~'])
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            let edge = if lang.is_empty() {
+                "···".to_string()
+            } else {
+                format!("··· {lang}")
+            };
+            return format!("{DIM}{edge}{RESET}");
         }
         if self.in_fence {
             return format!("{CYAN}{line}{RESET}");
         }
         if is_heading(trimmed) {
-            return format!("{BOLD}{line}{RESET}");
+            let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+            let body = trimmed[hashes..].trim_start();
+            return format!("{BOLD}{body}{RESET}");
         }
-        if trimmed.starts_with('>') || is_horizontal_rule(trimmed) {
-            return format!("{DIM}{line}{RESET}");
+        if let Some(quoted) = trimmed.strip_prefix('>') {
+            return format!("{DIM}│ {RESET}{}", inline(quoted.trim_start()));
+        }
+        if is_horizontal_rule(trimmed) {
+            return format!("{DIM}────────────────────────{RESET}");
+        }
+        if let Some(cells) = split_table_row(line) {
+            if cells.iter().all(|cell| {
+                let cell = cell.trim();
+                !cell.is_empty() && cell.chars().all(|c| c == '-' || c == ':')
+            }) {
+                return format!("{DIM}────────────────────────{RESET}");
+            }
+            let mut out = String::new();
+            for (i, cell) in cells.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(&format!("{DIM} │ {RESET}"));
+                }
+                out.push_str(&inline(cell.trim()));
+            }
+            return out;
         }
         match split_list_marker(line) {
-            Some((marker, rest)) => format!("{BOLD}{marker}{RESET}{}", inline(rest)),
+            Some((marker, rest)) => {
+                let indent = line.len() - line.trim_start().len();
+                let bullet = if marker
+                    .trim_start()
+                    .starts_with(|c: char| c.is_ascii_digit())
+                {
+                    marker.to_string()
+                } else {
+                    format!("{}• ", &line[..indent])
+                };
+                format!("{BOLD}{bullet}{RESET}{}", inline(rest))
+            }
             None => inline(line),
         }
     }
@@ -107,8 +149,18 @@ pub fn render_ratatui(text: &str) -> Text<'static> {
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             in_fence = !in_fence;
+            let lang = trimmed
+                .trim_start_matches(['`', '~'])
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            let edge = if lang.is_empty() {
+                "···".to_string()
+            } else {
+                format!("··· {lang}")
+            };
             lines.push(Line::from(Span::styled(
-                line.to_string(),
+                edge,
                 Style::default().fg(Color::DarkGray),
             )));
         } else if in_fence {
@@ -119,18 +171,58 @@ pub fn render_ratatui(text: &str) -> Text<'static> {
                     .bg(Color::Rgb(0x1a, 0x1a, 0x1a)),
             )));
         } else if is_heading(trimmed) {
+            let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+            let body = trimmed[hashes..].trim_start();
             lines.push(Line::from(Span::styled(
-                line.to_string(),
+                body.to_string(),
                 Style::default().add_modifier(Modifier::BOLD),
             )));
-        } else if trimmed.starts_with('>') || is_horizontal_rule(trimmed) {
+        } else if let Some(quoted) = trimmed.strip_prefix('>') {
+            let mut spans = vec![Span::styled(
+                "│ ".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )];
+            spans.extend(ratatui_inline(quoted.trim_start()));
+            lines.push(Line::from(spans));
+        } else if is_horizontal_rule(trimmed) {
             lines.push(Line::from(Span::styled(
-                line.to_string(),
+                "────────────────────────".to_string(),
                 Style::default().fg(Color::DarkGray),
             )));
+        } else if let Some(cells) = split_table_row(line) {
+            if cells.iter().all(|cell| {
+                let cell = cell.trim();
+                !cell.is_empty() && cell.chars().all(|c| c == '-' || c == ':')
+            }) {
+                lines.push(Line::from(Span::styled(
+                    "────────────────────────".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                let mut spans = Vec::new();
+                for (i, cell) in cells.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::styled(
+                            " │ ".to_string(),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    spans.extend(ratatui_inline(cell.trim()));
+                }
+                lines.push(Line::from(spans));
+            }
         } else if let Some((marker, rest)) = split_list_marker(line) {
+            let indent = line.len() - line.trim_start().len();
+            let bullet = if marker
+                .trim_start()
+                .starts_with(|c: char| c.is_ascii_digit())
+            {
+                marker.to_string()
+            } else {
+                format!("{}• ", &line[..indent])
+            };
             let mut spans = vec![Span::styled(
-                marker.to_string(),
+                bullet,
                 Style::default().add_modifier(Modifier::BOLD),
             )];
             spans.extend(ratatui_inline(rest));
@@ -259,6 +351,25 @@ fn split_list_marker(line: &str) -> Option<(&str, &str)> {
     }
     None
 }
+/// Split a GitHub-style table row (`| a | b |`) into its cells. Leading/trailing pipes are
+/// optional; any line with two or more `|`-separated cells counts, so even `a | b` prose
+/// renders with a `│` separator rather than a raw pipe.
+fn split_table_row(line: &str) -> Option<Vec<&str>> {
+    if !line.contains('|') {
+        return None;
+    }
+    let trimmed = line.trim();
+    let inner = trimmed
+        .strip_prefix('|')
+        .unwrap_or(trimmed)
+        .strip_suffix('|')
+        .unwrap_or(trimmed.strip_prefix('|').unwrap_or(trimmed));
+    let cells: Vec<&str> = inner.split('|').collect();
+    if cells.len() < 2 {
+        return None;
+    }
+    Some(cells)
+}
 
 /// Style inline code spans and bold runs, leaving everything else untouched. A code span wins over
 /// bold, and its contents are never reinterpreted, so a backticked `**not bold**` stays literal.
@@ -345,7 +456,7 @@ mod tests {
 
     #[test]
     fn headings_are_bold() {
-        assert_eq!(render("## Title"), format!("{BOLD}## Title{RESET}"));
+        assert_eq!(render("## Title"), format!("{BOLD}Title{RESET}"));
         // A hash without a space is not a heading (e.g. a comment or an issue reference).
         assert_eq!(render("#notaheading"), "#notaheading");
         assert_eq!(render("####### too many"), "####### too many");
@@ -391,9 +502,9 @@ mod tests {
         let lines: Vec<&str> = rendered.split('\n').collect();
 
         assert_eq!(lines[0], "before");
-        assert_eq!(lines[1], format!("{DIM}```rust{RESET}"));
+        assert_eq!(lines[1], format!("{DIM}··· rust{RESET}"));
         assert_eq!(lines[2], format!("{CYAN}fn main() {{}}{RESET}"));
-        assert_eq!(lines[3], format!("{DIM}```{RESET}"));
+        assert_eq!(lines[3], format!("{DIM}···{RESET}"));
         assert_eq!(lines[4], "after");
     }
 
@@ -406,18 +517,21 @@ mod tests {
 
     #[test]
     fn list_markers_are_highlighted_and_indentation_is_kept() {
-        assert_eq!(render("- first"), format!("{BOLD}- {RESET}first"));
+        assert_eq!(render("- first"), format!("{BOLD}• {RESET}first"));
         assert_eq!(
             render("  1. numbered"),
             format!("{BOLD}  1. {RESET}numbered")
         );
         // A bare dash is a horizontal rule, not a bullet.
-        assert_eq!(render("---"), format!("{DIM}---{RESET}"));
+        assert_eq!(
+            render("---"),
+            format!("{DIM}────────────────────────{RESET}")
+        );
     }
 
     #[test]
     fn blockquotes_are_dimmed() {
-        assert_eq!(render("> quoted"), format!("{DIM}> quoted{RESET}"));
+        assert_eq!(render("> quoted"), format!("{DIM}│ {RESET}quoted"));
     }
 
     #[test]
@@ -479,6 +593,73 @@ mod tests {
             text.lines[3].spans[0].style.bg,
             Some(Color::Rgb(0x1a, 0x1a, 0x1a)),
             "fenced code sits on a panel"
+        );
+    }
+    #[test]
+    fn ratatui_renderer_strips_block_markers() {
+        let text = render_ratatui("## Title\n- item\n> quoted\n---");
+        let plain: Vec<String> = text
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(
+            plain,
+            vec!["Title", "• item", "│ quoted", "────────────────────────"]
+        );
+        assert!(
+            text.lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "stripped heading stays bold"
+        );
+    }
+    #[test]
+    fn table_rows_lose_their_pipes_but_keep_inline_style() {
+        let rendered = render("| Modul | Peran |\n|---|---|\n| main.rs | **CLI** |\n");
+        let lines: Vec<&str> = rendered.split('\n').collect();
+        assert_eq!(lines[0], format!("Modul{DIM} │ {RESET}Peran"));
+        assert!(
+            lines[1].contains("───"),
+            "separator becomes a rule: {lines:?}"
+        );
+        assert_eq!(
+            lines[2],
+            format!("main.rs{DIM} │ {RESET}{BOLD}CLI{RESET}"),
+            "inline style survives inside cells: {lines:?}"
+        );
+        // A lone pipe is prose, not a table.
+        assert_eq!(render("a | b"), format!("a{DIM} │ {RESET}b"));
+        assert_eq!(render("no pipes here"), "no pipes here");
+    }
+
+    #[test]
+    fn ratatui_table_rows_split_into_cells() {
+        let text = render_ratatui("| a | b |\n|---|---|\n| `x` | y |");
+        let plain: Vec<String> = text
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(plain[0], "a │ b");
+        assert!(
+            plain[2].contains('x'),
+            "code cell keeps its text: {plain:?}"
+        );
+        assert!(
+            !plain.iter().any(|line| line.contains('|')),
+            "no raw pipes survive: {plain:?}"
         );
     }
 }

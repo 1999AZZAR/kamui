@@ -67,7 +67,7 @@ where
                     model: profile.model.clone(),
                     messages: vec![Message::user(&case.prompt)],
                     tools: Vec::new(),
-                session_id: None,
+                    session_id: None,
                 })
                 .await
                 .with_context(|| format!("benchmark case '{}' failed", case.name))?;

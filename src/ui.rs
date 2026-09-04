@@ -155,6 +155,8 @@ const ACCENT: Color = Color::Rgb(0xfa, 0xb2, 0x83);
 const GREEN: Color = Color::Rgb(0x7f, 0xd8, 0x8f);
 const WARN: Color = Color::Rgb(0xf5, 0xa7, 0x42);
 const RED: Color = Color::Rgb(0xe0, 0x6c, 0x75);
+/// Cache/secondary-info accent (variant C activity + context cache lines).
+const CYAN: Color = Color::Rgb(0x56, 0xb6, 0xc2);
 /// Kept from the earlier blue scheme; NOTICE_FG aliases it for readability everywhere.
 const NOTICE_FG: Color = MUTED;
 const MAX_HISTORY_LINES: usize = 4_000;
@@ -1913,7 +1915,10 @@ fn render_ask(frame: &mut Frame<'_>, ask: &AskState, area: Rect) {
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let width = 64.min(area.width.saturating_sub(4));
     let rows: [(&str, &str); 22] = [
-        ("Enter", "send message"),
+        (
+            "Enter",
+            "send message (accept slash completion, when the menu is open)",
+        ),
         ("Shift/Ctrl+Enter", "newline without sending"),
         ("\u{2190}/\u{2192}", "move the caret"),
         ("Alt+\u{2190}/\u{2192}", "move by word"),
@@ -1927,7 +1932,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         ("Right click", "copy the cell under the pointer"),
         ("?", "toggle this help"),
         ("Tab / Shift+Tab", "cycle mode (build / auto / plan)"),
-        ("Tab", "accept slash completion, when the menu is open"),
+        ("Tab", "accept slash completion without sending"),
         (
             "\u{2191}/\u{2193}",
             "line in the editor; history on first/last line",
@@ -2507,7 +2512,8 @@ fn input_thread(
             KeyCode::Enter => {
                 // opencode editor behavior: a backslash before the caret escapes the newline
                 // and continues the message on the next line. Read at the caret rather than at
-                // the end of the buffer, so it still works mid-line.
+                // the end of the buffer, so it still works mid-line. Checked first so a
+                // trailing backslash never triggers completion instead.
                 let before = prev_char_boundary(&buf, caret);
                 if before < caret && &buf[before..caret] == "\\" {
                     buf.replace_range(before..caret, "\n");
@@ -2518,7 +2524,20 @@ fn input_thread(
                     sync(&screen, &buf, caret, selected, Vec::new());
                     continue 'keys;
                 }
-                let line = buf.trim().to_string();
+                // Slash menu open with a match: Enter accepts the highlighted
+                // candidate and submits it, so `/mo` + Enter runs `/model`
+                // without a Tab stop first. Exact buffer wins: typing the full
+                // command still submits what was typed.
+                let mut line = buf.trim().to_string();
+                if is_slash {
+                    let all = items_for(&needle);
+                    if !all.is_empty()
+                        && !all.iter().any(|(name, _)| line == format!("/{name}"))
+                        && let Some(choice) = all.get(selected)
+                    {
+                        line = format!("/{} ", choice.0);
+                    }
+                }
                 buf.clear();
                 caret = 0;
                 selected = 0;
@@ -3106,6 +3125,24 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
     if let Some(entries) = &model.sidebar {
         let compact = area.height < (entries.len() as u16).saturating_mul(4);
         for (i, (key, value)) in entries.iter().enumerate() {
+            // Section headers (Session/Runtime/Context/Activity/Last turn) render as a
+            // small muted rule so groups read apart without a blank line each.
+            if is_sidebar_section(key) {
+                if i > 0 {
+                    lines.push(Line::from(Span::styled(
+                        "─".repeat(max.min(key.len() + 4)),
+                        Style::default().fg(BORDER),
+                    )));
+                }
+                lines.push(Line::from(Span::styled(
+                    key.to_string(),
+                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                )));
+                for value_line in value.split('\n') {
+                    push_sidebar_value(&mut lines, key, value_line, max);
+                }
+                continue;
+            }
             lines.push(Line::from(Span::styled(
                 format!("{key} "),
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -3114,29 +3151,7 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
             // spans, so split before styling. Tab-separated metric rows keep label/value
             // contrast; project paths truncate from the left so the leaf stays readable.
             for value_line in value.split('\n') {
-                if key == "Last turn"
-                    && let Some((label, rest)) = value_line.split_once('\t')
-                {
-                    let label_w = 4usize;
-                    let value_max = max.saturating_sub(label_w + 1);
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("{label:<label_w$} "),
-                            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            crate::tui::truncate_chars(rest, value_max),
-                            Style::default().fg(NOTICE_FG),
-                        ),
-                    ]));
-                    continue;
-                }
-                let truncated = if key == "Project" {
-                    crate::tui::truncate_left_chars(value_line, max)
-                } else {
-                    crate::tui::truncate_chars(value_line, max)
-                };
-                lines.push(Line::styled(truncated, Style::default().fg(NOTICE_FG)));
+                push_sidebar_value(&mut lines, key, value_line, max);
             }
             if !compact && i + 1 < entries.len() {
                 lines.push(Line::from(""));
@@ -3151,6 +3166,81 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
                 .border_style(Style::default().fg(MUTED))
                 .style(Style::default().bg(BG_PANEL)),
         )
+}
+
+/// Keys that open a sidebar group rather than a plain label row.
+fn is_sidebar_section(key: &str) -> bool {
+    matches!(
+        key,
+        "Session" | "Runtime" | "Context" | "Activity" | "Last turn"
+    )
+}
+
+/// Semantic value color: only the load-bearing value gets ink, labels stay quiet.
+fn sidebar_value_style(key: &str, label: &str, value: &str) -> Style {
+    match (key, label) {
+        (_, "model") => Style::default().fg(BLUE),
+        (_, "mode") => {
+            if value.contains("plan") {
+                Style::default().fg(WARN)
+            } else {
+                Style::default().fg(GREEN)
+            }
+        }
+        (_, "git") => {
+            if value.contains("changed") || value.contains('±') {
+                Style::default().fg(WARN)
+            } else {
+                Style::default().fg(NOTICE_FG)
+            }
+        }
+        (_, "cache") => Style::default().fg(CYAN),
+        _ => Style::default().fg(NOTICE_FG),
+    }
+}
+/// One sidebar value row: metric tab-rows keep label/value contrast, `bar\tNN`
+/// rows render a variant-C usage bar, everything else truncates plainly.
+fn push_sidebar_value(lines: &mut Vec<Line<'static>>, key: &str, value_line: &str, max: usize) {
+    if let Some(pct_str) = value_line.strip_prefix("bar\t")
+        && let Ok(pct) = pct_str.trim().parse::<u8>()
+    {
+        let pct = pct.min(100);
+        let width = max.clamp(4, 12) as u64;
+        let filled = (pct as u64 * width / 100) as usize;
+        let color = if pct >= 80 {
+            RED
+        } else if pct >= 50 {
+            WARN
+        } else {
+            GREEN
+        };
+        let mut spans = vec![Span::styled(
+            "▓".repeat(filled) + &"░".repeat(width as usize - filled),
+            Style::default().fg(color),
+        )];
+        spans.push(Span::styled(format!(" {pct}%"), Style::default().fg(MUTED)));
+        lines.push(Line::from(spans));
+        return;
+    }
+    if let Some((label, rest)) = value_line.split_once('\t') {
+        let label_w = 5usize;
+        let value_max = max.saturating_sub(label_w + 1);
+        let style = sidebar_value_style(key, label, rest);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{label:<label_w$} "),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(crate::tui::truncate_chars(rest, value_max), style),
+        ]));
+        return;
+    }
+    let truncated = if key == "Project" {
+        crate::tui::truncate_left_chars(value_line, max)
+    } else {
+        crate::tui::truncate_chars(value_line, max)
+    };
+    lines.push(Line::styled(truncated, Style::default().fg(NOTICE_FG)));
 }
 
 /// The home screen: two-tone block-letter logo centered above the version/model line and the
@@ -4125,6 +4215,42 @@ mod tests {
     #[test]
     fn hiding_the_sidebar_gives_its_columns_to_the_transcript() {
         assert_eq!(with_sidebar(100, true).transcript_width, 100);
+    }
+    #[test]
+    fn sidebar_groups_render_section_rules_and_a_usage_bar() {
+        let model = Model {
+            intro: false,
+            sidebar: Some(vec![
+                ("Session".into(), "hello\nid\ted1699fb".into()),
+                (
+                    "Runtime".into(),
+                    "model\torvix/grok-4.6\nmode\tbuild\ngit\tmain · 13 changed".into(),
+                ),
+                (
+                    "Context".into(),
+                    "7550 tokens (5.9% of 128000)\nbar\t6".into(),
+                ),
+                ("Activity".into(), "tools\t3\nlat\t1.9s".into()),
+            ]),
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &model);
+            })
+            .expect("draw");
+        let mut text = String::new();
+        for row in 0..30 {
+            for col in 70..100 {
+                text.push_str(terminal.backend().buffer()[(col, row)].symbol());
+            }
+            text.push('\n');
+        }
+        for want in ["Session", "Runtime", "Context", "Activity", "░", "6%"] {
+            assert!(text.contains(want), "rail shows {want:?}:\n{text}");
+        }
     }
 
     #[test]

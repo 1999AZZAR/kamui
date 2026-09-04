@@ -196,7 +196,9 @@ where
         project,
         &mcp_sidebar,
         None,
+        None,
         context_window,
+        None,
         None,
     );
     // Restore pending plan on resume/startup.
@@ -460,7 +462,9 @@ where
                         project,
                         &mcp_sidebar,
                         None,
+                        None,
                         context_window,
+                        None,
                         None,
                     );
                     chat_ui.notice(&format!("Added & switched to {rest} (profile {name})."))?;
@@ -790,7 +794,9 @@ where
                     project,
                     &mcp_sidebar,
                     None,
+                    None,
                     context_window,
+                    None,
                     None,
                 );
                 continue;
@@ -885,7 +891,9 @@ where
                     project,
                     &mcp_sidebar,
                     None,
+                    None,
                     context_window,
+                    None,
                     None,
                 );
             }
@@ -1260,6 +1268,11 @@ where
                 // the fixed-width label from the value so the sidebar can style them apart.
                 let mut lt = format!("tok\t{}", usage.total_tokens);
                 lt.push_str(&format!("\nin\t{}", usage.prompt_tokens));
+                if usage.cached_tokens > 0 && usage.prompt_tokens > 0 {
+                    let hit = (usage.cached_tokens as f64 / usage.prompt_tokens as f64 * 100.0)
+                        .min(100.0);
+                    lt.push_str(&format!("\ncache\t{} ({hit:.0}%)", usage.cached_tokens));
+                }
                 lt.push_str(&format!("\nout\t{}", usage.completion_tokens));
                 if let Some(t) = ttft {
                     lt.push_str(&format!("\nlat\t{}", crate::terminal::format_duration(t)));
@@ -1268,6 +1281,17 @@ where
                     "\ntime\t{}",
                     crate::terminal::format_duration(started.elapsed())
                 ));
+                let activity = {
+                    let mut a = format!("tools\t{}", tool_calls.len());
+                    if let Some(t) = ttft {
+                        a.push_str(&format!("\nlat\t{}", crate::terminal::format_duration(t)));
+                    }
+                    a.push_str(&format!(
+                        "\ntime\t{}",
+                        crate::terminal::format_duration(started.elapsed())
+                    ));
+                    a
+                };
                 update_sidebar(
                     &mut chat_ui,
                     session.as_ref(),
@@ -1277,8 +1301,10 @@ where
                     project,
                     &mcp_sidebar,
                     Some(usage.prompt_tokens),
+                    Some(usage.cached_tokens),
                     context_window,
                     Some(lt),
+                    Some(activity),
                 );
             } else {
                 println!("{usage_line}");
@@ -1291,7 +1317,9 @@ where
                     project,
                     &mcp_sidebar,
                     Some(usage.prompt_tokens),
+                    Some(usage.cached_tokens),
                     context_window,
+                    None,
                     None,
                 );
             }
@@ -2960,38 +2988,41 @@ fn update_sidebar(
     project: &ProjectContext,
     mcp: &str,
     last_input_tokens: Option<u64>,
+    last_cached_tokens: Option<u64>,
     context_window: Option<u64>,
     last_turn: Option<String>,
+    activity: Option<String>,
 ) {
     if !chat_ui.is_fullscreen() {
         return;
     }
-    let mut entries = vec![(
-        "Session".to_string(),
-        match session {
-            Some(session) => session.title.clone(),
-            None => "New chat".to_string(),
-        },
-    )];
+    let mut entries: Vec<(String, String)> = Vec::new();
+    // Groups mirror the prototype pick: Session identity, Runtime (model/mode/git/project),
+    // Context with a variant-C usage bar, then Activity + Last turn metrics.
+    let mut session_value = match session {
+        Some(session) => session.title.clone(),
+        None => "New chat".to_string(),
+    };
     if let Some(session) = session {
-        entries.push(("Id".to_string(), short_id(&session.id).to_string()));
+        session_value.push_str(&format!("\nid\t{}", short_id(&session.id)));
     }
-    entries.push(("Version".to_string(), format!("v{version}")));
-    entries.push(("Model".to_string(), model.to_string()));
-    entries.push(("Mode".to_string(), mode.to_string()));
+    session_value.push_str(&format!("\nversion\tv{version}"));
+    entries_push(&mut entries, "Session", session_value);
+    let mut runtime = format!("model\t{model}\nmode\t{mode}");
     if let Some(git) = git_status(project.root()) {
         let dirty = if git.changed == 0 {
             String::new()
         } else {
             format!(" · {} changed", git.changed)
         };
-        entries.push(("Git".to_string(), format!("{}{dirty}", git.branch)));
+        runtime.push_str(&format!("\ngit\t{}{dirty}", git.branch));
     }
-    entries.push(("Project".to_string(), display_path(project.root())));
+    runtime.push_str(&format!("\nproject\t{}", display_path(project.root())));
     if !mcp.is_empty() {
-        entries.push(("MCP".to_string(), mcp.to_string()));
+        runtime.push_str(&format!("\nmcp\t{mcp}"));
     }
-    let context_line = match (last_input_tokens, context_window) {
+    entries_push(&mut entries, "Runtime", runtime);
+    let mut context_line = match (last_input_tokens, context_window) {
         (Some(tokens), Some(window)) => {
             format!(
                 "{tokens} tokens ({:.1}% of {window})",
@@ -3001,7 +3032,20 @@ fn update_sidebar(
         (Some(tokens), None) => format!("{tokens} tokens"),
         (None, _) => "\u{2014}".to_string(),
     };
-    entries.push(("Context".to_string(), context_line));
+    if let (Some(tokens), Some(window)) = (last_input_tokens, context_window)
+        && window > 0
+    {
+        let pct = ((tokens as f64 / window as f64) * 100.0).min(100.0).round() as u8;
+        context_line.push_str(&format!("\nbar\t{pct}"));
+    }
+    if let (Some(tokens), Some(cached)) = (last_input_tokens, last_cached_tokens)
+        && cached > 0
+        && tokens > 0
+    {
+        let hit = (cached as f64 / tokens as f64 * 100.0).min(100.0);
+        context_line.push_str(&format!("\ncache\t{cached} ({hit:.0}%)"));
+    }
+    entries_push(&mut entries, "Context", context_line);
     // Status-bar badge: compact token count with context pressure for the amber threshold.
     match last_input_tokens {
         Some(tokens) => {
@@ -3019,10 +3063,24 @@ fn update_sidebar(
             let _ = chat_ui.set_token_badge(None);
         }
     }
+    if let Some(activity) = activity {
+        entries_push(&mut entries, "Activity", activity);
+    }
     if let Some(last_turn) = last_turn {
-        entries.push(("Last turn".to_string(), last_turn));
+        entries_push(&mut entries, "Last turn", last_turn);
     }
     let _ = chat_ui.set_sidebar(entries);
+}
+
+/// Push a sidebar group, merging into the previous entry when the same group is
+/// pushed twice (startup + refresh both contribute before the first turn).
+fn entries_push(entries: &mut Vec<(String, String)>, key: &str, value: String) {
+    if let Some(existing) = entries.iter_mut().find(|(k, _)| k == key) {
+        existing.1.push('\n');
+        existing.1.push_str(&value);
+    } else {
+        entries.push((key.to_string(), value));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3335,14 +3393,8 @@ async fn dispatch_spawn_agents(
                 (
                     call.id.clone(),
                     (
-                        dispatch_spawn_agent(
-                            provider,
-                            model,
-                            project,
-                            &call.arguments,
-                            session_id,
-                        )
-                        .await,
+                        dispatch_spawn_agent(provider, model, project, &call.arguments, session_id)
+                            .await,
                         started.elapsed(),
                     ),
                 )
@@ -5727,8 +5779,7 @@ mod tests {
             .collect::<Vec<_>>();
         let references = calls.iter().collect::<Vec<_>>();
 
-        let outputs =
-            dispatch_spawn_agents(&provider, "model", &project, &references, None).await;
+        let outputs = dispatch_spawn_agents(&provider, "model", &project, &references, None).await;
 
         assert_eq!(outputs.len(), 6);
         assert_eq!(outputs["c0"].0, "task 0");
