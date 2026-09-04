@@ -501,6 +501,39 @@ polish: users hit these before they ever need a design system or batch-approval 
       (fixes upstream 400 `No tool call found for function call output with call_id …` on
       OpenAI-compatible / Orvix Coding)
 
+## OpenCode-inspired TUI direction
+
+Kamui's fullscreen TUI is deliberately inspired by OpenCode (boxy rails, live editor, sidebar).
+Steal **behavior**, not chrome. Do not chase every OpenCode panel before Near-term dogfooding is
+usable — users fail on approve / resume / picker / queue long before they need a design system.
+
+### Steal from OpenCode
+
+- [ ] **Live sidebar as single glance**: mode (`plan`/`build`), MCP status (ok/fail + short reason),
+      cwd:branch, queued-input indicator, active plan step — not only static session cards
+- [ ] **Plan checklist as a first-class UI object**: `update_plan` already exists; render it as a
+      clear transcript block *and* a sidebar mirror with the active step highlighted (OpenCode-style
+      `# Todos`)
+- [ ] **Thin turn chrome**: one line like `build · model · 33.1s`; keep latency/tokens in the
+      sidebar or a small badge — do not compete with the assistant answer
+- [ ] **Minimal contextual footer**: interrupt hint · tokens · one primary shortcut for the current
+      state (e.g. commands / interrupt), instead of a crowded always-on shortcut strip
+
+### Do not copy blindly
+
+- Do not add OpenCode-parity panels (LSP list, always-on cost `$0.00`, full MCP inventory) until
+  Near-term friction is fixed
+- Do not thicken message rails further; the existing opencode-style borders are enough
+- Keep Kamui differentiators: permission modal, `--auto-approve`, Plan Mode, Coding cache badge —
+  polish their *state transitions*, do not replace them with a chat-app look
+
+### Suggested order after Near-term
+
+1. Live sidebar (mode / MCP / queue / git)
+2. Plan checklist mirror + active-step highlight
+3. `@` completion + command palette (boxy but fast)
+4. Only then Phase 11 visual tokens / themes
+
 ## Phase 8: Approval and Multi-Tool Workflow
 
 Do not start this phase until the Near-term dogfooding items above are in a usable state. The core
