@@ -245,7 +245,24 @@ where
     let mut pending_add: Option<(String, String)> = None;
     // Background jobs already reported as finished, so each is announced once.
     let mut announced_jobs: HashSet<String> = HashSet::new();
-
+    // One fixed tool array per Session (prefix-cache stability): computed once from the
+    // profile, never swapped per Turn. Plan Mode pending holds mutating tools at execution
+    // time (`is_mutating_held`) instead of shrinking the roster, so the `tools` suffix of
+    // the request prefix stays byte-identical across Turns. Reset on profile switch and
+    // whenever a command replaces the session (same points that reset plan/compaction state).
+    // ponytail: full roster in pending Plan Mode (model may call held tools, gets a hold
+    // message); subset roster if the hold-message round-trips prove wasteful.
+    let mut session_tools: Option<Vec<crate::provider::ToolDefinition>> = None;
+    // Frozen request head per Session (prefix-cache stability): the base system prompt,
+    // memory snapshot, and skill block are each their own message, computed once and
+    // reused across Turns. Only the rolling Compaction summary (which grows by design)
+    // is re-rendered per Turn, as the last head message before history.
+    // `cached_memory_snapshot` holds the last rendered memory block; `memory_dirty`
+    // flips when a memory Tool runs, so the next Turn re-reads the DB once instead of
+    // every Turn — while a skill toggle rebuilds the head around the same snapshot.
+    let mut head_messages: Option<Vec<Message>> = None;
+    let mut cached_memory_snapshot = String::new();
+    let mut memory_dirty = true;
     'chat: loop {
         // A background job that ended could previously only be found by polling `/jobs`. Report
         // it on the way back to the prompt, which is when there is somewhere to put it.
@@ -608,6 +625,8 @@ where
                                 Ok(()) => {
                                     disabled_skills =
                                         crate::settings::load_disabled_skills(project.root());
+                                    // Skill block is part of the frozen head: refresh next turn.
+                                    head_messages = None;
                                     chat_ui.notice(&format!(
                                         "/{} is now {}",
                                         skill.name,
@@ -689,6 +708,10 @@ where
                         display_path(project.root())
                     ))?;
                 }
+                // Profile switch may flip tools/embedding_model/system: recompute fixed state.
+                session_tools = None;
+                head_messages = None;
+                memory_dirty = true;
                 continue;
             }
             if command == "/status" {
@@ -933,6 +956,13 @@ where
                 summary = None;
                 summarized_upto = 0;
             }
+            // The fixed tool array + frozen head are session-scoped: a new/resumed session
+            // may carry a different plan state or profile, so recompute on the next turn.
+            if prev_session_id != session.as_ref().map(|s| s.id.clone()) {
+                session_tools = None;
+                head_messages = None;
+                memory_dirty = true;
+            }
             continue;
         }
 
@@ -975,23 +1005,22 @@ where
             plan_requested = false;
         }
         // Some models/endpoints reject the `tools` field; a profile can opt out so plain chat works.
-        // In Plan Mode (pending), only read-only + update_plan + ask_user/search_code/spawn_agent.
-        let is_plan_pending = plan_mode
-            .as_ref()
-            .is_some_and(|s| s.status == PlanStatus::Pending);
-        let tool_definitions = if active.tools {
-            if is_plan_pending {
-                plan_mode_definitions(project.root(), active.embedding_model.is_some())
-            } else {
+        // Fixed per Session (prefix-cache stability): computed once, reused every turn.
+        // Pending Plan Mode does NOT shrink the roster — mutating calls are held at execution
+        // time with an explanatory message (`is_mutating_held`), so the wire `tools` array
+        // never flips shape mid-session.
+        if session_tools.is_none() {
+            session_tools = Some(if active.tools {
                 let mut defs = tools.definitions();
                 if active.embedding_model.is_some() {
                     defs.push(tools::search_code_definition());
                 }
                 defs
-            }
-        } else {
-            Vec::new()
-        };
+            } else {
+                Vec::new()
+            });
+        }
+        let tool_definitions = session_tools.as_ref().expect("computed above").clone();
 
         // Auto-compact older history once the recent portion grows past the threshold.
         summarized_upto = summarized_upto.min(messages.len());
@@ -1038,28 +1067,34 @@ where
             }
         }
 
-        // Working conversation for this turn: the agentic system prompt (plus project instructions
-        // and any running summary), the un-summarized recent history, and the expanded prompt.
-        // Intermediate tool messages live here only; they are not persisted. Memory is read fresh
-        // every turn (unlike Kumo's frozen-at-startup snapshot): Kamui is a single interactive
-        // process, not a server shared across many chats, so a fact remembered in this turn should
-        // be visible on the very next one without needing a restart.
-        let skills_eager = skill_library.eager_block_filtered(&disabled_skills);
-        let mut system = prompt::build(
-            active.tools,
-            project.system_message().as_deref(),
-            skills_eager.as_deref(),
-        );
-        let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
-        if !memory_snapshot.is_empty() {
-            system.push_str("\n\n");
-            system.push_str(&memory_snapshot);
+        // Working conversation for this turn: the frozen head (base system, memory, skills
+        // as separate messages) + the rolling summary + un-summarized history + prompt.
+        // Intermediate tool messages live here only; they are not persisted. The head is
+        // computed once per Session and reused: a memory/skill change resets `head_messages`
+        // (skill toggle) or flips `memory_dirty` (memory tools), so the next turn rebuilds
+        // just the head while history turns keep byte-identical prefixes.
+        if head_messages.is_none() {
+            let skills_eager = skill_library.eager_block_filtered(&disabled_skills);
+            let base = prompt::build(active.tools, project.system_message().as_deref(), None);
+            // Refresh from the DB only when memory actually changed; otherwise reuse the
+            // snapshot baked into the previous head so the bytes stay identical.
+            // ponytail: re-read is a DB round-trip per memory-changing turn only, not per turn.
+            if memory_dirty {
+                cached_memory_snapshot = render_memory_snapshot(&database.list_memory()?);
+                memory_dirty = false;
+            }
+            head_messages = Some(build_head_messages(
+                base,
+                &cached_memory_snapshot,
+                skills_eager.as_deref(),
+            ));
         }
+        let mut turn_messages = head_messages.as_ref().expect("built above").clone();
         if let Some(summary) = &summary {
-            system.push_str("\n\nSummary of the earlier conversation so far:\n\n");
-            system.push_str(summary);
+            turn_messages.push(Message::system(format!(
+                "Summary of the earlier conversation so far:\n\n{summary}"
+            )));
         }
-        let mut turn_messages = vec![Message::system(system)];
         turn_messages.extend(messages[summarized_upto..].iter().cloned());
         // Say what was attached. The prompt text only ever shows what was typed (`@clipboard`,
         // `@shot.png`), so without this there is nothing to tell you whether an image was
@@ -1502,6 +1537,10 @@ where
                             .to_string(),
                     }
                 } else if is_memory_tool(&call.name) {
+                    // Memory changed: rebuild the frozen head next turn so the new fact is
+                    // visible immediately (same guarantee as the old read-fresh-every-turn).
+                    memory_dirty = true;
+                    head_messages = None;
                     dispatch_memory_tool(database, &call.name, &call.arguments)
                 } else if tools.requires_confirmation_for(&call.name, &call.arguments)
                     && !auto_approve
@@ -1792,17 +1831,9 @@ where
     }
 
     let skills_eager = skill_library.eager_block_filtered(&disabled_skills);
-    let mut system = prompt::build(
-        active.tools,
-        project.system_message().as_deref(),
-        skills_eager.as_deref(),
-    );
+    let base = prompt::build(active.tools, project.system_message().as_deref(), None);
     let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
-    if !memory_snapshot.is_empty() {
-        system.push_str("\n\n");
-        system.push_str(&memory_snapshot);
-    }
-    let mut turn_messages = vec![Message::system(system)];
+    let mut turn_messages = build_head_messages(base, &memory_snapshot, skills_eager.as_deref());
     if let Some(note) = describe_attachments(&expanded) {
         println!("{note}");
     }
@@ -3875,6 +3906,30 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// the system prompt (which carries every entry on every request) from growing unbounded.
 const MAX_MEMORY_BYTES: i64 = 4 * 1024;
 
+/// Build the frozen request head: one message per stable block (base system, memory,
+/// skills), so a change in one block never re-serializes the others. The rolling
+/// Compaction summary stays out — it grows by design and is appended per Turn by the
+/// caller as the last head message. Empty blocks are skipped, but a block that
+/// *becomes* empty keeps its slot only via full-head rebuild (see callers resetting
+/// `head_messages` on skill toggle / session change); per-Turn shape is stable
+/// otherwise: same blocks present → same prefix bytes.
+fn build_head_messages(
+    base_system: String,
+    memory_snapshot: &str,
+    skills_eager: Option<&str>,
+) -> Vec<Message> {
+    let mut head = vec![Message::system(base_system)];
+    if !memory_snapshot.is_empty() {
+        head.push(Message::system(memory_snapshot.to_string()));
+    }
+    if let Some(skills) = skills_eager
+        && !skills.is_empty()
+    {
+        head.push(Message::system(skills.to_string()));
+    }
+    head
+}
+
 /// Render every remembered fact as a system-prompt block, or an empty string when there is
 /// nothing remembered yet (so callers can skip adding an empty section).
 fn render_memory_snapshot(entries: &[storage::MemoryEntry]) -> String {
@@ -3936,19 +3991,6 @@ fn is_mutating_tool(name: &str) -> bool {
         name,
         tools::PATCH_FILE_TOOL | "run_command" | "command_status" | "stop_command"
     )
-}
-
-fn plan_mode_definitions(
-    root: &std::path::Path,
-    has_embedding: bool,
-) -> Vec<crate::provider::ToolDefinition> {
-    let mut defs = tools::ToolRegistry::plan_mode(root.to_path_buf()).definitions();
-    // plan_mode() already includes update_plan; add ask_user/spawn_agent/memory via definitions()
-    // which plan_mode's definitions() already includes. Add search_code if available.
-    if has_embedding {
-        defs.push(tools::search_code_definition());
-    }
-    defs
 }
 
 #[derive(serde::Deserialize)]
@@ -5343,6 +5385,35 @@ mod tests {
 
         assert!(rendered.contains("Prefers bun over node."));
         assert!(rendered.contains("Prefers uv over pip."));
+    }
+
+    #[test]
+    fn head_messages_skip_empty_blocks() {
+        let head = build_head_messages("base".to_string(), "", None);
+        assert_eq!(head.len(), 1);
+        assert_eq!(head[0].content, "base");
+    }
+
+    #[test]
+    fn head_messages_keep_blocks_separate() {
+        let head = build_head_messages(
+            "base".to_string(),
+            "Remembered facts:\n- bun",
+            Some("Skills:\n- review"),
+        );
+        assert_eq!(head.len(), 3);
+        assert_eq!(head[0].content, "base");
+        assert!(head[1].content.contains("bun"));
+        assert!(head[2].content.contains("review"));
+        // A memory change re-renders only message[1]: message[0] bytes are untouched.
+        let head2 = build_head_messages(
+            "base".to_string(),
+            "Remembered facts:\n- bun\n- uv",
+            Some("Skills:\n- review"),
+        );
+        assert_eq!(head2[0].content, head[0].content);
+        assert_eq!(head2[2].content, head[2].content);
+        assert_ne!(head2[1].content, head[1].content);
     }
 
     #[test]

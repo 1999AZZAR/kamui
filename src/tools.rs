@@ -113,30 +113,6 @@ impl ToolRegistry {
         }
     }
 
-    /// Plan Mode gate (ticket #9): read-only tools plus `update_plan` only.
-    /// Used while a plan is pending approval — mutating tools are held.
-    pub fn plan_mode(project_root: PathBuf) -> Self {
-        let tools: Vec<Box<dyn Tool>> = vec![
-            Box::new(ReadFileTool {
-                root: project_root.clone(),
-            }),
-            Box::new(ListDirectoryTool {
-                root: project_root.clone(),
-            }),
-            Box::new(GrepTool {
-                root: project_root.clone(),
-            }),
-            Box::new(GlobTool {
-                root: project_root.clone(),
-            }),
-            Box::new(UpdatePlanTool),
-        ];
-        Self {
-            tools,
-            jobs: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
     /// The shared background-job registry, so callers that aren't going through the tool-call
     /// protocol (the chat loop's `/jobs` command, killing jobs on shutdown) can reach it directly.
     pub fn jobs(&self) -> JobRegistry {
