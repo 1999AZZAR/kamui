@@ -101,6 +101,40 @@ pub fn prefix_bytes(system: &str, tools: &[ToolDefinition]) -> Vec<u8> {
     bytes
 }
 
+/// Side requests that must not share the conversation's sticky `session_id`.
+///
+/// Title generation and compaction are short, unrelated prefixes. If they reuse the
+/// conversation id on a sticky Coding Plan worker, that worker's prompt cache can be
+/// evicted right after turn one (title) or mid-session (compact) — the KPI then shows
+/// `Cached: 0` on the next chat turn for no harness-visible reason.
+///
+/// Orvix still requires *a* `session_id` on `/coding/completions`, so these derive a
+/// stable sibling id. Sticky Redis and `prompt_cache_key` key off that sibling; the
+/// conversation's warm prefix stays on the original id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SideRequest {
+    Title,
+    Compact,
+}
+
+impl SideRequest {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Title => ":title",
+            Self::Compact => ":compact",
+        }
+    }
+}
+
+/// Sticky id for a title or compaction call. `None` when the conversation itself is not
+/// cache-pinned (`conversation_id` absent).
+pub fn side_session_id(conversation_id: Option<&str>, kind: SideRequest) -> Option<String> {
+    conversation_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| format!("{id}{}", kind.suffix()))
+}
+
 /// Watches the prefix of a cache-pinned session for drift.
 ///
 /// It never rewrites a request: a user who toggles a skill or enters Plan Mode must get the tools
@@ -194,7 +228,7 @@ pub fn report(samples: &[(i64, i64)]) -> Option<CacheReport> {
     let pct_ge_90 = at_least(90.0);
     let pct_ge_95 = at_least(95.0);
     hits.sort_by(|a, b| a.partial_cmp(b).expect("hit ratios are never NaN"));
-    let median = if measured % 2 == 0 {
+    let median = if measured.is_multiple_of(2) {
         (hits[measured / 2 - 1] + hits[measured / 2]) / 2.0
     } else {
         hits[measured / 2]
@@ -405,5 +439,23 @@ mod tests {
     fn a_session_with_one_turn_has_nothing_to_report() {
         assert_eq!(report(&[(100, 0)]), None);
         assert_eq!(report(&[]), None);
+    }
+
+    #[test]
+    fn side_requests_derive_a_sibling_sticky_id() {
+        assert_eq!(side_session_id(None, SideRequest::Title), None);
+        assert_eq!(side_session_id(Some(""), SideRequest::Compact), None);
+        assert_eq!(
+            side_session_id(Some("abc-123"), SideRequest::Title).as_deref(),
+            Some("abc-123:title")
+        );
+        assert_eq!(
+            side_session_id(Some("abc-123"), SideRequest::Compact).as_deref(),
+            Some("abc-123:compact")
+        );
+        // Conversation id stays distinct so a sticky worker cannot confuse the two prefixes.
+        let chat = "abc-123";
+        let title = side_session_id(Some(chat), SideRequest::Title).unwrap();
+        assert_ne!(title, chat);
     }
 }

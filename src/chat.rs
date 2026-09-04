@@ -199,10 +199,13 @@ where
         None,
         None,
         context_window,
+        active.send_session_id,
+        session
+            .as_ref()
+            .and_then(|s| session_cache_line(database, &s.id)),
         None,
         None,
     );
-    // Restore pending plan on resume/startup.
     let mut plan_mode: Option<PlanModeState> = session
         .as_ref()
         .and_then(|s| database.get_plan(&s.id).ok().flatten())
@@ -493,6 +496,10 @@ where
                         None,
                         None,
                         context_window,
+                        active.send_session_id,
+                        session
+                            .as_ref()
+                            .and_then(|s| session_cache_line(database, &s.id)),
                         None,
                         None,
                     );
@@ -755,7 +762,10 @@ where
                         &messages,
                         summary.as_deref(),
                         summarized_upto,
-                        coding_session_id.clone(),
+                        cache::side_session_id(
+                            coding_session_id.as_deref(),
+                            cache::SideRequest::Compact,
+                        ),
                     ) => result,
                     signal = tokio::signal::ctrl_c() => {
                         signal.context("failed to listen for Ctrl+C")?;
@@ -834,6 +844,10 @@ where
                     None,
                     None,
                     context_window,
+                    active.send_session_id,
+                    session
+                        .as_ref()
+                        .and_then(|s| session_cache_line(database, &s.id)),
                     None,
                     None,
                 );
@@ -931,6 +945,10 @@ where
                     None,
                     None,
                     context_window,
+                    active.send_session_id,
+                    session
+                        .as_ref()
+                        .and_then(|s| session_cache_line(database, &s.id)),
                     None,
                     None,
                 );
@@ -1052,7 +1070,10 @@ where
                     &messages,
                     summary.as_deref(),
                     summarized_upto,
-                    coding_session_id.clone(),
+                    cache::side_session_id(
+                        coding_session_id.as_deref(),
+                        cache::SideRequest::Compact,
+                    ),
                 ) => result,
                 signal = tokio::signal::ctrl_c() => {
                     signal.context("failed to listen for Ctrl+C")?;
@@ -1348,6 +1369,8 @@ where
                     lt.push_str(&format!("\ncache\t{} ({hit:.0}%)", usage.cached_tokens));
                 } else if let Some(miss) = miss_label {
                     lt.push_str(&format!("\ncache\t{miss}"));
+                } else if active.send_session_id {
+                    lt.push_str("\ncache\t0 (warm-up)");
                 }
                 if let Some(t) = ttft {
                     lt.push_str(&format!("\nlat\t{}", crate::terminal::format_duration(t)));
@@ -1378,6 +1401,10 @@ where
                     Some(usage.prompt_tokens),
                     Some(usage.cached_tokens),
                     context_window,
+                    active.send_session_id,
+                    session
+                        .as_ref()
+                        .and_then(|s| session_cache_line(database, &s.id)),
                     Some(lt),
                     Some(activity),
                 );
@@ -1394,6 +1421,10 @@ where
                     Some(usage.prompt_tokens),
                     Some(usage.cached_tokens),
                     context_window,
+                    active.send_session_id,
+                    session
+                        .as_ref()
+                        .and_then(|s| session_cache_line(database, &s.id)),
                     None,
                     None,
                 );
@@ -1769,7 +1800,11 @@ where
                     Message::assistant(final_answer),
                 ],
                 tools: Vec::new(),
-                session_id: coding_session_id.clone(),
+                // Sibling sticky id: title must not evict the conversation's warm prefix.
+                session_id: cache::side_session_id(
+                    coding_session_id.as_deref(),
+                    cache::SideRequest::Title,
+                ),
             });
             let title_response = tokio::select! {
                 response = title_request => response,
@@ -2064,7 +2099,10 @@ where
                 Message::assistant(final_answer),
             ],
             tools: Vec::new(),
-            session_id: coding_session_id.clone(),
+            session_id: cache::side_session_id(
+                coding_session_id.as_deref(),
+                cache::SideRequest::Title,
+            ),
         })
         .await;
     match title_response {
@@ -3100,6 +3138,10 @@ fn update_sidebar(
     last_input_tokens: Option<u64>,
     last_cached_tokens: Option<u64>,
     context_window: Option<u64>,
+    // Cache-pinned profile (Orvix Coding Plan): always surface the cache line, including warm-up.
+    cache_pinned: bool,
+    // Session-level cache summary (`median …`), when enough chat turns exist.
+    session_cache: Option<String>,
     last_turn: Option<String>,
     activity: Option<String>,
 ) {
@@ -3148,25 +3190,39 @@ fn update_sidebar(
         let pct = ((tokens as f64 / window as f64) * 100.0).min(100.0).round() as u8;
         context_line.push_str(&format!("\nbar\t{pct}"));
     }
-    if let (Some(tokens), Some(cached)) = (last_input_tokens, last_cached_tokens)
-        && cached > 0
-        && tokens > 0
-    {
-        let hit = (cached as f64 / tokens as f64 * 100.0).min(100.0);
-        context_line.push_str(&format!("\ncache\t{cached} ({hit:.0}%)"));
+    match (last_input_tokens, last_cached_tokens) {
+        (Some(tokens), Some(cached)) if cached > 0 && tokens > 0 => {
+            let hit = (cached as f64 / tokens as f64 * 100.0).min(100.0);
+            context_line.push_str(&format!("\ncache\t{cached} ({hit:.0}%)"));
+        }
+        (Some(_), Some(0)) if cache_pinned => {
+            context_line.push_str("\ncache\t0 (warm-up)");
+        }
+        _ => {}
+    }
+    if let Some(summary) = session_cache {
+        context_line.push_str(&format!("\nsession\t{summary}"));
     }
     entries_push(&mut entries, "Context", context_line);
-    // Status-bar badge: compact token count with context pressure for the amber threshold.
+    // Status-bar badge: tokens + context pressure; cache hit when the turn had one.
     match last_input_tokens {
         Some(tokens) => {
             let pct: u8 = context_window
                 .map(|window| ((tokens as f64 / window as f64) * 100.0).min(100.0).round() as u8)
                 .unwrap_or(0);
-            let text = if tokens >= 1000 {
+            let mut text = if tokens >= 1000 {
                 format!("{:.1}k tok", tokens as f64 / 1000.0)
             } else {
                 format!("{tokens} tok")
             };
+            if let Some(cached) = last_cached_tokens.filter(|c| *c > 0)
+                && tokens > 0
+            {
+                let hit = (cached as f64 / tokens as f64 * 100.0).min(100.0);
+                text.push_str(&format!(" · {hit:.0}% hit"));
+            } else if cache_pinned && last_cached_tokens == Some(0) {
+                text.push_str(" · warm");
+            }
             let _ = chat_ui.set_token_badge(Some((text, pct)));
         }
         None => {
@@ -3180,6 +3236,16 @@ fn update_sidebar(
         entries_push(&mut entries, "Last turn", last_turn);
     }
     let _ = chat_ui.set_sidebar(entries);
+}
+
+/// Session median cache line for the Context rail, or `None` until there are measured turns.
+fn session_cache_line(database: &Database, session_id: &str) -> Option<String> {
+    let samples = database.cache_samples(session_id).ok()?;
+    let report = cache::report(&samples)?;
+    Some(format!(
+        "median {:.0}% · {} turns · \u{2265}90% {:.0}%",
+        report.median, report.measured, report.pct_ge_90
+    ))
 }
 
 /// Push a sidebar group, merging into the previous entry when the same group is

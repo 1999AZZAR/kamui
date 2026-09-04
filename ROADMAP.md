@@ -244,9 +244,10 @@ Orvix Coding Plan support extends Phase 5: `completions_path` plus a sticky `ses
 prompt cache actually holds. Memory and the rolling summary moved out of the system message into a
 volatile tail behind the history; `PrefixGuard` reports any prefix that moves; compaction waits
 until ~85% of the context window on a pinned profile; and `/stats` reports the per-session hit
-median, the share of turns at or above 90%/95%, and how many turns were warm-ups. Still open: title
-generation and compaction share the sticky session id, which may evict the conversation's cached
-prefix upstream — that needs a handshake with the harness rather than a Kamui-only change.
+median, the share of turns at or above 90%/95%, and how many turns were warm-ups. Title generation
+and compaction use derived sticky ids (`{session}:title` / `{session}:compact`) so side requests
+cannot evict the conversation's warm prefix. The fullscreen Context rail and token badge surface
+per-turn cache (including warm-up zeros on pinned profiles) plus the session median when measured.
 
 ## Phase 6: Terminal Experience
 

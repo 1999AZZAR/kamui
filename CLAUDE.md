@@ -409,14 +409,12 @@ Every request is assembled as:
   stays in the denominator, because a prefix that churned mid-session is exactly the failure worth
   seeing. `storage::cache_samples` feeds it from `kind = 'chat'` rows only.
 
-Known gap, not fixed in this pass: title generation and compaction send their own small requests
-under the *same* sticky `session_id`. If the upstream worker keeps one cached prefix per session,
-those requests can evict the conversation's - and title generation fires right after turn one, just
-before the turn the KPI measures. Kamui cannot tell from here what the harness does with a
-non-conversation prefix on a live session. Symptom to look for: turn two reporting `Cached: 0`
-while later turns are fine. Fixing it needs a documented handshake (a derived sub-session id, or
-the harness scoping its cache by prefix hash), so it is a joint decision, not a unilateral Kamui
-change.
+Known gap closed (2026-09-04): title generation and compaction used to share the conversation's
+sticky `session_id`, which could evict the warm prefix on the Coding Plan worker. They now send a
+derived sibling id (`{session}:title` / `{session}:compact` via `cache::side_session_id`) so Orvix
+still receives a required `session_id` while the conversation's Redis sticky key and
+`prompt_cache_key` stay untouched. Symptom that should stop: turn two reporting `Cached: 0` right
+after title generation while later turns are fine.
 
 ## Storage Decisions
 
