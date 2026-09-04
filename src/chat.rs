@@ -263,6 +263,14 @@ where
     let mut head_messages: Option<Vec<Message>> = None;
     let mut cached_memory_snapshot = String::new();
     let mut memory_dirty = true;
+    // Previous turn's cache + model for miss detection (`cache_miss_label`): a drop
+    // beyond the noise floor means the prefix broke. `head_rebuilt_this_turn` marks
+    // turns where we intentionally rebuilt the head (memory/skill change) so the
+    // label names the cause. Model identity is tracked to label model-switch misses.
+    let mut prev_cached: Option<u64> = None;
+    let mut prev_model: Option<String> = None;
+    let mut head_rebuilt_this_turn = false;
+
     'chat: loop {
         // A background job that ended could previously only be found by polling `/jobs`. Report
         // it on the way back to the prompt, which is when there is somewhere to put it.
@@ -627,6 +635,7 @@ where
                                         crate::settings::load_disabled_skills(project.root());
                                     // Skill block is part of the frozen head: refresh next turn.
                                     head_messages = None;
+                                    head_rebuilt_this_turn = true;
                                     chat_ui.notice(&format!(
                                         "/{} is now {}",
                                         skill.name,
@@ -1288,6 +1297,13 @@ where
                     }
                 }
             };
+            let miss_label = cache_miss_label(
+                prev_cached,
+                usage.cached_tokens,
+                usage.prompt_tokens,
+                prev_model.as_deref() != Some(active.model.as_str()),
+                head_rebuilt_this_turn,
+            );
             let usage_line = format_usage(
                 usage.prompt_tokens,
                 usage.completion_tokens,
@@ -1297,6 +1313,7 @@ where
                 ttft,
                 started.elapsed(),
                 context_window,
+                miss_label,
             );
             if chat_ui.is_fullscreen() {
                 // Structured per-metric lines read better in the narrow rail. Tab separates
@@ -1307,8 +1324,9 @@ where
                     let hit = (usage.cached_tokens as f64 / usage.prompt_tokens as f64 * 100.0)
                         .min(100.0);
                     lt.push_str(&format!("\ncache\t{} ({hit:.0}%)", usage.cached_tokens));
+                } else if let Some(miss) = miss_label {
+                    lt.push_str(&format!("\ncache\t{miss}"));
                 }
-                lt.push_str(&format!("\nout\t{}", usage.completion_tokens));
                 if let Some(t) = ttft {
                     lt.push_str(&format!("\nlat\t{}", crate::terminal::format_duration(t)));
                 }
@@ -1361,6 +1379,12 @@ where
             accumulate_usage(&mut final_usage, &usage);
             final_finish = finish_reason;
             last_content = content.clone();
+            // Feed miss detection for the next round: the last round's counts are what
+            // the next request's prefix is measured against. Reset the rebuild flag —
+            // it only names the turn where the rebuild happened.
+            prev_cached = Some(usage.cached_tokens);
+            prev_model = Some(active.model.clone());
+            head_rebuilt_this_turn = false;
 
             if tool_calls.is_empty() {
                 break 'agent Message::assistant(content);
@@ -1541,6 +1565,7 @@ where
                     // visible immediately (same guarantee as the old read-fresh-every-turn).
                     memory_dirty = true;
                     head_messages = None;
+                    head_rebuilt_this_turn = true;
                     dispatch_memory_tool(database, &call.name, &call.arguments)
                 } else if tools.requires_confirmation_for(&call.name, &call.arguments)
                     && !auto_approve
@@ -3114,6 +3139,41 @@ fn entries_push(entries: &mut Vec<(String, String)>, key: &str, value: String) {
     }
 }
 
+/// Prefix-cache miss detection (Pi parity: `cache-stats.ts` `detectCacheMiss`).
+/// Compares this turn's cached tokens against the previous turn's: a drop larger
+/// than the noise floor means the prefix broke somewhere. Returns a short label
+/// for the `cache` line, or `None` when there is nothing worth reporting (first
+/// turn, or the delta is within noise). Callers pass what changed this turn so
+/// the label names the likely cause instead of just saying "miss".
+///
+/// Smallest observable contract: same-prefix turns stay silent, a fresh-prefix
+/// turn after a cached one reports `miss`, first turns never report.
+fn cache_miss_label(
+    prev_cached: Option<u64>,
+    cached: u64,
+    input: u64,
+    model_switched: bool,
+    head_rebuilt: bool,
+) -> Option<&'static str> {
+    /// Misses at or below this many tokens are noise (cold start, rounding),
+    /// not a broken prefix. Same role as Pi's `NOISE_FLOOR_TOKENS = 1024`.
+    const NOISE_FLOOR_TOKENS: u64 = 1024;
+    let prev = prev_cached?;
+    if prev <= NOISE_FLOOR_TOKENS || input == 0 {
+        return None;
+    }
+    if cached >= prev.saturating_sub(NOISE_FLOOR_TOKENS) {
+        return None;
+    }
+    Some(if model_switched {
+        "miss (model switch)"
+    } else if head_rebuilt {
+        "miss (prefix rebuilt)"
+    } else {
+        "miss"
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn format_usage(
     input: u64,
@@ -3124,6 +3184,7 @@ fn format_usage(
     ttft: Option<Duration>,
     elapsed: Duration,
     context_window: Option<u64>,
+    miss_label: Option<&str>,
 ) -> String {
     let mut line = format!("Tokens: {input} input + {output} output = {total} total");
     if cached > 0 {
@@ -3133,6 +3194,8 @@ fn format_usage(
             0.0
         };
         line.push_str(&format!(" | Cached: {cached} ({percent:.0}%)"));
+    } else if let Some(miss) = miss_label {
+        line.push_str(&format!(" | Cache {miss}"));
     }
     if let Some(window) = context_window {
         let percent = input as f64 / window as f64 * 100.0;
@@ -5245,6 +5308,36 @@ mod tests {
         assert_eq!(total.completion_tokens, 50); // output summed across rounds
         assert_eq!(total.total_tokens, 200); // last input + all output
         assert_eq!(total.cached_tokens, 40); // last round wins, like prompt_tokens
+    }
+
+    #[test]
+    fn cache_miss_label_stays_silent_on_first_turn_and_hits() {
+        // No previous turn: never report.
+        assert_eq!(cache_miss_label(None, 0, 5000, false, false), None);
+        assert_eq!(cache_miss_label(None, 3000, 5000, false, false), None);
+        // Same-prefix hit: cached holds steady.
+        assert_eq!(cache_miss_label(Some(4000), 3950, 5000, false, false), None);
+        // Previous turn too small to trust: noise, not a miss.
+        assert_eq!(cache_miss_label(Some(500), 0, 5000, false, false), None);
+    }
+
+    #[test]
+    fn cache_miss_label_names_the_likely_cause() {
+        // Fresh prefix after a cached turn: plain miss.
+        assert_eq!(
+            cache_miss_label(Some(4000), 0, 5000, false, false),
+            Some("miss")
+        );
+        assert_eq!(
+            cache_miss_label(Some(4000), 0, 5000, true, false),
+            Some("miss (model switch)")
+        );
+        assert_eq!(
+            cache_miss_label(Some(4000), 0, 5000, false, true),
+            Some("miss (prefix rebuilt)")
+        );
+        // Partial drop within the noise floor: still a hit.
+        assert_eq!(cache_miss_label(Some(4000), 3500, 5000, false, false), None);
     }
 
     #[test]
