@@ -692,8 +692,9 @@ image input; text-only models will reject it.
 ## Tools
 
 Kamui offers the model these tools: `list_directory` (discover what is in a folder), `read_file`
-(read a file), `grep` (search file contents by regular expression), `glob` (find files by a glob
-pattern), `run_command` (run a shell command, optionally in the background), `command_status`/
+(read UTF-8 text), `read_image` (decode and attach PNG, JPEG, WebP, or GIF pixels for a
+vision-capable model), `grep` (search file contents by regular expression), `glob` (find files by a
+glob pattern), `run_command` (run a shell command, optionally in the background), `command_status`/
 `stop_command` (check on or stop a background job), `patch_file` (edit or create a file),
 `update_plan` (declare a live checklist for a multi-step task), `spawn_agent` (delegate a
 self-contained, read-only task to an isolated sub-agent), `search_code` (semantic code search,

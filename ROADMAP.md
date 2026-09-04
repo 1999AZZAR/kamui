@@ -11,8 +11,9 @@ configured through `kamui.toml`, `/model` switches between named provider profil
 MCP servers can contribute their own tools.
 
 The repository-aware runtime, scalable local search, benchmark runner, line-oriented terminal UI,
-concurrent read-only sub-agents, and persistent scheduled command queue have shipped. Remaining
-items are deliberately limited to the explicitly deferred work below.
+concurrent read-only sub-agents, and persistent scheduled command queue have shipped. Image tools
+(`read_image` plus `@image` / `@clipboard`) are in tree. The next priority is not more surface area
+— it is the dogfooding UX friction below, then the Phase 8+ items.
 
 ## Phase 1: Chat Foundation
 
@@ -135,6 +136,7 @@ Raw `git diff` remains available for code review because a condensed diff can om
 - [x] Project indexing (a deliberately simple v1 — see below; a larger-scale version remains open)
 - [x] Semantic search (`/index`, `search_code`)
 - [x] Image input
+- [x] `read_image` tool (agent-driven; same decode path as `@image`)
 - [ ] PDF input (not planned — handled via MCP)
 
 Directory context is built. Referencing a directory (`@src`) attaches the text files inside it,
@@ -143,15 +145,17 @@ outside a git repository. Files are attached in path order until the shared 128 
 or a 50-file cap runs out; anything left over (binary, too large, or over budget) is reported in a
 trailing note instead of failing the prompt.
 
-Image input is built, from a file or the clipboard. Referencing an image (`@shot.png`, also
-`.jpg`/`.jpeg`/`.gif`/`.webp`) attaches it to the request instead of inlining bytes as text: the file
-is read through the same containment checks, capped at 5 MiB, and carried as a base64
-`ImageAttachment` on the message. `@clipboard` prefers text but falls back to clipboard image data,
-encoding it as PNG, so a screenshot can be pasted straight into a prompt — terminals cannot accept
-pasted image data directly, so this is the paste path. The OpenAI adapter
-emits a content-parts array (`text` plus `image_url` data URLs) only when images are present, so
-text-only requests keep their plain-string content. Images are per-request and are not persisted.
-The model must support vision.
+Image input is built, from a file, the clipboard, or the `read_image` tool. Referencing an image
+(`@shot.png`, also `.jpg`/`.jpeg`/`.gif`/`.webp`) attaches it to the request instead of inlining
+bytes as text: the file is read through the same containment checks, capped at 5 MiB, and carried as
+a base64 `ImageAttachment` on the message. `@clipboard` prefers text but falls back to clipboard
+image data, encoding it as PNG, so a screenshot can be pasted straight into a prompt — terminals
+cannot accept pasted image data directly, so this is the paste path. `read_image` uses the same
+decode path when the model asks for a project screenshot mid-turn; vision attachments are appended
+only after every contiguous `tool` result in that batch so OpenAI-compatible upstreams do not 400
+on unpaired `call_id`s. The OpenAI adapter emits a content-parts array (`text` plus `image_url`
+data URLs) only when images are present, so text-only requests keep their plain-string content.
+Images are per-request and are not persisted. The model must support vision.
 
 Context compaction is built (`src/compaction.rs`). When a session's un-summarized recent history
 grows past a byte threshold (about half the profile's `context_window`, or a default), the older
@@ -458,4 +462,120 @@ prompt.
 - [x] Skill loader leniency matching opencode plus /warnings details and agent-driven repair
 - [x] Safe exit: double Ctrl+C confirmation at idle prompt
 
-Deferred: theme switching, @-file completion popup, timeline/subagent dialogs.
+Deferred from Phase 7 originally: theme switching, @-file completion popup, timeline/subagent
+dialogs. The completion popup and Plan Mode/resume friction are now tracked under **Near-term**
+below — work those before Phase 8–11 polish.
+
+## Near-term: Dogfooding UX (priority)
+
+Captured from real fullscreen Kamui sessions (2026-09). Happy-path friction beat aspirational
+polish: users hit these before they ever need a design system or batch-approval modal.
+
+### Session and commands
+
+- [ ] `/resume` with no id opens the session picker (same path as Ctrl+S / `/sessions`)
+- [ ] Accept unambiguous prefixes such as `/sess` → `/sessions` (and keep “did you mean” for
+      ambiguous typos)
+- [ ] Model picker lists every configured profile, not only the active/default entry
+
+### Plan Mode and live input
+
+- [ ] One clear approve path: after the user approves (permission modal or an explicit `approve`),
+      do not leave them in “plan not approved — still in Plan Mode” and ask again
+- [ ] Short control replies typed while a turn is running (`approve`, mode status, stop intents)
+      must not silently land in the Enter-queue as ordinary chat; consume them or surface that they
+      queued
+- [ ] Sidebar / notices must agree on mode (`plan` vs `build`) the moment approval lands
+
+### Editor and agent habits
+
+- [ ] `@`-file / directory completion popup in the fullscreen editor (Phase 7 deferred item;
+      still the highest-value TUI completion gap)
+- [ ] Prefer built-in `read_file` / `grep` / `glob` over `run_command`+`sed` for reading project
+      files (prompt/tool guidance), so dogfooding turns stay short
+
+### Image / multimodal (shipped basis)
+
+- [x] Explicit `read_image` tool alongside `@image` / `@clipboard` context input
+- [x] Defer vision `user` attachments until after every contiguous `tool` result in the batch
+      (fixes upstream 400 `No tool call found for function call output with call_id …` on
+      OpenAI-compatible / Orvix Coding)
+
+## Phase 8: Approval and Multi-Tool Workflow
+
+Do not start this phase until the Near-term dogfooding items above are in a usable state. The core
+permission modal already exists; the next step is reducing friction when one turn produces several
+independent commands or file edits without weakening reviewability.
+
+- [ ] Group pending tool calls into a single reviewable batch
+- [ ] Show a grouped command/diff preview with tool, path, risk, and affected files
+- [ ] Approve all, reject all, or approve/reject individual items in a batch
+- [ ] Keep approval scope explicit: once, tool-for-session, or reviewed-batch only
+- [ ] Preserve path validation, command allowlists, and capability checks for every item
+- [ ] Support stop-on-first-error versus continue-independent-items behavior
+- [ ] Add batch progress and per-item status in the TUI
+- [ ] Add atomic batch rollback while preserving the existing per-turn `/undo`
+- [ ] Persist an audit record for every requested, approved, rejected, failed, and reverted call
+
+## Phase 9: Context and Agent UX
+
+- [ ] Context inspector showing files, images, tools, and estimated token contribution
+- [x] Explicit `read_image` tool alongside existing `@image` context input (see Near-term)
+- [ ] Clear model capability indicators for tools, vision, embeddings, and context size
+- [ ] Tool-call timeline with duration, output size, cancellation, and sub-agent activity
+- [ ] Better test-failure summary with actionable retry and fix flows
+- [ ] Theme switching (completion popup tracked under Near-term)
+- [ ] Dedicated timeline and sub-agent detail dialogs
+
+## Phase 10: Reliability and Integrations
+
+- [ ] End-to-end coverage for multi-tool turns, batch approval, cancellation, rollback, and resume
+- [ ] Provider compatibility tests for text-only and multimodal requests
+- [ ] LSP integration for diagnostics, definitions, references, and formatting
+- [ ] Extensible plugin/tool contracts with explicit permission boundaries
+- [ ] Remote SSH/dev-container execution with visible project and environment indicators
+
+## Phase 11: UI/UX Design System and Interaction Polish
+
+Kamui should feel intentional and polished rather than like a chat log wrapped in borders. Visual hierarchy, interaction feedback, and keyboard behavior must remain clear in both wide and narrow terminals.
+
+### Visual system
+
+- [ ] Define reusable design tokens for color, spacing, borders, emphasis, and semantic states
+- [ ] Ship cohesive built-in dark themes with accessible contrast and graceful 16/256-color fallbacks
+- [ ] Give user, assistant, tool, warning, error, plan, and approval blocks distinct but restrained styling
+- [ ] Improve information hierarchy so primary content stays prominent and metadata remains scannable
+- [ ] Keep layout stable while streaming; avoid unnecessary jumps, flicker, and modal size changes
+- [ ] Add polished empty, loading, success, error, interrupted, and no-result states
+
+### Batch approval experience
+
+- [ ] Design a dedicated batch-review modal with a summary header and scrollable item list
+- [ ] Show each item's tool icon, target, concise action, risk level, and current decision
+- [ ] Provide obvious actions: Allow selected, Allow all reviewed, Reject selected, Reject all, and Cancel turn
+- [ ] Support keyboard selection, range selection, expand/collapse details, and mouse interaction
+- [ ] Preview command output intent and file diffs inline without leaving the approval flow
+- [ ] Clearly distinguish `Allow once`, `Allow this reviewed batch`, and `Always allow tool this session`
+- [ ] Require additional confirmation for destructive or high-risk commands even inside a batch
+- [ ] Show live batch progress and a final per-item result summary with retry options
+
+### Navigation and responsiveness
+
+- [ ] Add a discoverable command palette with fuzzy search, categories, and shortcut hints
+- [ ] Add responsive wide, compact, and single-pane layouts based on terminal dimensions
+- [ ] Preserve focus predictably when opening/closing modals and return to the previous position
+- [ ] Add visible focus, selection, scroll position, and unread/new-output indicators
+- [ ] Make transcript, sidebar, context inspector, diff, and tool timeline independently navigable
+- [ ] Provide first-run onboarding and contextual hints that disappear after the user learns the flow
+
+### Accessibility and validation
+
+- [ ] Never communicate state using color alone; pair color with labels, symbols, or patterns
+- [ ] Respect `NO_COLOR`, terminal capabilities, reduced motion, and configurable animation
+- [ ] Document every keyboard shortcut and provide remapping for common conflicts
+- [ ] Test at common terminal sizes, including 80x24, split panes, and very narrow windows
+- [ ] Add snapshot/golden tests for important screens, dialogs, wrapping, and theme variants
+- [ ] Run usability tests for first-time approval, batch review, context inspection, and recovery from errors
+- [ ] Establish measurable UX budgets for keypresses, modal depth, visual jitter, and time-to-understand
+
+

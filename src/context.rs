@@ -9,7 +9,9 @@ use std::process::Command;
 const INSTRUCTION_FILES: [&str; 2] = ["KAMUI.md", "AGENTS.md"];
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 const MAX_CONTEXT_BYTES: usize = 128 * 1024;
-const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_IMAGE_PIXELS: u64 = 25_000_000;
+const MAX_IMAGE_DIMENSION: u32 = 4096;
 const MAX_DIRECTORY_FILES: usize = 50;
 
 /// A prompt after `@` references are expanded: text context inlined, images carried separately.
@@ -116,9 +118,10 @@ impl ProjectContext {
                 continue;
             }
 
-            // Images cannot be inlined as text; they travel as attachments on the message.
-            if let Some(media_type) = image_media_type(Path::new(&reference)) {
-                images.push(read_project_image(&self.root, &reference, media_type)?);
+            // Images cannot be inlined as text; they travel as attachments on the message. The
+            // extension only selects this branch; the loader validates the actual magic bytes.
+            if is_image_path(Path::new(&reference)) {
+                images.push(read_project_image(&self.root, &reference)?.attachment);
                 context.push_str(&format!(
                     "\n\n<context source=\"{reference}\">(image attached)</context>"
                 ));
@@ -430,24 +433,52 @@ fn read_project_directory(
     })
 }
 
-/// Recognize an attachable image by extension, returning its MIME type.
-fn image_media_type(path: &Path) -> Option<&'static str> {
-    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    match extension.as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        _ => None,
+fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp"
+            )
+        })
+}
+
+/// A decoded project image ready for native multimodal transport.
+#[derive(Debug)]
+pub struct ProjectImage {
+    pub attachment: ImageAttachment,
+    pub filename: String,
+    pub media_type: String,
+    pub original_width: u32,
+    pub original_height: u32,
+    pub width: u32,
+    pub height: u32,
+    pub file_size: u64,
+    pub resized: bool,
+}
+
+impl ProjectImage {
+    pub fn metadata(&self) -> String {
+        format!(
+            "Image: {}\nMIME type: {}\nDimensions: {}x{}\nOriginal dimensions: {}x{}\nFile size: {} bytes\nResized: {}",
+            self.filename,
+            self.media_type,
+            self.width,
+            self.height,
+            self.original_width,
+            self.original_height,
+            self.file_size,
+            self.resized
+        )
     }
 }
 
-/// Read a project image and encode it for transport. Uses the same containment checks as text.
-fn read_project_image(
-    root: &Path,
-    reference: &str,
-    media_type: &'static str,
-) -> Result<ImageAttachment> {
+/// Decode an image selected by the model, validating its real format from the bytes. Images that
+/// exceed provider-friendly dimensions are resized while preserving aspect ratio and encoded PNG.
+pub fn read_project_image(root: &Path, reference: &str) -> Result<ProjectImage> {
+    use image::ImageFormat;
+
     let path = resolve_within_root(root, reference)?;
     if !path.is_file() {
         anyhow::bail!("path is not a file: {reference}");
@@ -461,9 +492,60 @@ fn read_project_image(
         );
     }
     let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(ImageAttachment {
+    let format = image::guess_format(&bytes)
+        .with_context(|| format!("{reference} is not a supported PNG, JPEG, WebP, or GIF image"))?;
+    let media_type = match format {
+        ImageFormat::Png => "image/png",
+        ImageFormat::Jpeg => "image/jpeg",
+        ImageFormat::WebP => "image/webp",
+        ImageFormat::Gif => "image/gif",
+        _ => anyhow::bail!("{reference} is not a supported PNG, JPEG, WebP, or GIF image"),
+    };
+    let decoded = image::load_from_memory_with_format(&bytes, format)
+        .with_context(|| format!("failed to decode image {reference}"))?;
+    let original_width = decoded.width();
+    let original_height = decoded.height();
+    let pixels = u64::from(original_width) * u64::from(original_height);
+    let resize_scale = (MAX_IMAGE_DIMENSION as f64
+        / f64::from(original_width.max(original_height)))
+    .min((MAX_IMAGE_PIXELS as f64 / pixels.max(1) as f64).sqrt())
+    .min(1.0);
+    let resized = resize_scale < 1.0;
+    let decoded = if resized {
+        let width = (f64::from(original_width) * resize_scale).floor().max(1.0) as u32;
+        let height = (f64::from(original_height) * resize_scale).floor().max(1.0) as u32;
+        decoded.resize_exact(width, height, image::imageops::FilterType::Lanczos3)
+    } else {
+        decoded
+    };
+    let width = decoded.width();
+    let height = decoded.height();
+    let (output_type, output) = if resized {
+        let mut output = std::io::Cursor::new(Vec::new());
+        decoded
+            .write_to(&mut output, ImageFormat::Png)
+            .with_context(|| format!("failed to encode resized image {reference}"))?;
+        ("image/png", output.into_inner())
+    } else {
+        (media_type, bytes)
+    };
+    Ok(ProjectImage {
+        attachment: ImageAttachment {
+            media_type: output_type.to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(output),
+        },
+        filename: path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
         media_type: media_type.to_string(),
-        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        original_width,
+        original_height,
+        width,
+        height,
+        file_size: metadata.len(),
+        resized,
     })
 }
 
@@ -792,7 +874,11 @@ mod tests {
     #[test]
     fn attaches_an_image_reference_as_an_attachment() {
         let root = project();
-        fs::write(root.join("shot.png"), b"fake-png-bytes").unwrap();
+        let attachment = encode_png(1, 1, &[255, 0, 0, 255]).unwrap();
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(attachment.data)
+            .unwrap();
+        fs::write(root.join("shot.png"), png).unwrap();
         let context = ProjectContext::from_root(root.clone()).unwrap();
 
         let expanded = context.expand_file_references("look at @shot.png").unwrap();
@@ -802,7 +888,7 @@ mod tests {
         assert!(!expanded.images[0].data.is_empty());
         // The text notes the attachment but does not inline the bytes.
         assert!(expanded.text.contains("shot.png"));
-        assert!(!expanded.text.contains("fake-png-bytes"));
+        assert!(!expanded.text.contains("iVBOR"));
         fs::remove_dir_all(root).unwrap();
     }
 

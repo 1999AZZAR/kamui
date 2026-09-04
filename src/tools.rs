@@ -1,7 +1,7 @@
 use crate::context::{
     list_project_directory, read_project_file, resolve_for_write, resolve_within_root,
 };
-use crate::provider::{ToolCall, ToolDefinition};
+use crate::provider::{ImageAttachment, ToolCall, ToolDefinition};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::json;
@@ -47,6 +47,7 @@ pub trait Tool: Send + Sync {
 /// The set of tools offered to the model, and the dispatcher that runs a requested call.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    project_root: PathBuf,
     jobs: JobRegistry,
 }
 
@@ -65,6 +66,7 @@ impl ToolRegistry {
             Box::new(ReadFileTool {
                 root: project_root.clone(),
             }),
+            Box::new(ReadImageTool),
             Box::new(ListDirectoryTool {
                 root: project_root.clone(),
             }),
@@ -84,10 +86,16 @@ impl ToolRegistry {
             }),
             Box::new(CommandStatusTool { jobs: jobs.clone() }),
             Box::new(StopCommandTool { jobs: jobs.clone() }),
-            Box::new(PatchFileTool { root: project_root }),
+            Box::new(PatchFileTool {
+                root: project_root.clone(),
+            }),
         ];
         tools.extend(extra);
-        Self { tools, jobs }
+        Self {
+            tools,
+            jobs,
+            project_root,
+        }
     }
 
     /// A read-only registry for an isolated sub-agent (see `spawn_agent`): only
@@ -99,17 +107,21 @@ impl ToolRegistry {
             Box::new(ReadFileTool {
                 root: project_root.clone(),
             }),
+            Box::new(ReadImageTool),
             Box::new(ListDirectoryTool {
                 root: project_root.clone(),
             }),
             Box::new(GrepTool {
                 root: project_root.clone(),
             }),
-            Box::new(GlobTool { root: project_root }),
+            Box::new(GlobTool {
+                root: project_root.clone(),
+            }),
         ];
         Self {
             tools,
             jobs: Arc::new(Mutex::new(HashMap::new())),
+            project_root,
         }
     }
 
@@ -117,6 +129,26 @@ impl ToolRegistry {
     /// protocol (the chat loop's `/jobs` command, killing jobs on shutdown) can reach it directly.
     pub fn jobs(&self) -> JobRegistry {
         self.jobs.clone()
+    }
+
+    /// Read an image for the chat loop, which must carry it as multimodal content.
+    pub fn read_image(&self, arguments: &str) -> Result<(String, ImageAttachment)> {
+        let value: serde_json::Value =
+            serde_json::from_str(arguments).context("tool arguments were not valid JSON")?;
+        let path = value
+            .get("path")
+            .and_then(|path| path.as_str())
+            .context("read_image requires a 'path' string argument")?;
+        if let Some(detail) = value.get("detail") {
+            let detail = detail
+                .as_str()
+                .context("read_image detail must be a string")?;
+            if !matches!(detail, "low" | "high" | "auto") {
+                anyhow::bail!("read_image detail must be low, high, or auto");
+            }
+        }
+        let image = crate::context::read_project_image(&self.project_root, path)?;
+        Ok((image.metadata(), image.attachment))
     }
 
     /// A preview of what a confirmation-gated call would do, if the tool provides one.
@@ -163,6 +195,12 @@ impl ToolRegistry {
     /// Run a requested call. Failures are returned as an `Error: ...` string rather than propagated
     /// so the model can read the problem and recover on the next turn.
     pub async fn dispatch(&self, call: &ToolCall) -> String {
+        if call.name == "read_image" {
+            return match self.read_image(&call.arguments) {
+                Ok((metadata, _)) => metadata,
+                Err(error) => format!("Error: {error:#}"),
+            };
+        }
         match self.tools.iter().find(|tool| tool.name() == call.name) {
             Some(tool) => match tool.run(&call.arguments).await {
                 Ok(output) => output,
@@ -358,6 +396,33 @@ impl Tool for ReadFileTool {
             .and_then(|path| path.as_str())
             .context("read_file requires a 'path' string argument")?;
         read_project_file(&self.root, path)
+    }
+}
+
+/// Image execution is handled by the chat loop because ordinary tool results are text-only.
+struct ReadImageTool;
+
+#[async_trait]
+impl Tool for ReadImageTool {
+    fn name(&self) -> &str {
+        "read_image"
+    }
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name().to_string(),
+            description: "Read an image from the project and attach it as visual input for the model. Requires a vision-capable model.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Project-relative path to a PNG, JPEG, WebP, or GIF image." },
+                    "detail": { "type": "string", "enum": ["low", "high", "auto"], "default": "auto" }
+                },
+                "required": ["path"]
+            }),
+        }
+    }
+    async fn run(&self, _arguments: &str) -> Result<String> {
+        anyhow::bail!("read_image must be executed by the multimodal chat loop")
     }
 }
 
@@ -2125,8 +2190,8 @@ mod tests {
             .into_iter()
             .map(|definition| definition.name)
             .collect();
-        assert_eq!(names.len(), 4);
-        for expected in ["read_file", "list_directory", "grep", "glob"] {
+        assert_eq!(names.len(), 5);
+        for expected in ["read_file", "read_image", "list_directory", "grep", "glob"] {
             assert!(names.contains(&expected.to_string()), "{names:?}");
         }
         for forbidden in ["run_command", "patch_file", "update_plan", "spawn_agent"] {

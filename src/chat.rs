@@ -1495,6 +1495,7 @@ where
                     }
                 }
             }
+            let mut pending_visuals = Vec::new();
             for call in &tool_calls {
                 let tool_started = Instant::now();
                 if call.name == tools::UPDATE_PLAN_TOOL
@@ -1704,9 +1705,31 @@ where
                     tool_body(&output).to_string()
                 };
                 chat_ui.tool_finished(&outcome, ok, &body)?;
-                let result_message = Message::tool_result(&call.id, output);
+                let result_message = Message::tool_result(&call.id, output.clone());
                 turn_messages.push(result_message.clone());
                 tool_trail.push(result_message);
+                // Defer vision attachments until every tool result in this batch is
+                // on the wire. A `user` message mid-batch breaks OpenAI's rule that
+                // every tool_call_id must be answered contiguously after the
+                // assistant tool_calls message (Orvix returns 400 otherwise).
+                if call.name == "read_image" && !output.starts_with("Error: ") {
+                    pending_visuals.push(match tools.read_image(&call.arguments) {
+                        Ok((metadata, image)) => Message::user_with_images(
+                            format!(
+                                "Visual input returned by read_image tool call {}:\n{metadata}",
+                                call.id
+                            ),
+                            vec![image],
+                        ),
+                        Err(error) => {
+                            Message::user(format!("Image attachment failed: {error:#}"))
+                        }
+                    });
+                }
+            }
+            for visual in pending_visuals {
+                turn_messages.push(visual.clone());
+                tool_trail.push(visual);
             }
         };
 
@@ -1975,6 +1998,7 @@ where
             coding_session_id.clone(),
         )
         .await;
+        let mut pending_visuals = Vec::new();
         for call in &response.tool_calls {
             let tool_started = Instant::now();
             if call.name == tools::UPDATE_PLAN_TOOL
@@ -2045,9 +2069,29 @@ where
                 );
             }
             println!("{}", ui.tool_outcome(&output, elapsed));
-            let result_message = Message::tool_result(&call.id, output);
+            let result_message = Message::tool_result(&call.id, output.clone());
             turn_messages.push(result_message.clone());
             tool_trail.push(result_message);
+            // Defer vision attachments until every tool result in this batch is
+            // on the wire. A `user` message mid-batch breaks OpenAI's rule that
+            // every tool_call_id must be answered contiguously after the
+            // assistant tool_calls message (Orvix returns 400 otherwise).
+            if call.name == "read_image" && !output.starts_with("Error: ") {
+                pending_visuals.push(match tools.read_image(&call.arguments) {
+                    Ok((metadata, image)) => Message::user_with_images(
+                        format!(
+                            "Visual input returned by read_image tool call {}:\n{metadata}",
+                            call.id
+                        ),
+                        vec![image],
+                    ),
+                    Err(error) => Message::user(format!("Image attachment failed: {error:#}")),
+                });
+            }
+        }
+        for visual in pending_visuals {
+            turn_messages.push(visual.clone());
+            tool_trail.push(visual);
         }
     };
 

@@ -12,7 +12,8 @@ unsure, say so rather than inventing details.";
 const TOOLS: &str = "\
 You can call tools to work in the repository:
 - list_directory: see what a folder contains.
-- read_file: read a file's contents.
+- read_file: read a UTF-8 text file's contents.
+- read_image: decode a project image and attach it as native visual input (requires a vision-capable model).
 - grep: search file contents by regular expression across the project.
 - glob: find files by a glob pattern, e.g. \"src/**/*.rs\".
 - run_command: run a shell command (the user must approve it before it runs).
