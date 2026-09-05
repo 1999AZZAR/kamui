@@ -18,6 +18,7 @@ pub struct ConnectionStatus {
     pub name: String,
     pub tool_count: usize,
     pub trusted: bool,
+    pub disabled: bool,
     pub error: Option<String>,
 }
 
@@ -27,17 +28,29 @@ pub struct Connections {
 }
 
 /// Connect to every configured server, returning all tools they advertise. A server that fails to
-/// start is reported and skipped rather than preventing Kamui from running.
+/// start is reported and skipped rather than preventing Kamui from running; a disabled server is
+/// recorded so the UI can list it for re-enabling, but its tools are not loaded.
 pub async fn connect_all(servers: &[McpServer]) -> Connections {
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
     let mut statuses = Vec::new();
     for server in servers {
+        if !server.enabled {
+            statuses.push(ConnectionStatus {
+                name: server.name.clone(),
+                tool_count: 0,
+                trusted: server.trusted,
+                disabled: true,
+                error: None,
+            });
+            continue;
+        }
         match connect(server).await {
             Ok(mut connected) => {
                 statuses.push(ConnectionStatus {
                     name: server.name.clone(),
                     tool_count: connected.len(),
                     trusted: server.trusted,
+                    disabled: false,
                     error: None,
                 });
                 tools.append(&mut connected);
@@ -46,6 +59,7 @@ pub async fn connect_all(servers: &[McpServer]) -> Connections {
                 name: server.name.clone(),
                 tool_count: 0,
                 trusted: server.trusted,
+                disabled: false,
                 error: Some(format!("{error:#}")),
             }),
         }

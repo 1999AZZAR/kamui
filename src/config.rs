@@ -156,6 +156,9 @@ pub struct McpServer {
     pub env: HashMap<String, String>,
     pub url: Option<String>,
     pub headers: HashMap<String, String>,
+    /// Whether the server participates in the current session. Disabled servers are kept
+    /// (rather than dropped) so `/mcp` can list and re-enable them.
+    pub enabled: bool,
 }
 
 /// Fully resolved runtime configuration: every available profile plus the default choice.
@@ -479,13 +482,13 @@ fn resolve_prices(global: PricingSection, project: Option<PricingSection>) -> Re
     Prices::new(currency, models)
 }
 
-/// Turn `[mcp.<name>]` blocks into launchable server definitions, ordered by name.
+/// Turn `[mcp.<name>]` blocks into launchable server definitions, ordered by name. Disabled
+/// servers are kept (with `enabled = false`) rather than dropped, so `/mcp` can list and
+/// re-enable them; `mcp::connect_all` skips them.
 fn resolve_mcp_servers(sections: HashMap<String, McpSection>) -> Result<Vec<McpServer>> {
     let mut servers = Vec::with_capacity(sections.len());
     for (name, section) in sections {
-        if section.enabled == Some(false) {
-            continue;
-        }
+        let enabled = section.enabled.unwrap_or(true);
         let is_remote = section
             .kind
             .as_deref()
@@ -503,6 +506,7 @@ fn resolve_mcp_servers(sections: HashMap<String, McpSection>) -> Result<Vec<McpS
                 env: HashMap::new(),
                 url: Some(url),
                 headers: section.headers,
+                enabled,
             });
             continue;
         }
@@ -519,6 +523,7 @@ fn resolve_mcp_servers(sections: HashMap<String, McpSection>) -> Result<Vec<McpS
             env,
             url: None,
             headers: HashMap::new(),
+            enabled,
         });
     }
     servers.sort_by(|a, b| a.name.cmp(&b.name));
@@ -712,6 +717,33 @@ pub fn save_theme(path: &Path, theme: &str) -> Result<()> {
         .context("global config must be a TOML table")?;
     table.insert("theme".to_string(), toml::Value::String(theme.to_string()));
     let rendered = toml::to_string_pretty(&doc).context("could not serialize theme config")?;
+    std::fs::write(path, rendered)?;
+    Ok(())
+}
+
+/// Toggle an `[mcp.<name>]` server's `enabled` flag in the global `kamui.toml`. The runtime
+/// connection is made at startup, so the change applies on the next launch; `/mcp` reports that.
+pub fn set_mcp_enabled(path: &Path, name: &str, enabled: bool) -> Result<()> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut doc: toml::Value = if content.trim().is_empty() {
+        toml::Value::Table(Default::default())
+    } else {
+        toml::from_str(&content).unwrap_or(toml::Value::Table(Default::default()))
+    };
+    let mcp = doc
+        .as_table_mut()
+        .context("global config must be a TOML table")?
+        .entry("mcp")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .context("[mcp] must be a TOML table")?;
+    let server = mcp
+        .entry(name.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .context("mcp server entry must be a TOML table")?;
+    server.insert("enabled".to_string(), toml::Value::Boolean(enabled));
+    let rendered = toml::to_string_pretty(&doc).context("could not serialize mcp config")?;
     std::fs::write(path, rendered)?;
     Ok(())
 }
@@ -1170,10 +1202,12 @@ api_key = "k"
         )
         .unwrap();
 
-        assert_eq!(config.mcp_servers.len(), 1, "disabled servers are skipped");
-        let on = &config.mcp_servers[0];
-        assert_eq!(on.name, "on");
+        assert_eq!(config.mcp_servers.len(), 2, "disabled servers are kept");
+        let on = config.mcp_servers.iter().find(|s| s.name == "on").unwrap();
+        assert!(on.enabled);
         assert_eq!(on.env.get("TOKEN").map(String::as_str), Some("t"));
+        let off = config.mcp_servers.iter().find(|s| s.name == "off").unwrap();
+        assert!(!off.enabled);
     }
 
     #[test]
