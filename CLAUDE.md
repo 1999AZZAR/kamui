@@ -178,8 +178,10 @@ effort or operational risk is disproportionate to their immediate value.
   `glob` only — no `run_command`, `patch_file`, memory tools, or recursive `spawn_agent`), so none
   of its tool calls ever need confirmation and it cannot mutate anything. Independent calls emitted
   in one response run concurrently through `chat::dispatch_spawn_agents` in batches capped at four;
-  outputs return in original tool-call order. The parent waits for the batch, and no parallel
-  approval flow is needed because every sub-agent tool is read-only.
+  outputs return in original tool-call order. Each invocation derives a sibling sticky ID from its
+  tool-call ID and reuses it for every round, isolating its prompt cache from the parent and other
+  sub-agents. The parent waits for the batch, and no parallel approval flow is needed because every
+  sub-agent tool is read-only.
 - `/index` rebuilds the semantic-search index (`chat::run_index`): walks the project the same
   `.gitignore`-aware way `grep`/`glob` do, splits each file into roughly 50-line chunks
   (`tools::chunk_text`, preferring blank lines and common declaration starts near the target),

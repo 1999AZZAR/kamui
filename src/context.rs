@@ -300,6 +300,27 @@ pub fn active_at_reference(input: &str, caret: usize) -> Option<ActiveAtReferenc
     None
 }
 
+/// Returns the valid attachment references in input, using a caller-provided candidate snapshot.
+/// This intentionally does no filesystem work: the TUI refreshes the snapshot separately.
+pub fn attachment_indicators(input: &str, candidates: &[String]) -> Vec<String> {
+    let valid: HashSet<&str> = candidates
+        .iter()
+        .map(|candidate| candidate.trim_start_matches('@'))
+        .collect();
+    let mut seen = HashSet::new();
+    file_references(input)
+        .into_iter()
+        .filter(|reference| valid.contains(reference.as_str()) && seen.insert(reference.clone()))
+        .map(|reference| match reference.as_str() {
+            "clipboard" => "clipboard".to_string(),
+            "diff" => "diff".to_string(),
+            "staged" => "staged".to_string(),
+            _ if is_image_path(Path::new(&reference)) => reference,
+            _ => reference,
+        })
+        .collect()
+}
+
 fn file_references(input: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut references = Vec::new();
@@ -561,6 +582,10 @@ fn is_image_path(path: &Path) -> bool {
                 "png" | "jpg" | "jpeg" | "gif" | "webp"
             )
         })
+}
+
+pub fn is_image_reference(reference: &str) -> bool {
+    is_image_path(Path::new(reference))
 }
 
 /// A decoded project image ready for native multimodal transport.
@@ -1064,6 +1089,25 @@ mod tests {
     fn file_references_ignore_mid_word_at_signs() {
         let refs = file_references("email a@b.test then read @src/main.rs");
         assert_eq!(refs, vec!["src/main.rs".to_string()]);
+    }
+
+    #[test]
+    fn attachment_indicators_validate_snapshot_and_deduplicate() {
+        let candidates = vec![
+            "@src/".to_string(),
+            "@src/main.rs".to_string(),
+            "@shot.png".to_string(),
+            "@diff".to_string(),
+            "@staged".to_string(),
+            "@clipboard".to_string(),
+        ];
+        assert_eq!(
+            attachment_indicators(
+                "@src/ @shot.png @diff @staged @clipboard @diff nope@src/ @missing",
+                &candidates
+            ),
+            ["src/", "shot.png", "diff", "staged", "clipboard"]
+        );
     }
 
     #[test]

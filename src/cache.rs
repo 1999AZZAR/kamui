@@ -135,6 +135,15 @@ pub fn side_session_id(conversation_id: Option<&str>, kind: SideRequest) -> Opti
         .map(|id| format!("{id}{}", kind.suffix()))
 }
 
+/// Sticky id for one `spawn_agent` tool call. Every round of that sub-agent reuses this id, while
+/// separate tool calls cannot share the conversation's or each other's prompt cache.
+pub fn sub_agent_session_id(conversation_id: Option<&str>, tool_call_id: &str) -> Option<String> {
+    conversation_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| format!("{id}:agent:{tool_call_id}"))
+}
+
 /// Watches the prefix of a cache-pinned session for drift.
 ///
 /// It never rewrites a request: a user who toggles a skill or enters Plan Mode must get the tools
@@ -457,5 +466,22 @@ mod tests {
         let chat = "abc-123";
         let title = side_session_id(Some(chat), SideRequest::Title).unwrap();
         assert_ne!(title, chat);
+    }
+
+    #[test]
+    fn sub_agents_derive_per_invocation_sibling_ids() {
+        assert_eq!(sub_agent_session_id(None, "call-1"), None);
+        assert_eq!(
+            sub_agent_session_id(Some("abc-123"), "call-1").as_deref(),
+            Some("abc-123:agent:call-1")
+        );
+        assert_ne!(
+            sub_agent_session_id(Some("abc-123"), "call-1"),
+            sub_agent_session_id(Some("abc-123"), "call-2")
+        );
+        assert_ne!(
+            sub_agent_session_id(Some("abc-123"), "call-1"),
+            side_session_id(Some("abc-123"), SideRequest::Title)
+        );
     }
 }
