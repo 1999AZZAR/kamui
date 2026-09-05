@@ -150,6 +150,7 @@ pub struct McpServer {
     pub args: Vec<String>,
     /// When true, this server's tools run without per-call approval.
     pub trusted: bool,
+    pub env: HashMap<String, String>,
 }
 
 /// Fully resolved runtime configuration: every available profile plus the default choice.
@@ -244,6 +245,11 @@ struct McpSection {
     args: Vec<String>,
     #[serde(default)]
     trusted: bool,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    /// opencode uses `environment`, accept both
+    #[serde(default)]
+    environment: HashMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -466,11 +472,14 @@ fn resolve_mcp_servers(sections: HashMap<String, McpSection>) -> Result<Vec<McpS
         let command = section
             .command
             .with_context(|| format!("mcp server '{name}' is missing a command"))?;
+        let mut env = section.env;
+        env.extend(section.environment);
         servers.push(McpServer {
             name,
             command,
             args: section.args,
             trusted: section.trusted,
+            env,
         });
     }
     servers.sort_by(|a, b| a.name.cmp(&b.name));

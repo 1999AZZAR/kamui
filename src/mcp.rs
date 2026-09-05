@@ -56,6 +56,9 @@ pub async fn connect_all(servers: &[McpServer]) -> Connections {
 async fn connect(server: &McpServer) -> Result<Vec<Box<dyn Tool>>> {
     let mut command = tokio::process::Command::new(&server.command);
     command.args(&server.args);
+    for (k, v) in &server.env {
+        command.env(k, v);
+    }
 
     // The transport defaults to inheriting stderr, which would interleave the server's own logging
     // with the chat UI, so it is silenced explicitly through the builder.
