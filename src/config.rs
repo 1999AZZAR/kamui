@@ -654,9 +654,17 @@ pub fn global_config_dir() -> Result<PathBuf> {
 /// repeated append can never produce a TOML table collision.
 pub fn save_theme(path: &Path, theme: &str) -> Result<()> {
     let content = std::fs::read_to_string(path).unwrap_or_default();
-    let mut doc: toml::Value = if content.trim().is_empty() { toml::Value::Table(Default::default()) } else { toml::from_str(&content).unwrap_or(toml::Value::Table(Default::default())) };
-    doc.as_table_mut().unwrap().insert("theme".to_string(), toml::Value::String(theme.to_string()));
-    std::fs::write(path, toml::to_string_pretty(&doc).unwrap())?;
+    let mut doc: toml::Value = if content.trim().is_empty() {
+        toml::Value::Table(Default::default())
+    } else {
+        toml::from_str(&content).unwrap_or(toml::Value::Table(Default::default()))
+    };
+    let table = doc
+        .as_table_mut()
+        .context("global config must be a TOML table")?;
+    table.insert("theme".to_string(), toml::Value::String(theme.to_string()));
+    let rendered = toml::to_string_pretty(&doc).context("could not serialize theme config")?;
+    std::fs::write(path, rendered)?;
     Ok(())
 }
 
