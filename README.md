@@ -813,6 +813,8 @@ exploration in the main conversation itself. The sub-agent:
 - Runs concurrently when the model issues several independent `spawn_agent` calls in one response.
   Kamui caps each batch at four and returns results in the original tool-call order. The parent turn
   still waits for the batch; read-only isolation means no approval prompts can interleave.
+- Uses a derived sticky session/cache ID per `spawn_agent` call, so all rounds of that sub-agent stay
+  together without disturbing the main conversation's cached prompt.
 
 This is a good fit for a well-scoped question like "find every place X is used and summarize how"
 or "explain what module Y does," not a substitute for tools the model can already call directly.

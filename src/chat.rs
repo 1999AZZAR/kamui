@@ -3923,7 +3923,7 @@ async fn dispatch_spawn_agents(
     let mut outputs = HashMap::with_capacity(calls.len());
     for batch in calls.chunks(MAX_CONCURRENT_SUB_AGENTS) {
         let futures = batch.iter().map(|call| {
-            let session_id = session_id.clone();
+            let session_id = cache::sub_agent_session_id(session_id.as_deref(), &call.id);
             async move {
                 let started = Instant::now();
                 (
@@ -6350,6 +6350,7 @@ mod tests {
     struct ConcurrentProvider {
         active: std::sync::atomic::AtomicUsize,
         maximum: std::sync::atomic::AtomicUsize,
+        session_ids: std::sync::Mutex<Vec<Option<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -6362,11 +6363,23 @@ mod tests {
             use std::sync::atomic::Ordering;
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.maximum.fetch_max(active, Ordering::SeqCst);
+            self.session_ids
+                .lock()
+                .unwrap()
+                .push(request.session_id.clone());
             tokio::time::sleep(Duration::from_millis(20)).await;
             self.active.fetch_sub(1, Ordering::SeqCst);
+            let first_round = request.messages.len() == 2;
             Ok(crate::provider::ChatResponse {
-                content: request.messages.last().unwrap().content.clone(),
-                tool_calls: Vec::new(),
+                content: request.messages[1].content.clone(),
+                tool_calls: first_round
+                    .then(|| ToolCall {
+                        id: "read".to_string(),
+                        name: "list_directory".to_string(),
+                        arguments: r#"{"path":"."}"#.to_string(),
+                    })
+                    .into_iter()
+                    .collect(),
                 usage: Usage::default(),
                 finish_reason: "stop".to_string(),
             })
@@ -6390,6 +6403,7 @@ mod tests {
         let provider = ConcurrentProvider {
             active: std::sync::atomic::AtomicUsize::new(0),
             maximum: std::sync::atomic::AtomicUsize::new(0),
+            session_ids: std::sync::Mutex::new(Vec::new()),
         };
         let project = temporary_project();
         let calls = (0..6)
@@ -6401,12 +6415,29 @@ mod tests {
             .collect::<Vec<_>>();
         let references = calls.iter().collect::<Vec<_>>();
 
-        let outputs = dispatch_spawn_agents(&provider, "model", &project, &references, None).await;
+        let outputs = dispatch_spawn_agents(
+            &provider,
+            "model",
+            &project,
+            &references,
+            Some("parent".to_string()),
+        )
+        .await;
 
         assert_eq!(outputs.len(), 6);
         assert_eq!(outputs["c0"].0, "task 0");
         assert_eq!(outputs["c5"].0, "task 5");
         assert_eq!(provider.maximum.load(Ordering::SeqCst), 4);
+        let session_ids = provider.session_ids.lock().unwrap();
+        for index in 0..6 {
+            let expected = Some(format!("parent:agent:c{index}"));
+            assert_eq!(
+                session_ids.iter().filter(|id| **id == expected).count(),
+                2,
+                "both rounds of sub-agent c{index} should share its derived id"
+            );
+        }
+        assert!(!session_ids.contains(&Some("parent".to_string())));
         fs::remove_dir_all(project.root()).unwrap();
     }
 
