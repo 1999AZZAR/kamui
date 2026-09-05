@@ -137,26 +137,26 @@ fn lock_screen(screen: &Mutex<FullScreen>) -> MutexGuard<'_, FullScreen> {
     screen.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-// OpenCode dark palette (theme/assets/opencode.json) with kamui's blue as the brand accent.
-const TEXT: Color = Color::Rgb(0xee, 0xee, 0xee);
-const MUTED: Color = Color::Rgb(0x80, 0x80, 0x80);
-const BORDER: Color = Color::Rgb(0x48, 0x48, 0x48);
-const BG_CHAT: Color = Color::Rgb(0x0c, 0x0c, 0x0c);
-const BG_ELEMENT: Color = Color::Rgb(0x22, 0x22, 0x22);
-const BG_PANEL: Color = Color::Rgb(0x14, 0x14, 0x14);
-const BLUE: Color = Color::Rgb(0x5c, 0x9c, 0xf5);
+// Tokyo Night Storm palette with Kamui's blue mapped to the theme's primary accent.
+const TEXT: Color = Color::Rgb(0xc0, 0xca, 0xf5);
+const MUTED: Color = Color::Rgb(0x56, 0x5f, 0x89);
+const BORDER: Color = Color::Rgb(0x41, 0x48, 0x68);
+const BG_CHAT: Color = Color::Rgb(0x1a, 0x1b, 0x26);
+const BG_ELEMENT: Color = Color::Rgb(0x24, 0x28, 0x3b);
+const BG_PANEL: Color = Color::Rgb(0x1f, 0x23, 0x35);
+const BLUE: Color = Color::Rgb(0x7a, 0xa2, 0xf7);
 /// Overlay panels sit *above* the transcript: a hair brighter than chat, still opaque.
-const POPUP_BG: Color = Color::Rgb(0x1a, 0x1a, 0x1a);
+const POPUP_BG: Color = Color::Rgb(0x24, 0x28, 0x3b);
 /// Search hits: every match gets a quiet wash, the one in view a brighter one.
-const MATCH_BG: Color = Color::Rgb(0x33, 0x2d, 0x14);
-const MATCH_CURRENT_BG: Color = Color::Rgb(0x6b, 0x55, 0x12);
+const MATCH_BG: Color = Color::Rgb(0x29, 0x2e, 0x42);
+const MATCH_CURRENT_BG: Color = Color::Rgb(0x3d, 0x59, 0xa1);
 /// Warm accent marking the user's own words (opencode primary tone).
-const ACCENT: Color = Color::Rgb(0xfa, 0xb2, 0x83);
-const GREEN: Color = Color::Rgb(0x7f, 0xd8, 0x8f);
-const WARN: Color = Color::Rgb(0xf5, 0xa7, 0x42);
-const RED: Color = Color::Rgb(0xe0, 0x6c, 0x75);
+const ACCENT: Color = Color::Rgb(0xbb, 0x9a, 0xf7);
+const GREEN: Color = Color::Rgb(0x9e, 0xce, 0x6a);
+const WARN: Color = Color::Rgb(0xe0, 0xaf, 0x68);
+const RED: Color = Color::Rgb(0xf7, 0x76, 0x8e);
 /// Cache/secondary-info accent (variant C activity + context cache lines).
-const CYAN: Color = Color::Rgb(0x56, 0xb6, 0xc2);
+const CYAN: Color = Color::Rgb(0x7d, 0xcf, 0xff);
 /// Kept from the earlier blue scheme; NOTICE_FG aliases it for readability everywhere.
 const NOTICE_FG: Color = MUTED;
 const MAX_HISTORY_LINES: usize = 4_000;
@@ -266,6 +266,7 @@ struct Model {
     /// Live transcript search (Ctrl+F). `/search` looks through saved sessions in SQLite; this
     /// looks through what is on screen right now, which is a different question.
     search: Option<SearchState>,
+    plan: Option<crate::tools::PlanView>,
 }
 
 /// An in-progress transcript search: what was typed, and which match is being looked at.
@@ -377,6 +378,7 @@ impl Default for Model {
             ask: None,
             sidebar_hidden: false,
             search: None,
+            plan: None,
         }
     }
 }
@@ -964,6 +966,17 @@ impl ChatUi {
             Some(screen) => {
                 let mut screen = lock_screen(screen);
                 screen.model.sidebar = Some(entries);
+                screen.draw()
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub fn set_plan(&mut self, plan: Option<crate::tools::PlanView>) -> Result<()> {
+        match self.fullscreen.as_ref() {
+            Some(screen) => {
+                let mut screen = lock_screen(screen);
+                screen.model.plan = plan;
                 screen.draw()
             }
             None => Ok(()),
@@ -1704,14 +1717,12 @@ const DIALOG_VISIBLE: usize = 8;
 fn render_dialog(frame: &mut Frame<'_>, dialog: &DialogState, area: Rect) {
     let filtered = dialog.filtered();
     let selected = dialog.selected.min(filtered.len().saturating_sub(1));
-    let width = 56.min(area.width.saturating_sub(4));
+    let width = 56.min(area.width.max(1));
     // Height follows what the list can actually show, not how many entries exist: sizing it to
     // `filtered.len()` grew the box to the full screen while only a window of rows was ever
     // drawn, leaving a session picker that was mostly empty space.
     let wanted = filtered.len().clamp(1, DIALOG_VISIBLE);
-    let height = ((wanted + 4) as u16)
-        .min(area.height.saturating_sub(2))
-        .max(5);
+    let height = ((wanted + 4) as u16).min(area.height.max(1));
     let capacity = (height as usize).saturating_sub(4).max(1);
     // Keep the selection centred in the window instead of pinned to its last row.
     let start = if filtered.len() <= capacity {
@@ -1798,11 +1809,11 @@ fn render_dialog(frame: &mut Frame<'_>, dialog: &DialogState, area: Rect) {
 
 /// Approval modal: preview body plus the three opencode options.
 fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) {
-    let width = 64.min(area.width.saturating_sub(4));
+    let width = 64.min(area.width.max(1));
     let all_rows: Vec<String> = wrap_display(&perm.body, width.saturating_sub(6) as usize);
     // Everything the box spends on chrome: blank row, options, the scroll note, the key hint.
     let chrome = PERM_OPTIONS.len() + 5;
-    let ceiling = area.height.saturating_sub(2).max(7) as usize;
+    let ceiling = area.height.max(1) as usize;
     let capacity = ceiling.saturating_sub(chrome).max(1);
     let scroll = perm.scroll.min(all_rows.len().saturating_sub(capacity));
     let body_rows: Vec<String> = all_rows
@@ -1811,9 +1822,7 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
         .take(capacity)
         .cloned()
         .collect();
-    let height = ((body_rows.len() + chrome) as u16)
-        .min(area.height.saturating_sub(2))
-        .max(7);
+    let height = ((body_rows.len() + chrome) as u16).min(area.height.max(1));
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let box_area = Rect {
@@ -3033,11 +3042,9 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 fn dialog_geometry(dialog: &DialogState, area: Rect) -> (Rect, usize, usize) {
     let filtered = dialog.filtered();
     let selected = dialog.selected.min(filtered.len().saturating_sub(1));
-    let width = 56.min(area.width.saturating_sub(4));
+    let width = 56.min(area.width.max(1));
     let wanted = filtered.len().clamp(1, DIALOG_VISIBLE);
-    let height = ((wanted + 4) as u16)
-        .min(area.height.saturating_sub(2))
-        .max(5);
+    let height = ((wanted + 4) as u16).min(area.height.max(1));
     let capacity = (height as usize).saturating_sub(4).max(1);
     let start = if filtered.len() <= capacity {
         0
@@ -3451,12 +3458,6 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
             format!("{label}{dots}"),
             Style::default().fg(MUTED).add_modifier(Modifier::DIM),
         ));
-        if area.width >= 56 {
-            wall_line.push(Span::styled(
-                "  \u{b7} Enter steers \u{b7} Esc interrupts".to_string(),
-                Style::default().fg(MUTED).add_modifier(Modifier::DIM),
-            ));
-        }
         rows.push(Line::from(wall_line));
     }
     Paragraph::new(Text::from(rows))
@@ -3519,6 +3520,9 @@ fn popup_widget(model: &Model, area: Rect) -> Paragraph<'static> {
             .min(total - MENU_VISIBLE)
     };
     let end = total.min(start + MENU_VISIBLE);
+    let content_width = area.width.saturating_sub(2) as usize;
+    let name_width = 24.min(content_width.saturating_sub(4));
+    let description_width = content_width.saturating_sub(name_width + 4);
 
     let counter = if total > MENU_VISIBLE {
         format!(" {} / {}", selected + 1, total)
@@ -3542,7 +3546,7 @@ fn popup_widget(model: &Model, area: Rect) -> Paragraph<'static> {
                 Style::default().fg(if is_on { BLUE } else { BORDER }),
             ),
             Span::styled(
-                crate::tui::truncate_chars(name, 24),
+                crate::tui::truncate_chars(name, name_width),
                 Style::default()
                     .fg(if is_on { TEXT } else { MUTED })
                     .add_modifier(if is_on {
@@ -3553,7 +3557,7 @@ fn popup_widget(model: &Model, area: Rect) -> Paragraph<'static> {
             ),
             Span::raw("  "),
             Span::styled(
-                crate::tui::truncate_chars(description, 48),
+                crate::tui::truncate_chars(description, description_width),
                 Style::default().fg(MUTED),
             ),
         ]));
@@ -3573,6 +3577,51 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     // Left border eats one column; keep a little padding so values never kiss the rail.
     let max = area.width.saturating_sub(3).max(1) as usize;
+    if let Some(plan) = &model.plan {
+        lines.push(Line::from(Span::styled(
+            "Plan",
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        )));
+        let compact_plan = area.width < 28 || area.height < 12;
+        let steps = if compact_plan {
+            plan.steps
+                .iter()
+                .filter(|(_, status)| *status == crate::tools::PlanStepStatus::InProgress)
+                .take(1)
+                .collect::<Vec<_>>()
+        } else {
+            plan.steps.iter().collect::<Vec<_>>()
+        };
+        let completed = plan
+            .steps
+            .iter()
+            .filter(|(_, status)| *status == crate::tools::PlanStepStatus::Completed)
+            .count();
+        if compact_plan {
+            lines.push(Line::styled(
+                format!("Progress {completed}/{}", plan.steps.len()),
+                Style::default().fg(MUTED),
+            ));
+        }
+        for (step, status) in steps {
+            let mark = match status {
+                crate::tools::PlanStepStatus::Completed => "x",
+                crate::tools::PlanStepStatus::InProgress => "~",
+                crate::tools::PlanStepStatus::Pending => " ",
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("[{mark}] "), Style::default().fg(BLUE)),
+                Span::styled(
+                    crate::tui::truncate_chars(step, max.saturating_sub(4)),
+                    Style::default().fg(if *status == crate::tools::PlanStepStatus::InProgress {
+                        TEXT
+                    } else {
+                        MUTED
+                    }),
+                ),
+            ]));
+        }
+    }
     if let Some(entries) = &model.sidebar {
         let compact = area.height < (entries.len() as u16).saturating_mul(4);
         for (i, (key, value)) in entries.iter().enumerate() {
@@ -3777,11 +3826,10 @@ fn footer_widget(model: &Model, area: Rect) -> Paragraph<'static> {
     } else {
         model.footer.clone()
     };
-    if !left.contains("Ctrl+K") {
-        left.push_str("  \u{b7}  Ctrl+K  \u{b7}  Ctrl+S");
-    }
+    // Keep action/status hints ahead of discoverability hints: truncation should not hide control
+    // of an in-flight turn or the fact that input was queued.
     if model.thinking.is_some() {
-        left.push_str("  \u{b7}  Esc interrupts");
+        left.push_str("  \u{b7}  Esc interrupts  \u{b7}  Enter steers");
     }
     if model.scroll_from_bottom > 0 {
         left.push_str(&format!(
@@ -3794,6 +3842,17 @@ fn footer_widget(model: &Model, area: Rect) -> Paragraph<'static> {
         left.push_str(&format!(
             "  \u{b7}  {} message{} queued",
             model.queued_count, plural
+        ));
+    }
+    if !left.contains("Ctrl+K") {
+        left.push_str("  \u{b7}  Ctrl+K  \u{b7}  Ctrl+S");
+    }
+    if let Some(plan) = &model.plan
+        && let Some(active) = &plan.active
+    {
+        left.push_str(&format!(
+            "  ·  plan: {}",
+            crate::tui::truncate_chars(active, 36)
         ));
     }
     // Model and token badge are pinned to the right edge: they are the two facts worth a glance
@@ -4505,6 +4564,54 @@ mod tests {
     }
 
     #[test]
+    fn compact_sidebar_plan_shows_progress_and_active_step_only() {
+        let model = Model {
+            plan: Some(crate::tools::PlanView {
+                steps: vec![
+                    ("done".into(), crate::tools::PlanStepStatus::Completed),
+                    (
+                        "current active step".into(),
+                        crate::tools::PlanStepStatus::InProgress,
+                    ),
+                    (
+                        "later pending step".into(),
+                        crate::tools::PlanStepStatus::Pending,
+                    ),
+                ],
+                active: Some("current active step".into()),
+            }),
+            ..Model::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(24, 8);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                frame.render_widget(sidebar_paragraph(&model, frame.area()), frame.area())
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = (0..8)
+            .flat_map(|y| {
+                (0..24).map({
+                    let buffer = buffer.clone();
+                    move |x| buffer[(x, y)].symbol().to_string()
+                })
+            })
+            .collect();
+        assert!(text.contains("Progress 1/3"));
+        assert!(text.contains("current"));
+        assert!(!text.contains("later pending step"));
+    }
+
+    #[test]
+    fn dialog_geometry_stays_inside_tiny_area() {
+        let dialog = DialogState::new("title", "/", vec![("value".into(), "label".into())]);
+        let (box_area, _, _) = dialog_geometry(&dialog, Rect::new(0, 0, 3, 2));
+        assert!(box_area.width <= 3);
+        assert!(box_area.height <= 2);
+    }
+
+    #[test]
     fn folding_targets_the_newest_card_that_has_something_folded() {
         // A command leaves a note cell behind as the literal last card. `/expand` used to aim
         // at that instead of the tool output the user had just seen.
@@ -4653,9 +4760,12 @@ mod tests {
             .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect())
             .collect();
         assert!(
-            all.iter()
-                .any(|row| row.contains("Thinking") && row.contains("Esc interrupts")),
-            "the editor wall names the run and how to stop it: {all:?}"
+            all.iter().any(|row| row.contains("Thinking")),
+            "the editor wall names the run: {all:?}"
+        );
+        assert!(
+            all.iter().any(|row| row.contains("Esc interrupts")),
+            "the footer says how to stop: {all:?}"
         );
     }
 
@@ -4687,7 +4797,7 @@ mod tests {
             .collect();
         assert!(
             all.iter().any(|row| row.contains("Esc interrupts")),
-            "the loading row says how to stop: {all:?}"
+            "the footer says how to stop: {all:?}"
         );
         assert!(
             all.iter().all(|row| !row.contains("type to steer")),
@@ -4722,9 +4832,12 @@ mod tests {
             "idle placeholder stays off while thinking: {all:?}"
         );
         assert!(
-            all.iter()
-                .any(|row| row.contains("Thinking") && row.contains("Esc interrupts")),
+            all.iter().any(|row| row.contains("Thinking")),
             "the wall still names the run: {all:?}"
+        );
+        assert!(
+            all.iter().any(|row| row.contains("Esc interrupts")),
+            "the footer owns the control hint: {all:?}"
         );
     }
 

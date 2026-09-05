@@ -1666,6 +1666,7 @@ where
                     } else {
                         println!("{rendered}");
                     }
+                    let _ = chat_ui.set_plan(tools::plan_view(&call.arguments));
                     // Persist plan: pending stays pending, approved stays tracker.
                     if let Some(state) = plan_mode.as_mut() {
                         state.plan_json = Some(call.arguments.clone());

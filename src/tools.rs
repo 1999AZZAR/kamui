@@ -828,14 +828,14 @@ pub const UPDATE_PLAN_TOOL: &str = "update_plan";
 
 /// A single step in a model-declared plan for a multi-step task, shown to the user as a checklist.
 #[derive(serde::Deserialize)]
-struct PlanStep {
-    step: String,
-    status: PlanStepStatus,
+pub struct PlanStep {
+    pub step: String,
+    pub status: PlanStepStatus,
 }
 
-#[derive(serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum PlanStepStatus {
+pub enum PlanStepStatus {
     Pending,
     InProgress,
     Completed,
@@ -857,6 +857,24 @@ fn parse_plan(arguments: &str) -> Result<Vec<PlanStep>> {
         anyhow::bail!("only one step may be in_progress at a time, found {in_progress}");
     }
     Ok(arguments.plan)
+}
+
+/// Structured plan data for lightweight UI mirrors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanView {
+    pub steps: Vec<(String, PlanStepStatus)>,
+    pub active: Option<String>,
+}
+
+pub fn plan_view(arguments: &str) -> Option<PlanView> {
+    let steps = parse_plan(arguments).ok()?;
+    let active = steps
+        .iter()
+        .find_map(|step| (step.status == PlanStepStatus::InProgress).then(|| step.step.clone()));
+    Some(PlanView {
+        steps: steps.into_iter().map(|s| (s.step, s.status)).collect(),
+        active,
+    })
 }
 
 /// Number of steps in an `update_plan` call, or `None` if it doesn't parse.
