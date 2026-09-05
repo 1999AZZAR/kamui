@@ -506,6 +506,7 @@ polish: users hit these before they ever need a design system or batch-approval 
 - [x] Clickable autocomplete rows, picker rows, approval options, and `ask_user` choices
 - [x] Contextual mouse-wheel navigation for overlays, dialogs, autocomplete, and transcript
 - [x] Modal click-through prevention and bounded transcript click targets
+- [x] Semantic mouse targets for sidebar/footer actions with overlay precedence and hover feedback
 
 ## OpenCode-inspired TUI direction
 
@@ -520,10 +521,10 @@ usable — users fail on approve / resume / picker / queue long before they need
 - [ ] **Plan checklist as a first-class UI object**: `update_plan` already exists; render it as a
       clear transcript block *and* a sidebar mirror with the active step highlighted (OpenCode-style
       `# Todos`)
-- [ ] **Thin turn chrome**: one line like `build · model · 33.1s`; keep latency/tokens in the
-      sidebar or a small badge — do not compete with the assistant answer
-- [ ] **Minimal contextual footer**: interrupt hint · tokens · one primary shortcut for the current
-      state (e.g. commands / interrupt), instead of a crowded always-on shortcut strip
+- [x] **Thin turn chrome**: a muted separator before each user turn; keep latency/tokens in the
+       sidebar or a small badge — do not compete with the assistant answer
+- [x] **Minimal contextual footer**: clickable help, model/session, interrupt, and live-position hints
+       state (e.g. commands / interrupt), instead of a crowded always-on shortcut strip
 
 ### Do not copy blindly
 

@@ -267,6 +267,9 @@ struct Model {
     /// looks through what is on screen right now, which is a different question.
     search: Option<SearchState>,
     plan: Option<crate::tools::PlanView>,
+    /// Semantic action under the mouse. Coordinates never enter model state, so moving within
+    /// one row does not trigger redundant redraws.
+    hovered: Option<HitTarget>,
 }
 
 /// An in-progress transcript search: what was typed, and which match is being looked at.
@@ -379,6 +382,7 @@ impl Default for Model {
             sidebar_hidden: false,
             search: None,
             plan: None,
+            hovered: None,
         }
     }
 }
@@ -817,7 +821,25 @@ enum HitTarget {
     Dialog(usize),
     Permission(usize),
     Ask(usize),
+    Sidebar(SidebarAction),
+    Footer(FooterAction),
     Overlay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarAction {
+    Session,
+    Model,
+    Mode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FooterAction {
+    Help,
+    Models,
+    Sessions,
+    Interrupt,
+    Live,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2198,6 +2220,9 @@ fn input_thread(
                         sync(&screen, &buf, caret, selected, items);
                     }
                 }
+                Ok(Event::Resize(_, _)) => {
+                    let _ = screen.draw_now();
+                }
                 Ok(Event::Mouse(mouse)) => match mouse.kind {
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                         let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
@@ -2322,6 +2347,85 @@ fn input_thread(
                                     let _ = answer_tx.send((index + 1).to_string());
                                 }
                             }
+                            Some(HitTarget::Sidebar(SidebarAction::Model)) => {
+                                let items = models_src
+                                    .read()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .clone();
+                                if !items.is_empty() {
+                                    let mut s = lock_screen(&screen.0);
+                                    s.model.dialog =
+                                        Some(DialogState::new("Select Model", "/model ", items));
+                                    drop(s);
+                                    let _ = screen.draw_now();
+                                }
+                            }
+                            Some(HitTarget::Sidebar(SidebarAction::Session)) => {
+                                let items = sessions_src
+                                    .read()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .clone();
+                                if !items.is_empty() {
+                                    let mut s = lock_screen(&screen.0);
+                                    s.model.dialog =
+                                        Some(DialogState::new("Resume Session", "/resume ", items));
+                                    drop(s);
+                                    let _ = screen.draw_now();
+                                }
+                            }
+                            Some(HitTarget::Sidebar(SidebarAction::Mode)) => submit_line(
+                                &screen,
+                                &tx,
+                                &requester,
+                                &busy,
+                                &interrupt,
+                                &queue,
+                                "/mode next".into(),
+                            ),
+                            Some(HitTarget::Footer(FooterAction::Help)) => {
+                                let mut s = lock_screen(&screen.0);
+                                s.model.help_visible = true;
+                                s.model.help_scroll = 0;
+                                drop(s);
+                                let _ = screen.draw_now();
+                            }
+                            Some(HitTarget::Footer(FooterAction::Models)) => {
+                                let items = models_src
+                                    .read()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .clone();
+                                if !items.is_empty() {
+                                    let mut s = lock_screen(&screen.0);
+                                    s.model.dialog =
+                                        Some(DialogState::new("Select Model", "/model ", items));
+                                    drop(s);
+                                    let _ = screen.draw_now();
+                                }
+                            }
+                            Some(HitTarget::Footer(FooterAction::Sessions)) => {
+                                let items = sessions_src
+                                    .read()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .clone();
+                                if !items.is_empty() {
+                                    let mut s = lock_screen(&screen.0);
+                                    s.model.dialog =
+                                        Some(DialogState::new("Resume Session", "/resume ", items));
+                                    drop(s);
+                                    let _ = screen.draw_now();
+                                }
+                            }
+                            Some(HitTarget::Footer(FooterAction::Interrupt)) => {
+                                if busy.load(std::sync::atomic::Ordering::SeqCst) {
+                                    interrupt.notify_one();
+                                }
+                            }
+                            Some(HitTarget::Footer(FooterAction::Live)) => {
+                                let mut s = lock_screen(&screen.0);
+                                s.model.scroll_from_bottom = 0;
+                                drop(s);
+                                let _ = screen.draw_now();
+                            }
                             Some(HitTarget::Overlay) | None => {}
                         }
                     }
@@ -2335,6 +2439,14 @@ fn input_thread(
                         };
                         if is_card {
                             let _ = lock_screen(&screen.0).copy_card_at_row(mouse.row);
+                        }
+                    }
+                    MouseEventKind::Moved => {
+                        let mut s = lock_screen(&screen.0);
+                        let next = hit_at(&s.last_hits, mouse.column, mouse.row);
+                        if s.model.hovered != next {
+                            s.model.hovered = next;
+                            let _ = s.draw();
                         }
                     }
                     _ => {}
@@ -3057,6 +3169,13 @@ fn dialog_geometry(dialog: &DialogState, area: Rect) -> (Rect, usize, usize) {
 }
 
 fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
+    // Paint every terminal cell before laying out widgets. Windows Terminal/ConPTY can expose
+    // newly reported rows or columns between draws; leaving any cell untouched reveals the
+    // terminal's default black instead of Tokyo Night and looks like letterboxing.
+    let whole = frame.area();
+    frame
+        .buffer_mut()
+        .set_style(whole, Style::default().bg(BG_CHAT));
     // OpenCode layout: transcript on top, autocomplete menu above the bordered editor, a
     // one-line footer, and the sidebar rail splitting the body horizontally.
     // The search bar and the slash menu never coexist: opening search closes the editor's menu.
@@ -3176,6 +3295,24 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     }
     if let Some(area) = sidebar_area {
         frame.render_widget(sidebar_paragraph(model, area), area);
+        // Sidebar actions use whole semantic rows, not individual glyph coordinates. The compact
+        // rail keeps these rows stable enough to remain useful at narrow supported widths.
+        if let Some(entries) = &model.sidebar {
+            for (row, (key, _)) in entries.iter().enumerate() {
+                let target = match key.as_str() {
+                    "Session" => Some(SidebarAction::Session),
+                    "Model" => Some(SidebarAction::Model),
+                    "mode" | "Mode" => Some(SidebarAction::Mode),
+                    _ => None,
+                };
+                if let Some(target) = target {
+                    hit_regions.push(HitRegion {
+                        area: Rect::new(area.x, area.y + row as u16, area.width, 1),
+                        target: HitTarget::Sidebar(target),
+                    });
+                }
+            }
+        }
     }
     if let Some(search) = &model.search {
         frame.render_widget(search_widget(search), popup_area);
@@ -3222,6 +3359,8 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     }
 
     frame.render_widget(footer_widget(model, footer_area), footer_area);
+    let footer_targets = footer_hit_regions(model, footer_area);
+    hit_regions.extend(footer_targets);
 
     // Modal elevation: dim whatever is behind an overlay so the dialog reads as the front
     // surface rather than one more box on the same plane. Only the DIM modifier is patched in,
@@ -3307,6 +3446,17 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         }
     }
 
+    // Hover is a quiet background wash. Apply it after normal widgets, but before modal-specific
+    // rows are added above the catch-all overlay, preserving the same precedence as clicks.
+    if let Some(hovered) = &model.hovered
+        && let Some(hit) = hit_regions.iter().rev().find(|hit| &hit.target == hovered)
+        && !matches!(hovered, HitTarget::Overlay)
+    {
+        frame
+            .buffer_mut()
+            .set_style(hit.area, Style::default().bg(MATCH_BG));
+    }
+
     RenderInfo {
         viewport_rows: if home {
             0
@@ -3317,6 +3467,32 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         transcript_width: transcript_area.width,
         hits: hit_regions,
     }
+}
+
+fn footer_hit_regions(model: &Model, area: Rect) -> Vec<HitRegion> {
+    let mut out = Vec::new();
+    let mut x = area.x;
+    let mut add = |label: &str, target: FooterAction| {
+        let width = label.chars().count() as u16;
+        if width > 0 && x < area.right() {
+            let actual = width.min(area.right() - x);
+            out.push(HitRegion {
+                area: Rect::new(x, area.y, actual, 1),
+                target: HitTarget::Footer(target),
+            });
+            x = x.saturating_add(width);
+        }
+    };
+    add("? help", FooterAction::Help);
+    if model.thinking.is_some() {
+        add("  ·  Esc interrupts", FooterAction::Interrupt);
+    }
+    if model.scroll_from_bottom > 0 {
+        add("  ·  Ctrl+End live", FooterAction::Live);
+    }
+    add("  ·  Ctrl+K", FooterAction::Models);
+    add("  ·  Ctrl+S", FooterAction::Sessions);
+    out
 }
 
 /// The newest card with rows hidden behind a fold -- the one Ctrl+O, `/expand`, and
@@ -4002,6 +4178,12 @@ fn transcript_rows(model: &Model, width: u16) -> Vec<(Line<'static>, Option<u64>
     let inner_width = width.max(20) as usize;
     let mut lines: Vec<(Line<'static>, Option<u64>)> = Vec::new();
     for card in &model.cards {
+        if matches!(card.kind, CardKind::User) {
+            lines.push((
+                Line::styled("─".repeat(inner_width.min(24)), Style::default().fg(BORDER)),
+                None,
+            ));
+        }
         let owner = (card.foldable_rows() > 0).then_some(card.id);
         let mut card_out = card_lines(card, inner_width);
         // Drop trailing blank content rows so the single swimlane separator stays single.
@@ -4461,6 +4643,21 @@ fn wrap_display(text: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_paints_the_full_terminal_background() {
+        let backend = ratatui::backend::TestBackend::new(83, 25);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &Model::default());
+            })
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(82, 24)].bg, BG_PANEL);
+        assert_ne!(buffer[(82, 24)].bg, Color::Black);
+    }
 
     /// Draws one frame into a test backend and reports where the terminal caret ended up
     /// together with the row it landed on, so caret and text can be compared directly.
