@@ -63,7 +63,10 @@ where
         .find(&active_name)
         .cloned()
         .unwrap_or_else(|| config.default().clone());
-    if let Some(th) = database.get_setting("active_theme")?.and_then(|s| s.parse::<crate::theme::Theme>().ok()) {
+    if let Some(th) = database
+        .get_setting("active_theme")?
+        .and_then(|s| s.parse::<crate::theme::Theme>().ok())
+    {
         config.theme = th;
     }
     let mut provider = build_provider(&active);
@@ -747,20 +750,30 @@ where
                 }
                 if arg.is_empty() {
                     let cur = config.theme.clone();
-                    let list: String = crate::theme::Theme::all().into_iter().map(|t| {
-                        let star = if t == cur { "*" } else { " " };
-                        format!("{star} {t}\n")
-                    }).collect();
-                    chat_ui.notice(&format!("Themes (* = active):\n{list}\nUsage: /theme <name>"))?;
+                    let list: String = crate::theme::Theme::all()
+                        .into_iter()
+                        .map(|t| {
+                            let star = if t == cur { "*" } else { " " };
+                            format!("{star} {t}\n")
+                        })
+                        .collect();
+                    chat_ui.notice(&format!(
+                        "Themes (* = active):\n{list}\nUsage: /theme <name>"
+                    ))?;
                 } else {
                     match arg.parse::<crate::theme::Theme>() {
                         Ok(th) => {
                             let th2 = th.clone();
                             config.theme = th2.clone();
                             let _ = database.set_setting("active_theme", &th2.to_string());
-                            let _ = crate::config::save_theme(&crate::config::global_config_path().unwrap(), &th2.to_string());
+                            let _ = crate::config::save_theme(
+                                &crate::config::global_config_path().unwrap(),
+                                &th2.to_string(),
+                            );
                             chat_ui.set_theme(th2.clone());
-                            chat_ui.notice(&format!("Theme switched to {th} — restart to fully re-theme chrome."))?;
+                            chat_ui.notice(&format!(
+                                "Theme switched to {th} — restart to fully re-theme chrome."
+                            ))?;
                         }
                         Err(e) => chat_ui.error(&e)?,
                     }

@@ -141,42 +141,90 @@ fn palette() -> Option<crate::theme::Palette> {
     ACTIVE_THEME.with(|c| c.borrow().clone().and_then(|t| t.palette()))
 }
 fn themed(or: Color, f: impl FnOnce(&crate::theme::Palette) -> String) -> Color {
-    if let Some(p) = palette() { crate::theme::ratatui_fg(&f(&p)) } else { or }
+    if let Some(p) = palette() {
+        crate::theme::ratatui_fg(&f(&p))
+    } else {
+        or
+    }
 }
 #[allow(non_snake_case)]
-fn TEXT() -> Color { themed(Color::Rgb(0xc0,0xca,0xf5), |p| p.fg.clone()) }
+fn TEXT() -> Color {
+    themed(Color::Rgb(0xc0, 0xca, 0xf5), |p| p.fg.clone())
+}
 #[allow(non_snake_case)]
-fn MUTED() -> Color { themed(Color::Rgb(0x56,0x5f,0x89), |p| p.muted.clone()) }
+fn MUTED() -> Color {
+    themed(Color::Rgb(0x56, 0x5f, 0x89), |p| p.muted.clone())
+}
 #[allow(non_snake_case)]
-fn BORDER() -> Color { themed(Color::Rgb(0x41,0x48,0x68), |_| palette().unwrap().muted.clone()) }
+fn BORDER() -> Color {
+    themed(Color::Rgb(0x41, 0x48, 0x68), |_| {
+        palette().unwrap().muted.clone()
+    })
+}
 #[allow(non_snake_case)]
-fn BG_CHAT() -> Color { themed(Color::Rgb(0x1a,0x1b,0x26), |p| p.bg.clone()) }
+fn BG_CHAT() -> Color {
+    themed(Color::Rgb(0x1a, 0x1b, 0x26), |p| p.bg.clone())
+}
 #[allow(non_snake_case)]
-fn BG_ELEMENT() -> Color { let (r,g,b)=crate::theme::hex_to_rgb(&palette().map(|p| p.bg).unwrap_or("#24283b".into())); Color::Rgb(r.saturating_sub(12),g.saturating_sub(12),b.saturating_sub(12)) }
+fn BG_ELEMENT() -> Color {
+    let (r, g, b) = crate::theme::hex_to_rgb(&palette().map(|p| p.bg).unwrap_or("#24283b".into()));
+    Color::Rgb(
+        r.saturating_sub(12),
+        g.saturating_sub(12),
+        b.saturating_sub(12),
+    )
+}
 #[allow(non_snake_case)]
-fn BG_PANEL() -> Color { let (r,g,b)=crate::theme::hex_to_rgb(&palette().map(|p| p.bg).unwrap_or("#1f2335".into())); Color::Rgb(r.saturating_sub(6),g.saturating_sub(6),b.saturating_sub(6)) }
+fn BG_PANEL() -> Color {
+    let (r, g, b) = crate::theme::hex_to_rgb(&palette().map(|p| p.bg).unwrap_or("#1f2335".into()));
+    Color::Rgb(
+        r.saturating_sub(6),
+        g.saturating_sub(6),
+        b.saturating_sub(6),
+    )
+}
 #[allow(non_snake_case)]
-fn BLUE() -> Color { themed(Color::Rgb(0x7a,0xa2,0xf7), |p| p.blue.clone()) }
+fn BLUE() -> Color {
+    themed(Color::Rgb(0x7a, 0xa2, 0xf7), |p| p.blue.clone())
+}
 #[allow(non_snake_case)]
-fn POPUP_BG() -> Color { BG_ELEMENT() }
+fn POPUP_BG() -> Color {
+    BG_ELEMENT()
+}
 #[allow(non_snake_case)]
-fn MATCH_BG() -> Color { themed(Color::Rgb(0x29,0x2e,0x42), |p| p.muted.clone()) }
+fn MATCH_BG() -> Color {
+    themed(Color::Rgb(0x29, 0x2e, 0x42), |p| p.muted.clone())
+}
 #[allow(non_snake_case)]
-fn MATCH_CURRENT_BG() -> Color { themed(Color::Rgb(0x3d,0x59,0xa1), |p| p.mauve.clone()) }
+fn MATCH_CURRENT_BG() -> Color {
+    themed(Color::Rgb(0x3d, 0x59, 0xa1), |p| p.mauve.clone())
+}
 #[allow(non_snake_case)]
-fn ACCENT() -> Color { themed(Color::Rgb(0xbb,0x9a,0xf7), |p| p.mauve.clone()) }
+fn ACCENT() -> Color {
+    themed(Color::Rgb(0xbb, 0x9a, 0xf7), |p| p.mauve.clone())
+}
 #[allow(non_snake_case)]
-fn GREEN() -> Color { themed(Color::Rgb(0x9e,0xce,0x6a), |p| p.green.clone()) }
+fn GREEN() -> Color {
+    themed(Color::Rgb(0x9e, 0xce, 0x6a), |p| p.green.clone())
+}
 #[allow(non_snake_case)]
-fn WARN() -> Color { themed(Color::Rgb(0xe0,0xaf,0x68), |p| p.amber.clone()) }
+fn WARN() -> Color {
+    themed(Color::Rgb(0xe0, 0xaf, 0x68), |p| p.amber.clone())
+}
 #[allow(non_snake_case)]
-fn RED() -> Color { themed(Color::Rgb(0xf7,0x76,0x8e), |p| p.red.clone()) }
+fn RED() -> Color {
+    themed(Color::Rgb(0xf7, 0x76, 0x8e), |p| p.red.clone())
+}
 #[allow(non_snake_case)]
-fn CYAN() -> Color { themed(Color::Rgb(0x7d,0xcf,0xff), |p| p.cyan.clone()) }
+fn CYAN() -> Color {
+    themed(Color::Rgb(0x7d, 0xcf, 0xff), |p| p.cyan.clone())
+}
 #[allow(non_snake_case)]
-fn NOTICE_FG() -> Color { MUTED() }
+fn NOTICE_FG() -> Color {
+    MUTED()
+}
 // Back-compat const aliases for code that still uses `TEXT()` without call — we replace via regex below to `TEXT()`
-thread_local! { static ACTIVE_THEME: std::cell::RefCell<Option<crate::theme::Theme>> = std::cell::RefCell::new(None); }
+thread_local! { static ACTIVE_THEME: std::cell::RefCell<Option<crate::theme::Theme>> = const { std::cell::RefCell::new(None) }; }
 const MAX_HISTORY_LINES: usize = 4_000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -430,7 +478,9 @@ struct FullScreen {
 
 impl FullScreen {
     #[allow(dead_code)]
-    fn new(header: String) -> Result<Self> { Self::new_with_theme(header, crate::theme::Theme::default()) }
+    fn new(header: String) -> Result<Self> {
+        Self::new_with_theme(header, crate::theme::Theme::default())
+    }
     fn new_with_theme(header: String, theme: crate::theme::Theme) -> Result<Self> {
         // If anything panics mid-draw, still restore the terminal instead of leaving it raw.
         let previous_hook = std::panic::take_hook();
@@ -934,16 +984,32 @@ impl Drop for ThinkingHandle {
 
 impl ChatUi {
     #[allow(dead_code)]
-    pub fn new(interactive: bool, header: String) -> Result<Self> { Self::new_with_theme(interactive, header, crate::theme::Theme::default()) }
-    pub fn new_with_theme(interactive: bool, header: String, theme: crate::theme::Theme) -> Result<Self> {
+    pub fn new(interactive: bool, header: String) -> Result<Self> {
+        Self::new_with_theme(interactive, header, crate::theme::Theme::default())
+    }
+    pub fn new_with_theme(
+        interactive: bool,
+        header: String,
+        theme: crate::theme::Theme,
+    ) -> Result<Self> {
         let plain = Ui::stdio();
         let fullscreen = interactive
-            .then(|| FullScreen::new_with_theme(header, theme).map(|screen| Arc::new(Mutex::new(screen))))
+            .then(|| {
+                FullScreen::new_with_theme(header, theme).map(|screen| Arc::new(Mutex::new(screen)))
+            })
             .transpose()?;
-        Ok(Self { plain, fullscreen, thinking: None })
+        Ok(Self {
+            plain,
+            fullscreen,
+            thinking: None,
+        })
     }
     pub fn set_theme(&self, theme: crate::theme::Theme) {
-        if let Some(fs) = &self.fullscreen { let mut s = lock_screen(fs); s.model.theme = theme; let _ = s.draw(); }
+        if let Some(fs) = &self.fullscreen {
+            let mut s = lock_screen(fs);
+            s.model.theme = theme;
+            let _ = s.draw();
+        }
     }
 
     pub fn is_fullscreen(&self) -> bool {
@@ -1497,9 +1563,16 @@ impl InputHub {
     }
 
     pub fn open_themes_dialog(&self) -> bool {
-        let items: Vec<(String,String)> = crate::theme::Theme::all().into_iter().map(|t| (t.to_string(), t.to_string())).collect();
-        { let mut s = lock_screen(&self.screen.0); s.model.dialog = Some(DialogState::new("Select Theme", "/theme ", items)); }
-        let _ = self.screen.draw_now(); true
+        let items: Vec<(String, String)> = crate::theme::Theme::all()
+            .into_iter()
+            .map(|t| (t.to_string(), t.to_string()))
+            .collect();
+        {
+            let mut s = lock_screen(&self.screen.0);
+            s.model.dialog = Some(DialogState::new("Select Theme", "/theme ", items));
+        }
+        let _ = self.screen.draw_now();
+        true
     }
     /// Sources for the Ctrl+S session switcher.
     pub fn set_sessions(&self, items: Vec<(String, String)>) {
@@ -3237,14 +3310,12 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     // screen, so a new chat is not a logo floating in a void.
     let (left_area, sidebar_area) = match (&model.sidebar, model.sidebar_hidden) {
         (Some(entries), false) if !entries.is_empty() && main_area.width >= 68 => {
-            let rail = if main_area.width >= 84 { 34 } else { 28 };
+            let rail = if main_area.width >= 84 { 30 } else { 24 };
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(0), Constraint::Length(1), Constraint::Length(rail)])
+                .constraints([Constraint::Min(0), Constraint::Length(rail)])
                 .split(main_area);
-            // gap column is cols[1]; left is cols[0], sidebar is cols[2]
-            frame.buffer_mut().set_style(cols[1], Style::default().bg(BG_CHAT()));
-            (cols[0], Some(cols[2]))
+            (cols[0], Some(cols[1]))
         }
         _ => (main_area, None),
     };
@@ -3259,7 +3330,9 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         ])
         .split(left_area);
     // spacer row between body and input/popup
-    frame.buffer_mut().set_style(left_rows[1], Style::default().bg(BG_CHAT()));
+    frame
+        .buffer_mut()
+        .set_style(left_rows[1], Style::default().bg(BG_CHAT()));
     let transcript_area = left_rows[0];
     let popup_area = left_rows[2];
     let editor_area = left_rows[3];
@@ -3870,7 +3943,11 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
     }
     Paragraph::new(Text::from(lines))
         .style(Style::default().bg(BG_PANEL()))
-        .block(Block::default().padding(Padding::new(1, 0, 1, 0)).style(Style::default().bg(BG_PANEL())))
+        .block(
+            Block::default()
+                .padding(Padding::new(1, 0, 1, 0))
+                .style(Style::default().bg(BG_PANEL())),
+        )
 }
 
 /// Keys that open a sidebar group rather than a plain label row.
@@ -3923,7 +4000,10 @@ fn push_sidebar_value(lines: &mut Vec<Line<'static>>, key: &str, value_line: &st
             "▓".repeat(filled) + &"░".repeat(width as usize - filled),
             Style::default().fg(color),
         )];
-        spans.push(Span::styled(format!(" {pct}%"), Style::default().fg(MUTED())));
+        spans.push(Span::styled(
+            format!(" {pct}%"),
+            Style::default().fg(MUTED()),
+        ));
         lines.push(Line::from(spans));
         return;
     }
@@ -4209,7 +4289,10 @@ fn transcript_rows(model: &Model, width: u16) -> Vec<(Line<'static>, Option<u64>
     for card in &model.cards {
         if matches!(card.kind, CardKind::User) {
             lines.push((
-                Line::styled("─".repeat(inner_width.min(24)), Style::default().fg(BORDER())),
+                Line::styled(
+                    "─".repeat(inner_width.min(24)),
+                    Style::default().fg(BORDER()),
+                ),
                 None,
             ));
         }
@@ -4499,7 +4582,10 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
                 };
                 for row in wrap_display(styled.content.as_ref(), width.saturating_sub(4)) {
                     if i == 0 {
-                        push_bordered(&mut out, vec![Span::styled(row, Style::default().fg(TEXT()))]);
+                        push_bordered(
+                            &mut out,
+                            vec![Span::styled(row, Style::default().fg(TEXT()))],
+                        );
                     } else {
                         push_bordered(&mut out, vec![Span::styled(row, body_style)]);
                     }
@@ -5256,7 +5342,11 @@ mod tests {
         let painted = highlight_row(line, MATCH_BG());
         assert_eq!(row_text(&painted), "\u{258c} hit", "text survives");
         for span in &painted.spans {
-            assert_eq!(span.style.bg, Some(MATCH_BG()), "every span carries the wash");
+            assert_eq!(
+                span.style.bg,
+                Some(MATCH_BG()),
+                "every span carries the wash"
+            );
         }
         // Foreground styling is left alone, so a highlighted answer still reads as an answer.
         assert_eq!(painted.spans[0].style.fg, Some(BLUE()));
