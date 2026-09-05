@@ -3408,12 +3408,7 @@ fn mcp_sidebar_value(statuses: &[ConnectionStatus]) -> String {
         .iter()
         .map(|server| match &server.error {
             Some(_) => format!("- {}\n  unavailable", server.name),
-            None => format!(
-                "- {}\n  {} tool(s){}",
-                server.name,
-                server.tool_count,
-                if server.trusted { "" } else { "" }
-            ),
+            None => format!("- {}\n  {} tool(s)", server.name, server.tool_count),
         })
         .collect::<Vec<_>>()
         .join("\n")

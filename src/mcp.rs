@@ -54,6 +54,9 @@ pub async fn connect_all(servers: &[McpServer]) -> Connections {
 }
 
 async fn connect(server: &McpServer) -> Result<Vec<Box<dyn Tool>>> {
+    if let Some(url) = &server.url {
+        return connect_remote(server, url).await;
+    }
     let mut command = tokio::process::Command::new(&server.command);
     command.args(&server.args);
     for (k, v) in &server.env {
@@ -72,12 +75,35 @@ async fn connect(server: &McpServer) -> Result<Vec<Box<dyn Tool>>> {
         .await
         .context("could not list tools")?;
 
+    Ok(wrap_tools(server, service, listed))
+}
+
+/// Remote (streamable-http / SSE) servers parse and validate in `config.rs`, but Kamui's MCP
+/// client is stdio-only today (`rmcp`'s reqwest transports are private). Report the gap clearly
+/// rather than silently dropping the server.
+async fn connect_remote(server: &McpServer, url: &str) -> Result<Vec<Box<dyn Tool>>> {
+    let headers_note = if server.headers.is_empty() {
+        String::new()
+    } else {
+        format!(" ({} header(s) configured)", server.headers.len())
+    };
+    anyhow::bail!(
+        "'{}' is a remote MCP server ({url}){headers_note} but Kamui only supports stdio \
+         transport; remote MCP is not implemented yet",
+        server.name
+    )
+}
+
+fn wrap_tools(
+    server: &McpServer,
+    service: RunningService<RoleClient, ()>,
+    listed: Vec<rmcp::model::Tool>,
+) -> Vec<Box<dyn Tool>> {
     let service = Arc::new(service);
-    Ok(listed
+    listed
         .into_iter()
         .map(|tool| {
             Box::new(McpTool {
-                // Qualified so a server's tools cannot collide with the built-ins or each other.
                 qualified_name: format!("{}__{}", server.name, tool.name),
                 remote_name: tool.name.to_string(),
                 description: tool.description.as_deref().unwrap_or_default().to_string(),
@@ -86,7 +112,7 @@ async fn connect(server: &McpServer) -> Result<Vec<Box<dyn Tool>>> {
                 service: service.clone(),
             }) as Box<dyn Tool>
         })
-        .collect())
+        .collect()
 }
 
 /// One tool advertised by a connected MCP server.

@@ -4010,8 +4010,14 @@ fn push_sidebar_value(lines: &mut Vec<Line<'static>>, key: &str, value_line: &st
     if let Some((label, rest)) = value_line.split_once('\t') {
         let style = sidebar_value_style(key, label, rest);
         // label on its own line, value indented on next line (user request: not "model model name")
-        lines.push(Line::styled(format!("{label} :"), Style::default().fg(TEXT()).add_modifier(Modifier::BOLD)));
-        let indented = format!(" {}", crate::tui::truncate_chars(rest, max.saturating_sub(1)));
+        lines.push(Line::styled(
+            format!("{label} :"),
+            Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
+        ));
+        let indented = format!(
+            " {}",
+            crate::tui::truncate_chars(rest, max.saturating_sub(1))
+        );
         // mcp value already contains newlines/bullets — keep as-is but indented
         for part in indented.split('\n') {
             lines.push(Line::styled(part.to_string(), style));

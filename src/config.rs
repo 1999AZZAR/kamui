@@ -80,6 +80,9 @@ api_key = \"\"
 # command = \"uvx\"
 # args = [\"mcp-excel\"]
 # trusted = true         # skip the per-call approval for this server
+# enabled = false        # opt out without deleting (opencode-compatible)
+# [mcp.excel.env]        # extra environment for the child process
+# KEY = \"value\"
 
 # Commands run_command may run without asking for approval. Exact match only (after
 # trimming), so this never widens beyond exactly what is listed. Global-only, like
@@ -151,6 +154,8 @@ pub struct McpServer {
     /// When true, this server's tools run without per-call approval.
     pub trusted: bool,
     pub env: HashMap<String, String>,
+    pub url: Option<String>,
+    pub headers: HashMap<String, String>,
 }
 
 /// Fully resolved runtime configuration: every available profile plus the default choice.
@@ -240,6 +245,11 @@ struct CommandsSection {
 
 #[derive(Debug, Default, Deserialize)]
 struct McpSection {
+    #[serde(default)]
+    enabled: Option<bool>,
+    /// opencode names this `type`; accept both spellings.
+    #[serde(default, alias = "type")]
+    kind: Option<String>,
     command: Option<String>,
     #[serde(default)]
     args: Vec<String>,
@@ -250,6 +260,10 @@ struct McpSection {
     /// opencode uses `environment`, accept both
     #[serde(default)]
     environment: HashMap<String, String>,
+    /// Remote server (`type = "remote"`): streamable-http URL + optional headers.
+    url: Option<String>,
+    #[serde(default)]
+    headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -469,6 +483,29 @@ fn resolve_prices(global: PricingSection, project: Option<PricingSection>) -> Re
 fn resolve_mcp_servers(sections: HashMap<String, McpSection>) -> Result<Vec<McpServer>> {
     let mut servers = Vec::with_capacity(sections.len());
     for (name, section) in sections {
+        if section.enabled == Some(false) {
+            continue;
+        }
+        let is_remote = section
+            .kind
+            .as_deref()
+            .is_some_and(|k| k.eq_ignore_ascii_case("remote"));
+        if is_remote {
+            let url = section
+                .url
+                .clone()
+                .with_context(|| format!("mcp server '{name}' is remote but has no url"))?;
+            servers.push(McpServer {
+                name,
+                command: String::new(),
+                args: Vec::new(),
+                trusted: section.trusted,
+                env: HashMap::new(),
+                url: Some(url),
+                headers: section.headers,
+            });
+            continue;
+        }
         let command = section
             .command
             .with_context(|| format!("mcp server '{name}' is missing a command"))?;
@@ -480,6 +517,8 @@ fn resolve_mcp_servers(sections: HashMap<String, McpSection>) -> Result<Vec<McpS
             args: section.args,
             trusted: section.trusted,
             env,
+            url: None,
+            headers: HashMap::new(),
         });
     }
     servers.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1116,6 +1155,47 @@ api_key = "k"
         )
         .unwrap_err();
         assert!(error.to_string().contains("missing a command"));
+    }
+
+    #[test]
+    fn an_mcp_server_can_be_disabled_and_forward_env() {
+        let config = resolve(
+            file(
+                "model = \"m\"\n[provider]\napi_key = \"k\"\n\
+                 [mcp.on]\ncommand = \"srv\"\nenabled = true\n\
+                 [mcp.on.environment]\nTOKEN = \"t\"\n\
+                 [mcp.off]\ncommand = \"srv\"\nenabled = false",
+            ),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(config.mcp_servers.len(), 1, "disabled servers are skipped");
+        let on = &config.mcp_servers[0];
+        assert_eq!(on.name, "on");
+        assert_eq!(on.env.get("TOKEN").map(String::as_str), Some("t"));
+    }
+
+    #[test]
+    fn a_remote_mcp_server_parses_without_a_command() {
+        let config = resolve(
+            file(
+                "model = \"m\"\n[provider]\napi_key = \"k\"\n\
+                 [mcp.remote]\ntype = \"remote\"\nurl = \"https://example.com/mcp\"\n\
+                 [mcp.remote.headers]\nX-Api-Key = \"secret\"",
+            ),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(config.mcp_servers.len(), 1);
+        let remote = &config.mcp_servers[0];
+        assert_eq!(remote.url.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(remote.command, "");
+        assert_eq!(
+            remote.headers.get("X-Api-Key").map(String::as_str),
+            Some("secret")
+        );
     }
 
     #[test]
