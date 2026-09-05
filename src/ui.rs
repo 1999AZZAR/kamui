@@ -2284,7 +2284,11 @@ fn input_thread(
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .filter(|path| path.to_ascii_lowercase().starts_with(needle))
+            .filter(|path| {
+                path.trim_start_matches('@')
+                    .to_ascii_lowercase()
+                    .starts_with(needle)
+            })
             .map(|path| {
                 let description = match path.trim_start_matches('@') {
                     "clipboard" => "clipboard",
