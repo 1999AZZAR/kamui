@@ -516,6 +516,9 @@ Highlights:
   since the prompt itself only ever shows the reference you typed. Files a directory reference had
   to leave out are reported too — an `@src` that delivered twelve of fifty files answers from
   partial context, and until now only the model was told.
+  `Ctrl+Shift+V` inserts `@clipboard` at the caret without submitting. The fullscreen footer shows
+  compact indicators for valid file, directory, image, diff, staged, and clipboard references;
+  incomplete or invalid references are hidden.
 - **Tool cards** — a call and its result are one block: a header naming the tool and its
   arguments, then an outcome row (`✓ completed · 1.2s · 142 chars`, or `✗ failed · 1.2s`) that
   stays visible while the output itself stays folded. **`Ctrl+O` or a click** on the card

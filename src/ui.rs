@@ -2156,6 +2156,16 @@ fn input_thread(
         s.model.input_caret = caret.min(buf.len());
         s.model.ac_selected = selected;
         s.model.ac_items = items;
+        let snapshot = path_candidates
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let labels = crate::context::attachment_indicators(buf, &snapshot);
+        s.model.footer = if labels.is_empty() {
+            String::new()
+        } else {
+            format!("attachments: {}", labels.join(" "))
+        };
         let _ = s.draw();
     };
     let items_for = |needle: &str| -> Vec<(String, String)> {
@@ -2174,10 +2184,13 @@ fn input_thread(
             .iter()
             .filter(|path| path.to_ascii_lowercase().starts_with(needle))
             .map(|path| {
-                let description = if path.ends_with('/') {
-                    "directory"
-                } else {
-                    "file"
+                let description = match path.trim_start_matches('@') {
+                    "clipboard" => "clipboard",
+                    "diff" => "diff",
+                    "staged" => "staged",
+                    value if crate::context::is_image_reference(value) => "image",
+                    _ if path.ends_with('/') => "directory",
+                    _ => "file",
                 };
                 (
                     path.trim_start_matches('@').to_string(),
@@ -2754,6 +2767,18 @@ fn input_thread(
             let _ = lock_screen(&screen.0).copy_latest();
             continue;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.modifiers.contains(KeyModifiers::SHIFT)
+            && key.code == KeyCode::Char('v')
+        {
+            caret = insert_clipboard_reference(&mut buf, caret);
+            selected = 0;
+            if history_idx == history.len() {
+                saved_buf = buf.clone();
+            }
+            sync(&screen, &buf, caret, selected, Vec::new());
+            continue;
+        }
         if key.code == KeyCode::Char('?') && buf.is_empty() {
             let mut sc = lock_screen(&screen.0);
             sc.model.help_visible = !sc.model.help_visible;
@@ -3054,6 +3079,28 @@ fn input_thread(
             };
         sync(&screen, &buf, caret, selected, items);
     }
+}
+
+fn insert_clipboard_reference(buf: &mut String, caret: usize) -> usize {
+    let prefix = if caret > 0
+        && !buf[..caret]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace)
+    {
+        " "
+    } else {
+        ""
+    };
+    let suffix =
+        if caret < buf.len() && !buf[caret..].chars().next().is_some_and(char::is_whitespace) {
+            " "
+        } else {
+            ""
+        };
+    let insertion = format!("{prefix}@clipboard{suffix}");
+    buf.insert_str(caret, &insertion);
+    caret + prefix.len() + "@clipboard".len()
 }
 
 /// Shared submit path for the editor and modal dialogs: a waiting approval/ask_user takes
@@ -6012,4 +6059,20 @@ mod line_tests {
             "{rendered:?}"
         );
     }
+}
+#[test]
+fn clipboard_reference_inserts_at_caret_with_sensible_spacing() {
+    let mut middle = "hello world".to_string();
+    let caret = insert_clipboard_reference(&mut middle, 5);
+    assert_eq!(middle, "hello @clipboard world");
+    assert_eq!(caret, "hello @clipboard".len());
+
+    let mut after_space = "ask ".to_string();
+    assert_eq!(insert_clipboard_reference(&mut after_space, 4), 14);
+    assert_eq!(after_space, "ask @clipboard");
+
+    let mut unicode = "éx".to_string();
+    let caret = insert_clipboard_reference(&mut unicode, 2);
+    assert_eq!(unicode, "é @clipboard x");
+    assert_eq!(caret, "é @clipboard".len());
 }
