@@ -97,6 +97,9 @@ api_key = \"\"
 # timeout_secs = 30
 # background_max_secs = 1800
 
+# Theme: default | catppuccin | ayu-dark | ayuppuccin (also per-project override)
+# theme = \"ayuppuccin\"
+
 # Optional: an embedding-capable model on this same provider, enabling /index and the
 # search_code tool. Not every model/endpoint offers an embeddings API; omit this to
 # leave semantic search unavailable.
@@ -166,6 +169,7 @@ pub struct Config {
     /// Per-model prices for optional cost reporting in `/stats` and `/usage`. Empty unless the
     /// user configured `[pricing.models]`, and cost is left out of both reports entirely when it is.
     pub prices: Prices,
+    pub theme: crate::theme::Theme,
 }
 
 impl Config {
@@ -195,6 +199,7 @@ struct ConfigFile {
     context_window: Option<u64>,
     provider: Option<ProviderSection>,
     default_profile: Option<String>,
+    theme: Option<String>,
     /// Named, shared provider credentials that profiles can reference by name.
     #[serde(default)]
     providers: HashMap<String, ProviderSection>,
@@ -414,6 +419,17 @@ fn resolve(mut global: ConfigFile, mut project: Option<ConfigFile>) -> Result<Co
 
     let mcp_servers = resolve_mcp_servers(std::mem::take(&mut global.mcp))?;
     let allow_commands = std::mem::take(&mut global.permissions).allow_commands;
+    let theme = project
+        .as_ref()
+        .and_then(|f| f.theme.clone())
+        .or(global.theme.clone())
+        .as_deref()
+        .map(|s| s.parse::<crate::theme::Theme>())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!(e))?
+        .unwrap_or_default();
+    // also allow DB override if toml had default and DB was set previously — toml wins when explicitly set
+
     let mut config = if global.profiles.is_empty() {
         resolve_flat(global, project)?
     } else {
@@ -424,6 +440,7 @@ fn resolve(mut global: ConfigFile, mut project: Option<ConfigFile>) -> Result<Co
     config.command_timeout_secs = command_timeout_secs;
     config.background_max_secs = background_max_secs;
     config.prices = prices;
+    config.theme = theme;
     Ok(config)
 }
 
@@ -533,6 +550,7 @@ fn resolve_flat(global: ConfigFile, project: Option<ConfigFile>) -> Result<Confi
         background_max_secs: DEFAULT_BACKGROUND_MAX_SECS,
         // Overwritten by `resolve`, which is the only place that sees both files.
         prices: Prices::default(),
+        theme: crate::theme::Theme::default(),
     })
 }
 
@@ -618,6 +636,7 @@ fn resolve_profiles(global: ConfigFile, project: Option<ConfigFile>) -> Result<C
         background_max_secs: DEFAULT_BACKGROUND_MAX_SECS,
         // Overwritten by `resolve`, which is the only place that sees both files.
         prices: Prices::default(),
+        theme: crate::theme::Theme::default(),
     })
 }
 
@@ -633,6 +652,14 @@ pub fn global_config_dir() -> Result<PathBuf> {
 /// Appends a `[profiles.<name>]` block to the global `kamui.toml`, creating the file if
 /// needed. Used by the TUI "Add provider" flow; the name is sanitized and de-duplicated so a
 /// repeated append can never produce a TOML table collision.
+pub fn save_theme(path: &Path, theme: &str) -> Result<()> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut doc: toml::Value = if content.trim().is_empty() { toml::Value::Table(Default::default()) } else { toml::from_str(&content).unwrap_or(toml::Value::Table(Default::default())) };
+    doc.as_table_mut().unwrap().insert("theme".to_string(), toml::Value::String(theme.to_string()));
+    std::fs::write(path, toml::to_string_pretty(&doc).unwrap())?;
+    Ok(())
+}
+
 pub fn append_profile(path: &Path, base_url: &str, api_key: &str, model: &str) -> Result<String> {
     use std::io::Write;
 

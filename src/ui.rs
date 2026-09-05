@@ -15,7 +15,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Padding, Paragraph},
 };
 use std::{
     collections::VecDeque,
@@ -38,7 +38,7 @@ fn bouncing_wall_spans(frame_idx: usize) -> Vec<Span<'static>> {
     // first half of the cycle moves right, second half moves left
     let moving_right = (frame_idx % WALL_POS.len()) < 8;
     let mut spans = Vec::with_capacity(WALL_TRACK_LEN + 2);
-    spans.push(Span::styled("[", Style::default().fg(MUTED)));
+    spans.push(Span::styled("[", Style::default().fg(MUTED())));
     for i in 0..WALL_TRACK_LEN {
         let in_wall = i >= pos && i < pos + WALL_LEN;
         let is_tail = if moving_right {
@@ -49,15 +49,15 @@ fn bouncing_wall_spans(frame_idx: usize) -> Vec<Span<'static>> {
         if in_wall {
             spans.push(Span::styled(
                 "█",
-                Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+                Style::default().fg(BLUE()).add_modifier(Modifier::BOLD),
             ));
         } else if is_tail {
-            spans.push(Span::styled("▓", Style::default().fg(BLUE)));
+            spans.push(Span::styled("▓", Style::default().fg(BLUE())));
         } else {
-            spans.push(Span::styled("─", Style::default().fg(BORDER)));
+            spans.push(Span::styled("─", Style::default().fg(BORDER())));
         }
     }
-    spans.push(Span::styled("]", Style::default().fg(MUTED)));
+    spans.push(Span::styled("]", Style::default().fg(MUTED())));
     spans
 }
 
@@ -137,28 +137,46 @@ fn lock_screen(screen: &Mutex<FullScreen>) -> MutexGuard<'_, FullScreen> {
     screen.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-// Tokyo Night Storm palette with Kamui's blue mapped to the theme's primary accent.
-const TEXT: Color = Color::Rgb(0xc0, 0xca, 0xf5);
-const MUTED: Color = Color::Rgb(0x56, 0x5f, 0x89);
-const BORDER: Color = Color::Rgb(0x41, 0x48, 0x68);
-const BG_CHAT: Color = Color::Rgb(0x1a, 0x1b, 0x26);
-const BG_ELEMENT: Color = Color::Rgb(0x24, 0x28, 0x3b);
-const BG_PANEL: Color = Color::Rgb(0x1f, 0x23, 0x35);
-const BLUE: Color = Color::Rgb(0x7a, 0xa2, 0xf7);
-/// Overlay panels sit *above* the transcript: a hair brighter than chat, still opaque.
-const POPUP_BG: Color = Color::Rgb(0x24, 0x28, 0x3b);
-/// Search hits: every match gets a quiet wash, the one in view a brighter one.
-const MATCH_BG: Color = Color::Rgb(0x29, 0x2e, 0x42);
-const MATCH_CURRENT_BG: Color = Color::Rgb(0x3d, 0x59, 0xa1);
-/// Warm accent marking the user's own words (opencode primary tone).
-const ACCENT: Color = Color::Rgb(0xbb, 0x9a, 0xf7);
-const GREEN: Color = Color::Rgb(0x9e, 0xce, 0x6a);
-const WARN: Color = Color::Rgb(0xe0, 0xaf, 0x68);
-const RED: Color = Color::Rgb(0xf7, 0x76, 0x8e);
-/// Cache/secondary-info accent (variant C activity + context cache lines).
-const CYAN: Color = Color::Rgb(0x7d, 0xcf, 0xff);
-/// Kept from the earlier blue scheme; NOTICE_FG aliases it for readability everywhere.
-const NOTICE_FG: Color = MUTED;
+fn palette() -> Option<crate::theme::Palette> {
+    ACTIVE_THEME.with(|c| c.borrow().clone().and_then(|t| t.palette()))
+}
+fn themed(or: Color, f: impl FnOnce(&crate::theme::Palette) -> String) -> Color {
+    if let Some(p) = palette() { crate::theme::ratatui_fg(&f(&p)) } else { or }
+}
+#[allow(non_snake_case)]
+fn TEXT() -> Color { themed(Color::Rgb(0xc0,0xca,0xf5), |p| p.fg.clone()) }
+#[allow(non_snake_case)]
+fn MUTED() -> Color { themed(Color::Rgb(0x56,0x5f,0x89), |p| p.muted.clone()) }
+#[allow(non_snake_case)]
+fn BORDER() -> Color { themed(Color::Rgb(0x41,0x48,0x68), |_| palette().unwrap().muted.clone()) }
+#[allow(non_snake_case)]
+fn BG_CHAT() -> Color { themed(Color::Rgb(0x1a,0x1b,0x26), |p| p.bg.clone()) }
+#[allow(non_snake_case)]
+fn BG_ELEMENT() -> Color { let (r,g,b)=crate::theme::hex_to_rgb(&palette().map(|p| p.bg).unwrap_or("#24283b".into())); Color::Rgb(r.saturating_sub(12),g.saturating_sub(12),b.saturating_sub(12)) }
+#[allow(non_snake_case)]
+fn BG_PANEL() -> Color { let (r,g,b)=crate::theme::hex_to_rgb(&palette().map(|p| p.bg).unwrap_or("#1f2335".into())); Color::Rgb(r.saturating_sub(6),g.saturating_sub(6),b.saturating_sub(6)) }
+#[allow(non_snake_case)]
+fn BLUE() -> Color { themed(Color::Rgb(0x7a,0xa2,0xf7), |p| p.blue.clone()) }
+#[allow(non_snake_case)]
+fn POPUP_BG() -> Color { BG_ELEMENT() }
+#[allow(non_snake_case)]
+fn MATCH_BG() -> Color { themed(Color::Rgb(0x29,0x2e,0x42), |p| p.muted.clone()) }
+#[allow(non_snake_case)]
+fn MATCH_CURRENT_BG() -> Color { themed(Color::Rgb(0x3d,0x59,0xa1), |p| p.mauve.clone()) }
+#[allow(non_snake_case)]
+fn ACCENT() -> Color { themed(Color::Rgb(0xbb,0x9a,0xf7), |p| p.mauve.clone()) }
+#[allow(non_snake_case)]
+fn GREEN() -> Color { themed(Color::Rgb(0x9e,0xce,0x6a), |p| p.green.clone()) }
+#[allow(non_snake_case)]
+fn WARN() -> Color { themed(Color::Rgb(0xe0,0xaf,0x68), |p| p.amber.clone()) }
+#[allow(non_snake_case)]
+fn RED() -> Color { themed(Color::Rgb(0xf7,0x76,0x8e), |p| p.red.clone()) }
+#[allow(non_snake_case)]
+fn CYAN() -> Color { themed(Color::Rgb(0x7d,0xcf,0xff), |p| p.cyan.clone()) }
+#[allow(non_snake_case)]
+fn NOTICE_FG() -> Color { MUTED() }
+// Back-compat const aliases for code that still uses `TEXT()` without call — we replace via regex below to `TEXT()`
+thread_local! { static ACTIVE_THEME: std::cell::RefCell<Option<crate::theme::Theme>> = std::cell::RefCell::new(None); }
 const MAX_HISTORY_LINES: usize = 4_000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -255,6 +273,7 @@ struct Model {
     /// First keybinding row shown in the `?` overlay; a short terminal scrolls the sheet
     /// rather than silently cutting the bindings that did not fit.
     help_scroll: usize,
+    theme: crate::theme::Theme,
     /// Right-side status-bar badge ("5.9k tok 41%", amber past 80%).
     token_badge: Option<(String, u8)>,
     /// Open approval modal (opencode permission panel).
@@ -356,6 +375,7 @@ impl DialogState {
 impl Default for Model {
     fn default() -> Self {
         Self {
+            theme: crate::theme::Theme::default(),
             header: String::from("Kamui"),
             cards: Vec::new(),
             footer: String::from("? help"),
@@ -409,7 +429,9 @@ struct FullScreen {
 }
 
 impl FullScreen {
-    fn new(header: String) -> Result<Self> {
+    #[allow(dead_code)]
+    fn new(header: String) -> Result<Self> { Self::new_with_theme(header, crate::theme::Theme::default()) }
+    fn new_with_theme(header: String, theme: crate::theme::Theme) -> Result<Self> {
         // If anything panics mid-draw, still restore the terminal instead of leaving it raw.
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -449,10 +471,11 @@ impl FullScreen {
             let _ = disable_raw_mode();
             return Err(error).context("could not clear terminal");
         }
-        let model = Model {
+        let mut model = Model {
             header,
             ..Model::default()
         };
+        model.theme = theme;
         let mut screen = Self {
             terminal,
             model,
@@ -910,16 +933,17 @@ impl Drop for ThinkingHandle {
 }
 
 impl ChatUi {
-    pub fn new(interactive: bool, header: String) -> Result<Self> {
+    #[allow(dead_code)]
+    pub fn new(interactive: bool, header: String) -> Result<Self> { Self::new_with_theme(interactive, header, crate::theme::Theme::default()) }
+    pub fn new_with_theme(interactive: bool, header: String, theme: crate::theme::Theme) -> Result<Self> {
         let plain = Ui::stdio();
         let fullscreen = interactive
-            .then(|| FullScreen::new(header).map(|screen| Arc::new(Mutex::new(screen))))
+            .then(|| FullScreen::new_with_theme(header, theme).map(|screen| Arc::new(Mutex::new(screen))))
             .transpose()?;
-        Ok(Self {
-            plain,
-            fullscreen,
-            thinking: None,
-        })
+        Ok(Self { plain, fullscreen, thinking: None })
+    }
+    pub fn set_theme(&self, theme: crate::theme::Theme) {
+        if let Some(fs) = &self.fullscreen { let mut s = lock_screen(fs); s.model.theme = theme; let _ = s.draw(); }
     }
 
     pub fn is_fullscreen(&self) -> bool {
@@ -1472,6 +1496,11 @@ impl InputHub {
         true
     }
 
+    pub fn open_themes_dialog(&self) -> bool {
+        let items: Vec<(String,String)> = crate::theme::Theme::all().into_iter().map(|t| (t.to_string(), t.to_string())).collect();
+        { let mut s = lock_screen(&self.screen.0); s.model.dialog = Some(DialogState::new("Select Theme", "/theme ", items)); }
+        let _ = self.screen.draw_now(); true
+    }
     /// Sources for the Ctrl+S session switcher.
     pub fn set_sessions(&self, items: Vec<(String, String)>) {
         *self
@@ -1769,16 +1798,16 @@ fn render_dialog(frame: &mut Frame<'_>, dialog: &DialogState, area: Rect) {
         Line::from(vec![
             Span::styled(
                 "\u{276f} ".to_string(),
-                Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+                Style::default().fg(BLUE()).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(dialog.query.clone(), Style::default().fg(TEXT)),
+            Span::styled(dialog.query.clone(), Style::default().fg(TEXT())),
             Span::styled(
                 if filtered.is_empty() {
                     "  Esc closes".to_string()
                 } else {
                     format!("  {}/{} \u{b7} Esc closes", selected + 1, filtered.len())
                 },
-                Style::default().fg(BORDER),
+                Style::default().fg(BORDER()),
             ),
         ]),
         Line::from(""),
@@ -1786,7 +1815,7 @@ fn render_dialog(frame: &mut Frame<'_>, dialog: &DialogState, area: Rect) {
     if filtered.is_empty() {
         lines.push(Line::styled(
             "(no match)".to_string(),
-            Style::default().fg(MUTED),
+            Style::default().fg(MUTED()),
         ));
     }
     for (idx, (value, label)) in filtered.iter().enumerate().take(end).skip(start) {
@@ -1795,12 +1824,12 @@ fn render_dialog(frame: &mut Frame<'_>, dialog: &DialogState, area: Rect) {
         let mut row = vec![
             Span::styled(
                 prefix.to_string(),
-                Style::default().fg(if is_on { BLUE } else { BORDER }),
+                Style::default().fg(if is_on { BLUE() } else { BORDER() }),
             ),
             Span::styled(
                 label.clone(),
                 Style::default()
-                    .fg(if is_on { TEXT } else { MUTED })
+                    .fg(if is_on { TEXT() } else { MUTED() })
                     .add_modifier(if is_on {
                         Modifier::BOLD
                     } else {
@@ -1811,19 +1840,19 @@ fn render_dialog(frame: &mut Frame<'_>, dialog: &DialogState, area: Rect) {
         // Show the raw value only when the label doesn't already contain it.
         if !label.contains(value.as_str()) {
             row.push(Span::raw("  "));
-            row.push(Span::styled(value.clone(), Style::default().fg(BORDER)));
+            row.push(Span::styled(value.clone(), Style::default().fg(BORDER())));
         }
         lines.push(Line::from(row));
     }
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .style(Style::default().bg(POPUP_BG))
+            .style(Style::default().bg(POPUP_BG()))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(BLUE))
+                    .border_style(Style::default().fg(BLUE()))
                     .title(format!(" {} ", dialog.title))
-                    .title_style(Style::default().fg(BLUE).add_modifier(Modifier::BOLD)),
+                    .title_style(Style::default().fg(BLUE()).add_modifier(Modifier::BOLD)),
             ),
         box_area,
     );
@@ -1859,15 +1888,15 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
     for row in &body_rows {
         let trimmed = row.trim_start();
         let style = if trimmed.starts_with("- ") {
-            Style::default().fg(RED)
+            Style::default().fg(RED())
         } else if trimmed.starts_with("+ ") {
-            Style::default().fg(GREEN)
+            Style::default().fg(GREEN())
         } else if trimmed.starts_with("--- ") {
-            Style::default().fg(BLUE).add_modifier(Modifier::BOLD)
+            Style::default().fg(BLUE()).add_modifier(Modifier::BOLD)
         } else if trimmed.starts_with("…") {
-            Style::default().fg(MUTED).add_modifier(Modifier::DIM)
+            Style::default().fg(MUTED()).add_modifier(Modifier::DIM)
         } else {
-            Style::default().fg(TEXT)
+            Style::default().fg(TEXT())
         };
         lines.push(Line::styled(row.clone(), style));
     }
@@ -1879,7 +1908,7 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
                 scroll + body_rows.len(),
                 all_rows.len()
             ),
-            Style::default().fg(WARN),
+            Style::default().fg(WARN()),
         ));
     }
     lines.push(Line::from(""));
@@ -1889,22 +1918,22 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
         lines.push(Line::from(vec![
             Span::styled(
                 prefix.to_string(),
-                Style::default().fg(if is_on { BLUE } else { BORDER }),
+                Style::default().fg(if is_on { BLUE() } else { BORDER() }),
             ),
             Span::styled(
                 format!("{hotkey}  "),
                 Style::default()
-                    .fg(if is_on { BLUE } else { MUTED })
+                    .fg(if is_on { BLUE() } else { MUTED() })
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 (*label).to_string(),
                 Style::default()
                     .fg(match (idx, is_on) {
-                        (2, true) => RED,
-                        (2, false) => MUTED,
-                        (_, true) => TEXT,
-                        _ => MUTED,
+                        (2, true) => RED(),
+                        (2, false) => MUTED(),
+                        (_, true) => TEXT(),
+                        _ => MUTED(),
                     })
                     .add_modifier(if is_on {
                         Modifier::BOLD
@@ -1916,17 +1945,17 @@ fn render_permission(frame: &mut Frame<'_>, perm: &PermissionState, area: Rect) 
     }
     lines.push(Line::from(Span::styled(
         "y / a / n  \u{b7}  Enter confirm  \u{b7}  Esc rejects".to_string(),
-        Style::default().fg(MUTED),
+        Style::default().fg(MUTED()),
     )));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .style(Style::default().bg(POPUP_BG))
+            .style(Style::default().bg(POPUP_BG()))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(WARN))
+                    .border_style(Style::default().fg(WARN()))
                     .title(format!(" {} ", perm.title))
-                    .title_style(Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
+                    .title_style(Style::default().fg(WARN()).add_modifier(Modifier::BOLD)),
             ),
         box_area,
     );
@@ -1951,7 +1980,7 @@ fn render_ask(frame: &mut Frame<'_>, ask: &AskState, area: Rect) {
     frame.render_widget(Clear, box_area);
     let mut lines: Vec<Line<'static>> = question_rows
         .into_iter()
-        .map(|row| Line::styled(row, Style::default().fg(TEXT)))
+        .map(|row| Line::styled(row, Style::default().fg(TEXT())))
         .collect();
     lines.push(Line::from(""));
     for (idx, option) in ask.options.iter().enumerate() {
@@ -1960,18 +1989,18 @@ fn render_ask(frame: &mut Frame<'_>, ask: &AskState, area: Rect) {
         lines.push(Line::from(vec![
             Span::styled(
                 prefix.to_string(),
-                Style::default().fg(if is_on { BLUE } else { BORDER }),
+                Style::default().fg(if is_on { BLUE() } else { BORDER() }),
             ),
             Span::styled(
                 format!("{}  ", idx + 1),
                 Style::default()
-                    .fg(if is_on { BLUE } else { MUTED })
+                    .fg(if is_on { BLUE() } else { MUTED() })
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 option.clone(),
                 Style::default()
-                    .fg(if is_on { TEXT } else { MUTED })
+                    .fg(if is_on { TEXT() } else { MUTED() })
                     .add_modifier(if is_on {
                         Modifier::BOLD
                     } else {
@@ -1991,14 +2020,14 @@ fn render_ask(frame: &mut Frame<'_>, ask: &AskState, area: Rect) {
     lines.push(Line::from(vec![
         Span::styled(
             "\u{276f} ".to_string(),
-            Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+            Style::default().fg(BLUE()).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             prompt,
             if ask.typed.is_empty() {
-                Style::default().fg(MUTED).add_modifier(Modifier::DIM)
+                Style::default().fg(MUTED()).add_modifier(Modifier::DIM)
             } else {
-                Style::default().fg(TEXT)
+                Style::default().fg(TEXT())
             },
         ),
     ]));
@@ -2009,17 +2038,17 @@ fn render_ask(frame: &mut Frame<'_>, ask: &AskState, area: Rect) {
     };
     lines.push(Line::from(Span::styled(
         hint.to_string(),
-        Style::default().fg(MUTED),
+        Style::default().fg(MUTED()),
     )));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .style(Style::default().bg(POPUP_BG))
+            .style(Style::default().bg(POPUP_BG()))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(BLUE))
+                    .border_style(Style::default().fg(BLUE()))
                     .title(" Ask ")
-                    .title_style(Style::default().fg(BLUE).add_modifier(Modifier::BOLD)),
+                    .title_style(Style::default().fg(BLUE()).add_modifier(Modifier::BOLD)),
             ),
         box_area,
     );
@@ -2077,7 +2106,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, scroll: usize) {
     frame.render_widget(Clear, box_area);
     let mut lines = vec![Line::from(Span::styled(
         "Keybindings",
-        Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+        Style::default().fg(BLUE()).add_modifier(Modifier::BOLD),
     ))];
     // One column width for every key, so the descriptions line up instead of stepping around
     // the longest binding.
@@ -2091,9 +2120,9 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, scroll: usize) {
         lines.push(Line::from(vec![
             Span::styled(
                 format!("  {key}{pad}  "),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
             ),
-            Span::styled((*desc).to_string(), Style::default().fg(MUTED)),
+            Span::styled((*desc).to_string(), Style::default().fg(MUTED())),
         ]));
     }
     let hidden = rows.len() - capacity;
@@ -2108,15 +2137,15 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, scroll: usize) {
                 rows.len()
             )
         },
-        Style::default().fg(BORDER),
+        Style::default().fg(BORDER()),
     )));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .style(Style::default().bg(POPUP_BG))
+            .style(Style::default().bg(POPUP_BG()))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(BORDER)),
+                    .border_style(Style::default().fg(BORDER())),
             ),
         box_area,
     );
@@ -3169,13 +3198,14 @@ fn dialog_geometry(dialog: &DialogState, area: Rect) -> (Rect, usize, usize) {
 }
 
 fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
+    ACTIVE_THEME.with(|c| *c.borrow_mut() = Some(model.theme.clone()));
     // Paint every terminal cell before laying out widgets. Windows Terminal/ConPTY can expose
     // newly reported rows or columns between draws; leaving any cell untouched reveals the
     // terminal's default black instead of Tokyo Night and looks like letterboxing.
     let whole = frame.area();
     frame
         .buffer_mut()
-        .set_style(whole, Style::default().bg(BG_CHAT));
+        .set_style(whole, Style::default().bg(BG_CHAT()));
     // OpenCode layout: transcript on top, autocomplete menu above the bordered editor, a
     // one-line footer, and the sidebar rail splitting the body horizontally.
     // The search bar and the slash menu never coexist: opening search closes the editor's menu.
@@ -3207,13 +3237,14 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     // screen, so a new chat is not a logo floating in a void.
     let (left_area, sidebar_area) = match (&model.sidebar, model.sidebar_hidden) {
         (Some(entries), false) if !entries.is_empty() && main_area.width >= 68 => {
-            // Narrow terminals get a narrower rail rather than none at all.
-            let rail = if main_area.width >= 84 { 30 } else { 24 };
+            let rail = if main_area.width >= 84 { 34 } else { 28 };
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(0), Constraint::Length(rail)])
+                .constraints([Constraint::Min(0), Constraint::Length(1), Constraint::Length(rail)])
                 .split(main_area);
-            (cols[0], Some(cols[1]))
+            // gap column is cols[1]; left is cols[0], sidebar is cols[2]
+            frame.buffer_mut().set_style(cols[1], Style::default().bg(BG_CHAT()));
+            (cols[0], Some(cols[2]))
         }
         _ => (main_area, None),
     };
@@ -3222,13 +3253,16 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
+            Constraint::Length(1),
             Constraint::Length(popup_height),
             Constraint::Length(editor_rows),
         ])
         .split(left_area);
+    // spacer row between body and input/popup
+    frame.buffer_mut().set_style(left_rows[1], Style::default().bg(BG_CHAT()));
     let transcript_area = left_rows[0];
-    let popup_area = left_rows[1];
-    let editor_area = left_rows[2];
+    let popup_area = left_rows[2];
+    let editor_area = left_rows[3];
 
     let mut card_rows: Vec<(u16, u64)> = Vec::new();
     let mut hit_regions = Vec::new();
@@ -3280,16 +3314,16 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
             }
             let absolute = start + offset;
             let line = if Some(absolute) == current_hit {
-                highlight_row(line, MATCH_CURRENT_BG)
+                highlight_row(line, MATCH_CURRENT_BG())
             } else if hits.binary_search(&absolute).is_ok() {
-                highlight_row(line, MATCH_BG)
+                highlight_row(line, MATCH_BG())
             } else {
                 line
             };
             window.push(line);
         }
         frame.render_widget(
-            Paragraph::new(Text::from(window)).style(Style::default().bg(BG_CHAT)),
+            Paragraph::new(Text::from(window)).style(Style::default().bg(BG_CHAT())),
             transcript_area,
         );
     }
@@ -3454,7 +3488,7 @@ fn render(frame: &mut Frame<'_>, model: &Model) -> RenderInfo {
     {
         frame
             .buffer_mut()
-            .set_style(hit.area, Style::default().bg(MATCH_BG));
+            .set_style(hit.area, Style::default().bg(MATCH_BG()));
     }
 
     RenderInfo {
@@ -3587,7 +3621,7 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
         _ if model.input.is_empty() => vec![Line::from(vec![
             Span::styled(
                 "\u{276f} ".to_string(),
-                Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+                Style::default().fg(BLUE()).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 "Ask Kamui, or / for commands".to_string(),
@@ -3610,12 +3644,12 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
                         if offset == 0 && model.input_caret <= model.input.len() {
                             Span::styled(
                                 "\u{276f} ".to_string(),
-                                Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+                                Style::default().fg(BLUE()).add_modifier(Modifier::BOLD),
                             )
                         } else {
                             Span::raw("  ".to_string())
                         },
-                        Span::styled(row, Style::default().fg(TEXT)),
+                        Span::styled(row, Style::default().fg(TEXT())),
                     ])
                 })
                 .collect()
@@ -3632,16 +3666,16 @@ fn editor_widget(model: &Model, area: Rect) -> Paragraph<'static> {
         let dots = ".".repeat(frame_idx % 4);
         wall_line.push(Span::styled(
             format!("{label}{dots}"),
-            Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+            Style::default().fg(MUTED()).add_modifier(Modifier::DIM),
         ));
         rows.push(Line::from(wall_line));
     }
     Paragraph::new(Text::from(rows))
-        .style(Style::default().bg(BG_ELEMENT))
+        .style(Style::default().bg(BG_ELEMENT()))
         .block(
             Block::default()
                 .borders(Borders::LEFT)
-                .border_style(Style::default().fg(BLUE)),
+                .border_style(Style::default().fg(BLUE())),
         )
 }
 
@@ -3669,19 +3703,19 @@ fn search_widget(search: &SearchState) -> Paragraph<'static> {
     Paragraph::new(Text::from(Line::from(vec![
         Span::styled(
             "search ".to_string(),
-            Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+            Style::default().fg(BLUE()).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(search.query.clone(), Style::default().fg(TEXT)),
+        Span::styled(search.query.clone(), Style::default().fg(TEXT())),
         Span::styled(
             format!("  {readout}"),
-            Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+            Style::default().fg(MUTED()).add_modifier(Modifier::DIM),
         ),
         Span::styled(
             "  \u{b7} Enter next \u{b7} Up prev \u{b7} Esc close".to_string(),
-            Style::default().fg(BORDER).add_modifier(Modifier::DIM),
+            Style::default().fg(BORDER()).add_modifier(Modifier::DIM),
         ),
     ])))
-    .style(Style::default().bg(POPUP_BG))
+    .style(Style::default().bg(POPUP_BG()))
 }
 
 fn popup_widget(model: &Model, area: Rect) -> Paragraph<'static> {
@@ -3709,8 +3743,8 @@ fn popup_widget(model: &Model, area: Rect) -> Paragraph<'static> {
         .saturating_sub(counter.chars().count() + 2)
         .max(1);
     let mut lines: Vec<Line<'static>> = vec![Line::from(vec![
-        Span::styled("\u{2500}".repeat(rule), Style::default().fg(BORDER)),
-        Span::styled(counter, Style::default().fg(BORDER)),
+        Span::styled("\u{2500}".repeat(rule), Style::default().fg(BORDER())),
+        Span::styled(counter, Style::default().fg(BORDER())),
     ])];
     for idx in start..end {
         let (name, description) = &model.ac_items[idx];
@@ -3719,12 +3753,12 @@ fn popup_widget(model: &Model, area: Rect) -> Paragraph<'static> {
         lines.push(Line::from(vec![
             Span::styled(
                 prefix.to_string(),
-                Style::default().fg(if is_on { BLUE } else { BORDER }),
+                Style::default().fg(if is_on { BLUE() } else { BORDER() }),
             ),
             Span::styled(
                 crate::tui::truncate_chars(name, name_width),
                 Style::default()
-                    .fg(if is_on { TEXT } else { MUTED })
+                    .fg(if is_on { TEXT() } else { MUTED() })
                     .add_modifier(if is_on {
                         Modifier::BOLD
                     } else {
@@ -3734,18 +3768,18 @@ fn popup_widget(model: &Model, area: Rect) -> Paragraph<'static> {
             Span::raw("  "),
             Span::styled(
                 crate::tui::truncate_chars(description, description_width),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             ),
         ]));
     }
     Paragraph::new(Text::from(lines))
-        .style(Style::default().bg(POPUP_BG))
+        .style(Style::default().bg(POPUP_BG()))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(BORDER))
+                .border_style(Style::default().fg(BORDER()))
                 .title(" commands ")
-                .title_style(Style::default().fg(MUTED)),
+                .title_style(Style::default().fg(MUTED())),
         )
 }
 
@@ -3756,7 +3790,7 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
     if let Some(plan) = &model.plan {
         lines.push(Line::from(Span::styled(
             "Plan",
-            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            Style::default().fg(MUTED()).add_modifier(Modifier::BOLD),
         )));
         let compact_plan = area.width < 28 || area.height < 12;
         let steps = if compact_plan {
@@ -3776,7 +3810,7 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
         if compact_plan {
             lines.push(Line::styled(
                 format!("Progress {completed}/{}", plan.steps.len()),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             ));
         }
         for (step, status) in steps {
@@ -3786,13 +3820,13 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
                 crate::tools::PlanStepStatus::Pending => " ",
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("[{mark}] "), Style::default().fg(BLUE)),
+                Span::styled(format!("[{mark}] "), Style::default().fg(BLUE())),
                 Span::styled(
                     crate::tui::truncate_chars(step, max.saturating_sub(4)),
                     Style::default().fg(if *status == crate::tools::PlanStepStatus::InProgress {
-                        TEXT
+                        TEXT()
                     } else {
-                        MUTED
+                        MUTED()
                     }),
                 ),
             ]));
@@ -3807,12 +3841,12 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
                 if i > 0 {
                     lines.push(Line::from(Span::styled(
                         "─".repeat(max.min(key.len() + 4)),
-                        Style::default().fg(BORDER),
+                        Style::default().fg(BORDER()),
                     )));
                 }
                 lines.push(Line::from(Span::styled(
                     key.to_string(),
-                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                    Style::default().fg(MUTED()).add_modifier(Modifier::BOLD),
                 )));
                 for value_line in value.split('\n') {
                     push_sidebar_value(&mut lines, key, value_line, max);
@@ -3821,7 +3855,7 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
             }
             lines.push(Line::from(Span::styled(
                 format!("{key} "),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
             )));
             // Values may carry newlines (Last turn metrics); ratatui strips them inside
             // spans, so split before styling. Tab-separated metric rows keep label/value
@@ -3835,13 +3869,8 @@ fn sidebar_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
         }
     }
     Paragraph::new(Text::from(lines))
-        .style(Style::default().bg(BG_PANEL))
-        .block(
-            Block::default()
-                .borders(Borders::LEFT)
-                .border_style(Style::default().fg(MUTED))
-                .style(Style::default().bg(BG_PANEL)),
-        )
+        .style(Style::default().bg(BG_PANEL()))
+        .block(Block::default().padding(Padding::new(1, 0, 1, 0)).style(Style::default().bg(BG_PANEL())))
 }
 
 /// Keys that open a sidebar group rather than a plain label row.
@@ -3855,23 +3884,23 @@ fn is_sidebar_section(key: &str) -> bool {
 /// Semantic value color: only the load-bearing value gets ink, labels stay quiet.
 fn sidebar_value_style(key: &str, label: &str, value: &str) -> Style {
     match (key, label) {
-        (_, "model") => Style::default().fg(BLUE),
+        (_, "model") => Style::default().fg(BLUE()),
         (_, "mode") => {
             if value.contains("plan") {
-                Style::default().fg(WARN)
+                Style::default().fg(WARN())
             } else {
-                Style::default().fg(GREEN)
+                Style::default().fg(GREEN())
             }
         }
         (_, "git") => {
             if value.contains("changed") || value.contains('±') {
-                Style::default().fg(WARN)
+                Style::default().fg(WARN())
             } else {
-                Style::default().fg(NOTICE_FG)
+                Style::default().fg(NOTICE_FG())
             }
         }
-        (_, "cache") => Style::default().fg(CYAN),
-        _ => Style::default().fg(NOTICE_FG),
+        (_, "cache") => Style::default().fg(CYAN()),
+        _ => Style::default().fg(NOTICE_FG()),
     }
 }
 /// One sidebar value row: metric tab-rows keep label/value contrast, `bar\tNN`
@@ -3884,17 +3913,17 @@ fn push_sidebar_value(lines: &mut Vec<Line<'static>>, key: &str, value_line: &st
         let width = max.clamp(4, 12) as u64;
         let filled = (pct as u64 * width / 100) as usize;
         let color = if pct >= 80 {
-            RED
+            RED()
         } else if pct >= 50 {
-            WARN
+            WARN()
         } else {
-            GREEN
+            GREEN()
         };
         let mut spans = vec![Span::styled(
             "▓".repeat(filled) + &"░".repeat(width as usize - filled),
             Style::default().fg(color),
         )];
-        spans.push(Span::styled(format!(" {pct}%"), Style::default().fg(MUTED)));
+        spans.push(Span::styled(format!(" {pct}%"), Style::default().fg(MUTED())));
         lines.push(Line::from(spans));
         return;
     }
@@ -3905,7 +3934,7 @@ fn push_sidebar_value(lines: &mut Vec<Line<'static>>, key: &str, value_line: &st
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{label:<label_w$} "),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
             ),
             Span::styled(crate::tui::truncate_chars(rest, value_max), style),
         ]));
@@ -3916,7 +3945,7 @@ fn push_sidebar_value(lines: &mut Vec<Line<'static>>, key: &str, value_line: &st
     } else {
         crate::tui::truncate_chars(value_line, max)
     };
-    lines.push(Line::styled(truncated, Style::default().fg(NOTICE_FG)));
+    lines.push(Line::styled(truncated, Style::default().fg(NOTICE_FG())));
 }
 
 /// The home screen: two-tone block-letter logo centered above the version/model line and the
@@ -3934,10 +3963,10 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
         let pad = width.saturating_sub(combined.chars().count()) / 2;
         lines.push(Line::from(vec![
             Span::raw(" ".repeat(pad)),
-            Span::styled((*left).to_string(), Style::default().fg(NOTICE_FG)),
+            Span::styled((*left).to_string(), Style::default().fg(NOTICE_FG())),
             Span::styled(
                 (*right).to_string(),
-                Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+                Style::default().fg(BLUE()).add_modifier(Modifier::BOLD),
             ),
         ]));
     }
@@ -3946,7 +3975,7 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
     let pad = width.saturating_sub(UnicodeWidthStr::width(info.as_str())) / 2;
     lines.push(Line::from(vec![
         Span::raw(" ".repeat(pad)),
-        Span::styled(info, Style::default().fg(NOTICE_FG)),
+        Span::styled(info, Style::default().fg(NOTICE_FG())),
     ]));
     let hint = "Ask Kamui, or / for commands";
     let pad = width.saturating_sub(hint.len()) / 2;
@@ -3962,7 +3991,7 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
     let pad = width.saturating_sub(keys.len()) / 2;
     lines.push(Line::from(vec![
         Span::raw(" ".repeat(pad)),
-        Span::styled(keys.to_string(), Style::default().fg(MUTED)),
+        Span::styled(keys.to_string(), Style::default().fg(MUTED())),
     ]));
     // Startup notices still belong on the home screen — the logo must never hide them.
     for card in &model.cards {
@@ -3971,7 +4000,7 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
             lines.push(Line::from(""));
         }
         for row in rows {
-            lines.push(Line::styled(row.to_string(), Style::default().fg(MUTED)));
+            lines.push(Line::styled(row.to_string(), Style::default().fg(MUTED())));
         }
     }
     if model.warnings_visible {
@@ -3979,7 +4008,7 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
             lines.push(Line::from(""));
             lines.push(Line::styled(
                 format!("\u{26a0} {warning}"),
-                Style::default().fg(WARN),
+                Style::default().fg(WARN()),
             ));
         }
         if model.warning_details_visible {
@@ -3987,12 +4016,12 @@ fn intro_paragraph(model: &Model, area: Rect) -> Paragraph<'static> {
                 lines.push(Line::from(""));
                 lines.push(Line::styled(
                     format!("  ↳ {detail}"),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED()),
                 ));
             }
         }
     }
-    Paragraph::new(Text::from(lines)).style(Style::default().bg(BG_CHAT))
+    Paragraph::new(Text::from(lines)).style(Style::default().bg(BG_CHAT()))
 }
 
 /// Status line: a few discoverable keys, live run hints, token badge.
@@ -4040,7 +4069,7 @@ fn footer_widget(model: &Model, area: Rect) -> Paragraph<'static> {
     {
         right.push(Span::styled(
             crate::tui::truncate_chars(model_name, 24),
-            Style::default().fg(BORDER),
+            Style::default().fg(BORDER()),
         ));
     }
     if let Some((badge_text, pct)) = &model.token_badge {
@@ -4050,8 +4079,8 @@ fn footer_widget(model: &Model, area: Rect) -> Paragraph<'static> {
         right.push(Span::styled(
             format!(" {badge_text} "),
             Style::default()
-                .bg(if *pct >= 80 { WARN } else { TEXT })
-                .fg(BG_PANEL)
+                .bg(if *pct >= 80 { WARN() } else { TEXT() })
+                .fg(BG_PANEL())
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -4064,12 +4093,12 @@ fn footer_widget(model: &Model, area: Rect) -> Paragraph<'static> {
     let left_budget = total.saturating_sub(right_width + 2);
     let left = crate::tui::truncate_chars(&left, left_budget);
     let gap = total.saturating_sub(UnicodeWidthStr::width(left.as_str()) + right_width);
-    let mut spans = vec![Span::styled(left, Style::default().fg(MUTED))];
+    let mut spans = vec![Span::styled(left, Style::default().fg(MUTED()))];
     if !right.is_empty() {
         spans.push(Span::raw(" ".repeat(gap)));
         spans.extend(right);
     }
-    Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_PANEL))
+    Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_PANEL()))
 }
 
 /// The transcript as it is actually drawn: every source line wrapped to `width`, each wrapped
@@ -4180,7 +4209,7 @@ fn transcript_rows(model: &Model, width: u16) -> Vec<(Line<'static>, Option<u64>
     for card in &model.cards {
         if matches!(card.kind, CardKind::User) {
             lines.push((
-                Line::styled("─".repeat(inner_width.min(24)), Style::default().fg(BORDER)),
+                Line::styled("─".repeat(inner_width.min(24)), Style::default().fg(BORDER())),
                 None,
             ));
         }
@@ -4210,7 +4239,7 @@ fn transcript_rows(model: &Model, width: u16) -> Vec<(Line<'static>, Option<u64>
         }
         for warning in &model.warnings {
             lines.push((
-                Line::styled(format!("\u{26a0} {warning}"), Style::default().fg(WARN)),
+                Line::styled(format!("\u{26a0} {warning}"), Style::default().fg(WARN())),
                 None,
             ));
         }
@@ -4218,7 +4247,7 @@ fn transcript_rows(model: &Model, width: u16) -> Vec<(Line<'static>, Option<u64>
             for detail in &model.warning_details {
                 lines.push((Line::from(""), None));
                 lines.push((
-                    Line::styled(format!("  \u{21b3} {detail}"), Style::default().fg(MUTED)),
+                    Line::styled(format!("  \u{21b3} {detail}"), Style::default().fg(MUTED())),
                     None,
                 ));
             }
@@ -4294,22 +4323,22 @@ fn error_headline(body: &str) -> String {
 
 fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
     let (border, body_style) = if card.title == "Assistant" {
-        (BLUE, Style::default().fg(TEXT))
+        (BLUE(), Style::default().fg(TEXT()))
     } else {
         match card.kind {
-            CardKind::User => (ACCENT, Style::default().fg(TEXT)),
+            CardKind::User => (ACCENT(), Style::default().fg(TEXT())),
             CardKind::Tool => match &card.status {
-                None => (WARN, Style::default().fg(MUTED)),
-                Some((_, true)) => (GREEN, Style::default().fg(MUTED)),
-                Some((_, false)) => (RED, Style::default().fg(RED)),
+                None => (WARN(), Style::default().fg(MUTED())),
+                Some((_, true)) => (GREEN(), Style::default().fg(MUTED())),
+                Some((_, false)) => (RED(), Style::default().fg(RED())),
             },
             CardKind::Output => match &card.status {
-                Some((_, false)) => (RED, Style::default().fg(RED)),
-                Some((_, true)) => (GREEN, Style::default().fg(MUTED)),
-                None => (GREEN, Style::default().fg(MUTED)),
+                Some((_, false)) => (RED(), Style::default().fg(RED())),
+                Some((_, true)) => (GREEN(), Style::default().fg(MUTED())),
+                None => (GREEN(), Style::default().fg(MUTED())),
             },
-            CardKind::Error => (RED, Style::default().fg(TEXT)),
-            CardKind::Note => (MUTED, Style::default().fg(NOTICE_FG)),
+            CardKind::Error => (RED(), Style::default().fg(TEXT())),
+            CardKind::Note => (MUTED(), Style::default().fg(NOTICE_FG())),
         }
     };
 
@@ -4328,7 +4357,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
             &mut out,
             vec![Span::styled(
                 "Kamui".to_string(),
-                Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+                Style::default().fg(BLUE()).add_modifier(Modifier::BOLD),
             )],
         );
         let text = crate::markdown::render_ratatui(&card.body);
@@ -4353,7 +4382,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
             &mut out,
             vec![Span::styled(
                 title,
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
             )],
         );
         if let Some((status, ok)) = &card.status {
@@ -4361,7 +4390,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
                 &mut out,
                 vec![Span::styled(
                     format!("{} {status}", if *ok { "\u{2713}" } else { "\u{2717}" }),
-                    Style::default().fg(if *ok { GREEN } else { RED }),
+                    Style::default().fg(if *ok { GREEN() } else { RED() }),
                 )],
             );
         }
@@ -4376,7 +4405,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
                     &mut out,
                     vec![Span::styled(
                         "\u{2026} ctrl+o or click".to_string(),
-                        Style::default().fg(MUTED),
+                        Style::default().fg(MUTED()),
                     )],
                 );
             }
@@ -4395,7 +4424,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
             &mut out,
             vec![Span::styled(
                 card.title.clone(),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
             )],
         );
     }
@@ -4406,7 +4435,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
             &mut out,
             vec![Span::styled(
                 format!("{} {status}", if *ok { "\u{2713}" } else { "\u{2717}" }),
-                Style::default().fg(if *ok { GREEN } else { RED }),
+                Style::default().fg(if *ok { GREEN() } else { RED() }),
             )],
         );
     }
@@ -4431,7 +4460,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
                 &mut out,
                 vec![Span::styled(
                     format!("\u{2026} {hidden} more line(s) \u{b7} ctrl+o or click"),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED()),
                 )],
             );
         }
@@ -4444,7 +4473,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
                 &mut out,
                 vec![Span::styled(
                     "You".to_string(),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
                 )],
             );
             if card.title != "User" && !card.title.is_empty() {
@@ -4452,7 +4481,7 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
                     &mut out,
                     vec![Span::styled(
                         card.title.clone(),
-                        Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+                        Style::default().fg(MUTED()).add_modifier(Modifier::DIM),
                     )],
                 );
             }
@@ -4464,13 +4493,13 @@ fn card_lines(card: &Card, width: usize) -> Vec<Line<'static>> {
             // Tool call: "Name: args", then its output beneath, all under one muted rail.
             for (i, source) in card.body.lines().enumerate() {
                 let styled = if i == 0 {
-                    Span::styled(source.to_string(), Style::default().fg(TEXT))
+                    Span::styled(source.to_string(), Style::default().fg(TEXT()))
                 } else {
                     Span::styled(source.to_string(), body_style)
                 };
                 for row in wrap_display(styled.content.as_ref(), width.saturating_sub(4)) {
                     if i == 0 {
-                        push_bordered(&mut out, vec![Span::styled(row, Style::default().fg(TEXT))]);
+                        push_bordered(&mut out, vec![Span::styled(row, Style::default().fg(TEXT()))]);
                     } else {
                         push_bordered(&mut out, vec![Span::styled(row, body_style)]);
                     }
@@ -4655,7 +4684,7 @@ mod tests {
             .expect("draw");
 
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(82, 24)].bg, BG_PANEL);
+        assert_eq!(buffer[(82, 24)].bg, BG_PANEL());
         assert_ne!(buffer[(82, 24)].bg, Color::Black);
     }
 
@@ -5221,17 +5250,17 @@ mod tests {
     #[test]
     fn highlighting_a_row_repaints_it_without_losing_its_text() {
         let line = Line::from(vec![
-            Span::styled("\u{258c} ".to_string(), Style::default().fg(BLUE)),
-            Span::styled("hit".to_string(), Style::default().fg(TEXT)),
+            Span::styled("\u{258c} ".to_string(), Style::default().fg(BLUE())),
+            Span::styled("hit".to_string(), Style::default().fg(TEXT())),
         ]);
-        let painted = highlight_row(line, MATCH_BG);
+        let painted = highlight_row(line, MATCH_BG());
         assert_eq!(row_text(&painted), "\u{258c} hit", "text survives");
         for span in &painted.spans {
-            assert_eq!(span.style.bg, Some(MATCH_BG), "every span carries the wash");
+            assert_eq!(span.style.bg, Some(MATCH_BG()), "every span carries the wash");
         }
         // Foreground styling is left alone, so a highlighted answer still reads as an answer.
-        assert_eq!(painted.spans[0].style.fg, Some(BLUE));
-        assert_eq!(painted.spans[1].style.fg, Some(TEXT));
+        assert_eq!(painted.spans[0].style.fg, Some(BLUE()));
+        assert_eq!(painted.spans[1].style.fg, Some(TEXT()));
     }
 
     #[test]
@@ -5655,7 +5684,7 @@ mod tests {
         let lines = card_lines(&card, 20);
         assert_eq!(lines.len(), 2, "speaker label then body");
         assert_eq!(lines[0].spans[0].content, "\u{258c} ");
-        assert_eq!(lines[0].spans[0].style.fg, Some(ACCENT));
+        assert_eq!(lines[0].spans[0].style.fg, Some(ACCENT()));
         let label: String = lines[0]
             .spans
             .iter()
@@ -5748,7 +5777,7 @@ mod tests {
         // Every line starts with the accent bar and carries no background fill.
         for line in &lines {
             assert_eq!(line.spans[0].content, "\u{258c} ");
-            assert_eq!(line.spans[0].style.fg, Some(BLUE));
+            assert_eq!(line.spans[0].style.fg, Some(BLUE()));
             assert!(line.spans[0].style.bg.is_none());
         }
     }

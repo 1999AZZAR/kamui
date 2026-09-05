@@ -25,6 +25,8 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("mode", "Cycle build / auto / plan (also Tab)"),
     ("skills", "List discovered skills"),
     ("warnings", "Hide/show warnings; details; fix"),
+    ("theme", "List or switch theme (also /themes)"),
+    ("themes", "List or switch theme"),
 ];
 
 /// Whether `name` is a built-in slash command, and so not a name a user command file or a
@@ -36,7 +38,7 @@ pub fn is_builtin_command(name: &str) -> bool {
     let name = name.trim().to_ascii_lowercase();
     BUILTINS.iter().any(|(builtin, _)| *builtin == name)
         // Handled but not advertised in the menu.
-        || matches!(name.as_str(), "models" | "warning")
+         || matches!(name.as_str(), "models" | "warning" | "themes")
 }
 
 #[derive(Debug, Clone)]

@@ -9,6 +9,7 @@ mod frontmatter;
 mod jobs;
 mod markdown;
 mod mcp;
+mod theme;
 mod onboarding;
 mod pricing;
 mod prompt;
