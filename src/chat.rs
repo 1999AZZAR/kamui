@@ -63,6 +63,9 @@ where
         .find(&active_name)
         .cloned()
         .unwrap_or_else(|| config.default().clone());
+    if let Some(th) = database.get_setting("active_theme")?.and_then(|s| s.parse::<crate::theme::Theme>().ok()) {
+        config.theme = th;
+    }
     let mut provider = build_provider(&active);
     let mut context_window = active.context_window;
     let job_registry = tools.jobs();
@@ -72,7 +75,7 @@ where
     // be compared against a fresh load and reported instead of ending silently.
     let mut pending_skill_fix: Option<Vec<String>> = None;
     let use_tui = crate::tui::is_interactive();
-    let mut chat_ui = crate::ui::ChatUi::new(
+    let mut chat_ui = crate::ui::ChatUi::new_with_theme(
         use_tui,
         format!(
             "Kamui v{} · {} · {}",
@@ -80,6 +83,7 @@ where
             active.model,
             display_path(project.root())
         ),
+        config.theme.clone(),
     )?;
     // The keyboard hub owns all TUI input for the session: editor always live, Enter queues
     // while the agent runs, Esc interrupts.
@@ -731,6 +735,34 @@ where
                         chat_ui.notice(buf.trim_end())?;
                     } else {
                         print!("{buf}");
+                    }
+                }
+                continue;
+            }
+            if command == "/theme" || command == "/themes" {
+                let arg = argument.trim();
+                if arg.is_empty() && use_tui {
+                    hub.as_ref().map(|h| h.open_themes_dialog());
+                    continue;
+                }
+                if arg.is_empty() {
+                    let cur = config.theme.clone();
+                    let list: String = crate::theme::Theme::all().into_iter().map(|t| {
+                        let star = if t == cur { "*" } else { " " };
+                        format!("{star} {t}\n")
+                    }).collect();
+                    chat_ui.notice(&format!("Themes (* = active):\n{list}\nUsage: /theme <name>"))?;
+                } else {
+                    match arg.parse::<crate::theme::Theme>() {
+                        Ok(th) => {
+                            let th2 = th.clone();
+                            config.theme = th2.clone();
+                            let _ = database.set_setting("active_theme", &th2.to_string());
+                            let _ = crate::config::save_theme(&crate::config::global_config_path().unwrap(), &th2.to_string());
+                            chat_ui.set_theme(th2.clone());
+                            chat_ui.notice(&format!("Theme switched to {th} — restart to fully re-theme chrome."))?;
+                        }
+                        Err(e) => chat_ui.error(&e)?,
                     }
                 }
                 continue;

@@ -21,6 +21,10 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 memory.db
+memory.db-*
+
+# conductor files
+conductor
 
 # Local scratch (screenshots, one-off implementation prompts)
 .tmp-screenshots/
